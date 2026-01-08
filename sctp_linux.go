@@ -154,14 +154,17 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 
 func (c *SCTPConn) Close() error {
 	if c != nil {
-		fd := atomic.SwapInt32(&c._fd, -1)
+		fd := c.fd() // get fd first
 		if fd > 0 {
-			info := &SndRcvInfo{
-				Flags: SCTP_EOF,
-			}
+			// Send SCTP_EOF BEFORE swapping
+			info := &SndRcvInfo{Flags: SCTP_EOF}
 			c.SCTPWrite(nil, info)
-			syscall.Shutdown(int(fd), syscall.SHUT_RDWR)
-			return syscall.Close(int(fd))
+
+			// Now swap to prevent other operations
+			atomic.SwapInt32(&c._fd, -1)
+
+			syscall.Shutdown(fd, syscall.SHUT_RDWR)
+			return syscall.Close(fd)
 		}
 	}
 	return syscall.EBADF
