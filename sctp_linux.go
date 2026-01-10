@@ -396,7 +396,7 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
 			}
 		}
-		err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR)
+		err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR) // error EADDRINUSE "Address already in use" may occur if resource (source IP and Port) is occupied
 		if err != nil {
 			return nil, err
 		}
