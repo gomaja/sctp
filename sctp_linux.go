@@ -162,8 +162,8 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 // forcefully terminate the association and release resources.
 //
 // This ensures that Close always returns promptly and releases resources,
-// avoiding the "address already in use" error that can occur when the kernel
-// continues retrying shutdown in the background.
+// avoiding the EADDRINUSE "Address already in use" error that can occur when the kernel
+// still occupies the resource.
 //
 // For immediate termination without waiting, use Abort() instead.
 func (c *SCTPConn) Close() error {
