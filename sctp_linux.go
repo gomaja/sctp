@@ -152,19 +152,58 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 	}
 }
 
+// Close closes the SCTP connection gracefully with a timeout fallback.
+//
+// It initiates a graceful shutdown by sending a SHUTDOWN chunk to the peer
+// and waits up to 3 seconds for the peer to acknowledge (SHUTDOWN-ACK).
+// If the peer responds, the connection closes gracefully and resources are
+// released immediately. If the peer does not respond within the timeout
+// (e.g., network failure or unreachable peer), an ABORT chunk is sent to
+// forcefully terminate the association and release resources.
+//
+// This ensures that Close always returns promptly and releases resources,
+// avoiding the "address already in use" error that can occur when the kernel
+// continues retrying shutdown in the background.
+//
+// For immediate termination without waiting, use Abort() instead.
 func (c *SCTPConn) Close() error {
 	if c != nil {
-		fd := c.fd() // get fd first
+		fd := atomic.SwapInt32(&c._fd, -1)
 		if fd > 0 {
-			// Send SCTP_EOF BEFORE swapping
-			info := &SndRcvInfo{Flags: SCTP_EOF}
-			c.SCTPWrite(nil, info)
+			// Send SHUTDOWN to initiate graceful shutdown
+			syscall.Shutdown(int(fd), syscall.SHUT_WR)
 
-			// Now swap to prevent other operations
-			atomic.SwapInt32(&c._fd, -1)
+			// Wait up to 3 seconds for graceful shutdown to complete.
+			// If peer responds, Read returns immediately with ENOTCONN.
+			// If peer is unreachable, Read times out after 3 seconds.
+			syscall.SetsockoptTimeval(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
+				&syscall.Timeval{Sec: 3, Usec: 0})
+			var buf [1]byte
+			syscall.Read(int(fd), buf[:])
 
-			syscall.Shutdown(fd, syscall.SHUT_RDWR)
-			return syscall.Close(fd)
+			// Set linger=0 so close() sends ABORT if handshake didn't complete,
+			// or just releases resources if it did.
+			syscall.SetsockoptLinger(int(fd), syscall.SOL_SOCKET, syscall.SO_LINGER,
+				&syscall.Linger{Onoff: 1, Linger: 0})
+			return syscall.Close(int(fd))
+		}
+	}
+	return syscall.EBADF
+}
+
+// Abort terminates the SCTP association immediately by sending an ABORT chunk.
+// Unlike Close(), this does not perform a graceful shutdown handshake.
+// Use this when you need immediate resource release without waiting for
+// the peer to acknowledge the shutdown (e.g., when the peer is unreachable).
+func (c *SCTPConn) Abort() error {
+	if c != nil {
+		fd := atomic.SwapInt32(&c._fd, -1)
+		if fd > 0 {
+			// Setting SO_LINGER with l_onoff=1 and l_linger=0 causes the kernel
+			// to send an ABORT chunk instead of SHUTDOWN when closing.
+			syscall.SetsockoptLinger(int(fd), syscall.SOL_SOCKET, syscall.SO_LINGER,
+				&syscall.Linger{Onoff: 1, Linger: 0})
+			return syscall.Close(int(fd))
 		}
 	}
 	return syscall.EBADF
