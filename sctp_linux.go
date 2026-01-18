@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -170,25 +171,31 @@ func (c *SCTPConn) Close() error {
 	if c != nil {
 		fd := atomic.SwapInt32(&c._fd, -1)
 		if fd > 0 {
-			// Send SHUTDOWN to initiate graceful shutdown
-			syscall.Shutdown(int(fd), syscall.SHUT_WR)
-
-			// Wait up to 3 seconds for graceful shutdown to complete.
-			// If peer responds, Read returns immediately with ENOTCONN.
-			// If peer is unreachable, Read times out after 3 seconds.
-			syscall.SetsockoptTimeval(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
-				&syscall.Timeval{Sec: 3, Usec: 0})
-			var buf [1]byte
-			syscall.Read(int(fd), buf[:])
-
-			// Set linger=0 so close() sends ABORT if handshake didn't complete,
-			// or just releases resources if it did.
-			syscall.SetsockoptLinger(int(fd), syscall.SOL_SOCKET, syscall.SO_LINGER,
-				&syscall.Linger{Onoff: 1, Linger: 0})
-			return syscall.Close(int(fd))
+			return closeSctpSocket(int(fd), 3*time.Second)
 		}
 	}
 	return syscall.EBADF
+}
+
+func closeSctpSocket(fd int, timeout time.Duration) error {
+	// Send SHUTDOWN to initiate graceful shutdown
+	syscall.Shutdown(fd, syscall.SHUT_WR)
+
+	// Wait for graceful shutdown to complete.
+	// If peer responds, Read returns immediately with ENOTCONN.
+	// If peer is unreachable, Read times out after the configured duration.
+	sec := int64(timeout / time.Second)
+	usec := int64((timeout % time.Second) / time.Microsecond)
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
+		&syscall.Timeval{Sec: sec, Usec: usec})
+	var buf [1]byte
+	syscall.Read(fd, buf[:])
+
+	// Set linger=0 so close() sends ABORT if handshake didn't complete,
+	// or just releases resources if it did.
+	syscall.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER,
+		&syscall.Linger{Onoff: 1, Linger: 0})
+	return syscall.Close(fd)
 }
 
 // Abort terminates the SCTP association immediately by sending an ABORT chunk.
@@ -250,7 +257,7 @@ func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, contr
 	// close socket on error
 	defer func() {
 		if err != nil {
-			syscall.Close(sock)
+			closeSctpSocket(sock, 1*time.Second)
 		}
 	}()
 	if err = setDefaultSockopts(sock, af, ipv6only); err != nil {
@@ -367,7 +374,7 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 	// close socket on error
 	defer func() {
 		if err != nil {
-			syscall.Close(sock)
+			closeSctpSocket(sock, 1*time.Second)
 		}
 	}()
 	if err = setDefaultSockopts(sock, af, ipv6only); err != nil {
