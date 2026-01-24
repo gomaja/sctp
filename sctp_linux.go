@@ -179,7 +179,7 @@ func (c *SCTPConn) Close() error {
 
 func closeSctpSocket(fd int, timeout time.Duration) error {
 	// Send SHUTDOWN to initiate graceful shutdown
-	syscall.Shutdown(fd, syscall.SHUT_WR)
+	syscall.Shutdown(fd, syscall.SHUT_RDWR)
 
 	// Wait for graceful shutdown to complete.
 	// If peer responds, Read returns immediately with ENOTCONN.
