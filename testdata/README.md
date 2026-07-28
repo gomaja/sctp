@@ -61,3 +61,18 @@ docker run --rm --privileged --net=host -v "$PWD":/src -w /src sctp-test \
 It totals the DATA chunk payloads on the wire and compares them against what
 was sent; the totals match even in the runs where messages are lost at the
 API.
+
+## Close-path wire verification
+
+Confirms what each teardown puts on the wire: `Close` completing a SHUTDOWN
+handshake, `Abort` sending an ABORT chunk, and `Close` against an
+unresponsive peer falling back to ABORT rather than blocking for the full
+grace period.
+
+```sh
+docker run --rm --privileged --net=host -v "$PWD":/src -w /src sctp-test \
+    bash testdata/tshark-close.sh
+```
+
+Each mode runs on its own port so the capture can be split per association.
+`closeprobe/` is the driver it builds.

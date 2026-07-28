@@ -22,3 +22,5 @@ example/example
 testdata/repro/go.mod
 testdata/repro/go.sum
 *.pcap
+testdata/closeprobe/go.mod
+testdata/closeprobe/go.sum
