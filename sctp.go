@@ -804,7 +804,17 @@ func (c *SCTPSndRcvInfoWrappedConn) Read(b []byte) (int, error) {
 	if err != nil {
 		return n, err
 	}
-	copy(b, toBuf(info))
+	if info != nil {
+		copy(b, toBuf(info))
+	} else {
+		// No ancillary data came back, so there is nothing to describe the
+		// message. Zero the header rather than leaving whatever the caller
+		// had in b, which would otherwise be read as a valid SndRcvInfo.
+		hdr := b[:sndRcvInfoSize]
+		for i := range hdr {
+			hdr[i] = 0
+		}
+	}
 	return n + int(sndRcvInfoSize), err
 }
 
