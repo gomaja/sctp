@@ -26,8 +26,16 @@ import (
 	"unsafe"
 )
 
+// testingTB is the subset of testing.TB the connection helper needs, so the
+// same setup serves both tests and fuzz targets.
+type testingTB interface {
+	Helper()
+	Fatalf(format string, args ...interface{})
+	Cleanup(func())
+}
+
 // eorPair brings up a loopback association and returns both ends.
-func eorPair(t *testing.T) (client, server *SCTPConn) {
+func eorPair(t testingTB) (client, server *SCTPConn) {
 	t.Helper()
 
 	addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
