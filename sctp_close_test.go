@@ -325,7 +325,10 @@ func TestCloseDoesNotLeakDescriptors(t *testing.T) {
 				buf := make([]byte, 256)
 				for {
 					if _, _, err := c.SCTPRead(buf); err != nil {
-						_ = c.Close()
+						// The client has already gone; abort rather than run
+						// a graceful shutdown that has no peer to answer it
+						// and would serialise the whole test.
+						_ = c.Abort()
 						return
 					}
 				}
@@ -539,7 +542,18 @@ func TestCloseDuringBlockedRead(t *testing.T) {
 // TestCloseDuringWrite covers close racing a writer.
 func TestCloseDuringWrite(t *testing.T) {
 	client, server := eorPair(t)
-	_ = server
+
+	// Drain the peer. Without a reader the send queue fills and a blocking
+	// write never returns, so the test would be measuring send-buffer
+	// pressure rather than the close.
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			if _, _, err := server.SCTPRead(buf); err != nil {
+				return
+			}
+		}
+	}()
 
 	stop := make(chan struct{})
 	done := make(chan struct{})

@@ -139,7 +139,10 @@ func TestCloseChurnUnderLoad(t *testing.T) {
 				buf := make([]byte, 512)
 				for {
 					if _, _, err := c.SCTPRead(buf); err != nil {
-						_ = c.Close()
+						// The client has already gone; abort rather than run
+						// a graceful shutdown that has no peer to answer it
+						// and would serialise the whole test.
+						_ = c.Abort()
 						return
 					}
 				}
