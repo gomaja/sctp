@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -448,6 +449,17 @@ func SCTPBind(fd int, addr *SCTPAddr, flags int) error {
 type SCTPConn struct {
 	_fd                 int32
 	notificationHandler NotificationHandler
+
+	// Deadlines are absolute, as net.Conn specifies, and are converted to a
+	// relative SO_RCVTIMEO/SO_SNDTIMEO immediately before each syscall. They
+	// are stored as UnixNano; 0 means no deadline. Accessed atomically so a
+	// deadline may be set from another goroutine while a call is in flight.
+	readDeadline  int64
+	writeDeadline int64
+
+	// Tracks whether a non-zero SO_RCVTIMEO is currently programmed, so the
+	// no-deadline path does not issue a setsockopt on every read.
+	rcvTimeoSet int32
 }
 
 func (c *SCTPConn) fd() int {
@@ -752,16 +764,85 @@ func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
 	return &SCTPConn{_fd: int32(param.sd)}, nil
 }
 
+// SetDeadline sets both the read and write deadlines.
+//
+// A zero time.Time clears the deadline, as with net.Conn.
 func (c *SCTPConn) SetDeadline(t time.Time) error {
-	return syscall.EOPNOTSUPP
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
 }
 
+// SetReadDeadline sets the absolute time after which reads fail.
+//
+// A read that exceeds the deadline returns an error satisfying
+// errors.Is(err, os.ErrDeadlineExceeded). The deadline applies to each read
+// as a whole: ReadMsg, which may need several recvmsg calls to reassemble a
+// message, is bounded by the deadline overall rather than per call.
+//
+// Unlike net.Conn, setting a deadline does not interrupt a read that is
+// already blocked; it takes effect from the next read. The deadline is
+// realised with SO_RCVTIMEO, which the kernel only consults when a call
+// begins.
 func (c *SCTPConn) SetReadDeadline(t time.Time) error {
-	return syscall.EOPNOTSUPP
+	atomic.StoreInt64(&c.readDeadline, timeToUnixNano(t))
+	return nil
 }
 
+// SetWriteDeadline sets the absolute time after which writes fail. The
+// caveats on SetReadDeadline apply equally.
 func (c *SCTPConn) SetWriteDeadline(t time.Time) error {
-	return syscall.EOPNOTSUPP
+	atomic.StoreInt64(&c.writeDeadline, timeToUnixNano(t))
+	return nil
+}
+
+func timeToUnixNano(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+// applyTimeout programs optname (SO_RCVTIMEO or SO_SNDTIMEO) from an absolute
+// deadline. It reports ErrDeadlineExceeded when the deadline has already
+// passed, since a zero timeval means "block forever" rather than "expire
+// immediately" and would otherwise hang.
+func applyTimeout(fd int, optname int, deadline int64) error {
+	if deadline == 0 {
+		// No deadline: clear any timeout left by a previous call. Callers
+		// that track whether one is programmed skip this entirely.
+		return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname,
+			&syscall.Timeval{})
+	}
+
+	d := time.Until(time.Unix(0, deadline))
+	if d <= 0 {
+		return os.ErrDeadlineExceeded
+	}
+
+	// Round up so a sub-microsecond remainder does not truncate to zero,
+	// which the kernel would read as "no timeout".
+	usec := (d.Nanoseconds() + 999) / 1000
+
+	// Timeval field widths differ by platform (int64 on linux/amd64, int32 on
+	// linux/386 and darwin). syscall.NsecToTimeval builds the right shape for
+	// the target, so convert back to nanoseconds rather than assigning the
+	// fields directly.
+	tv := syscall.NsecToTimeval(usec * 1000)
+	if tv.Sec == 0 && tv.Usec == 0 {
+		tv.Usec = 1
+	}
+	return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname, &tv)
+}
+
+// toDeadlineErr maps the kernel's timeout errno onto os.ErrDeadlineExceeded,
+// so callers can use errors.Is regardless of which syscall reported it.
+func toDeadlineErr(err error) error {
+	if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+		return os.ErrDeadlineExceeded
+	}
+	return err
 }
 
 type SCTPListener struct {

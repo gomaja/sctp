@@ -105,6 +105,14 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 		hdr.SetLen(syscall.CmsgSpace(len(cmsgBuf)))
 		cbuf = append(toBuf(hdr), cmsgBuf...)
 	}
+	// Writes use MSG_DONTWAIT and so never block; SO_SNDTIMEO would have no
+	// effect on them. Enforce the write deadline directly instead, so a
+	// deadline already in the past fails rather than being ignored.
+	if deadline := atomic.LoadInt64(&c.writeDeadline); deadline != 0 {
+		if time.Until(time.Unix(0, deadline)) <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+	}
 	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
 }
 
@@ -150,9 +158,29 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 	oob := make([]byte, 254)
 	for {
+		// Reprogram the timeout each iteration: the deadline is absolute, so
+		// a notification consuming part of the budget must shorten the next
+		// wait rather than restart it.
+		//
+		// Only an expired deadline aborts the read. Any other setsockopt
+		// failure is left to recvmsg to report, so that a socket closed
+		// concurrently still surfaces its own error (EOF, EBADF) rather than
+		// being masked by a failure to program the timeout.
+		deadline := atomic.LoadInt64(&c.readDeadline)
+		if deadline != 0 || atomic.LoadInt32(&c.rcvTimeoSet) != 0 {
+			if err := applyTimeout(c.fd(), syscall.SO_RCVTIMEO, deadline); err == os.ErrDeadlineExceeded {
+				return 0, nil, 0, err
+			}
+			if deadline != 0 {
+				atomic.StoreInt32(&c.rcvTimeoSet, 1)
+			} else {
+				atomic.StoreInt32(&c.rcvTimeoSet, 0)
+			}
+		}
+
 		n, oobn, recvflags, _, err := syscall.Recvmsg(c.fd(), b, oob, 0)
 		if err != nil {
-			return n, nil, recvflags, err
+			return n, nil, recvflags, toDeadlineErr(err)
 		}
 
 		if n == 0 && oobn == 0 {
