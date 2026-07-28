@@ -18,6 +18,7 @@ package sctp
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -36,7 +37,17 @@ const (
 	SCTP_BINDX_REM_ADDR = 0x02
 
 	MSG_NOTIFICATION = 0x8000
+
+	// MSG_EOR is set in the flags returned by SCTPReadFlags when the buffer
+	// received the end of a message. Its absence means the message was
+	// truncated to the buffer and the remainder follows on later reads.
+	MSG_EOR = 0x80
 )
+
+// ErrMsgTooLong is returned by ReadMsg when a message exceeds the caller's
+// limit. The bytes read so far are returned with it; the remainder of the
+// message stays queued.
+var ErrMsgTooLong = errors.New("sctp: message exceeds maximum length")
 
 const (
 	SCTP_RTOINFO = iota

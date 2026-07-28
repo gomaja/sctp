@@ -127,28 +127,100 @@ func parseSndRcvInfo(b []byte) (*SndRcvInfo, error) {
 	return nil, nil
 }
 
+// SCTPRead reads one message, or as much of one message as fits in b.
+//
+// If the message is larger than b, the remainder is not discarded: it is
+// returned by subsequent reads, which makes a truncated message
+// indistinguishable from a complete one here. Callers of framed protocols
+// should use SCTPReadFlags and test the returned flags for MSG_EOR, or use
+// ReadMsg to have the reassembly done for them.
 func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
+	n, info, _, err := c.SCTPReadFlags(b)
+	return n, info, err
+}
+
+// SCTPReadFlags is SCTPRead, additionally returning the flags recvmsg
+// reported for the message.
+//
+// The kernel sets MSG_EOR when b received the end of a message and clears it
+// when more of that message remains, so flags&MSG_EOR == 0 means the message
+// was truncated and the remainder will arrive on subsequent reads. Without
+// checking it, an oversized message is silently split and the remainder is
+// delivered as what looks like a fresh message.
+func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 	oob := make([]byte, 254)
 	for {
 		n, oobn, recvflags, _, err := syscall.Recvmsg(c.fd(), b, oob, 0)
 		if err != nil {
-			return n, nil, err
+			return n, nil, recvflags, err
 		}
 
 		if n == 0 && oobn == 0 {
-			return 0, nil, io.EOF
+			return 0, nil, recvflags, io.EOF
 		}
 
 		if recvflags&MSG_NOTIFICATION > 0 && c.notificationHandler != nil {
 			if err := c.notificationHandler(b[:n]); err != nil {
-				return 0, nil, err
+				return 0, nil, recvflags, err
 			}
 		} else {
 			var info *SndRcvInfo
 			if oobn > 0 {
 				info, err = parseSndRcvInfo(oob[:oobn])
 			}
-			return n, info, err
+			return n, info, recvflags, err
+		}
+	}
+}
+
+// ReadMsg reads one whole message, reassembling it across as many reads as
+// the kernel needs to deliver it.
+//
+// It returns the complete message, so unlike SCTPRead the caller does not
+// need to size a buffer against the largest message the peer might send. At
+// most max bytes are accumulated; a message that exceeds max stops there and
+// is returned with ErrMsgTooLong, leaving its remainder queued. The returned
+// SndRcvInfo is the one reported for the message's first fragment.
+func (c *SCTPConn) ReadMsg(max int) ([]byte, *SndRcvInfo, error) {
+	if max <= 0 {
+		return nil, nil, syscall.EINVAL
+	}
+
+	// Start well under max so a small message costs a small allocation.
+	const chunk = 2048
+	size := chunk
+	if max < size {
+		size = max
+	}
+	buf := make([]byte, size)
+	var (
+		total int
+		first *SndRcvInfo
+	)
+	for {
+		if total == len(buf) {
+			if total >= max {
+				return buf[:total], first, ErrMsgTooLong
+			}
+			grow := len(buf)
+			if room := max - total; room < grow {
+				grow = room
+			}
+			buf = append(buf, make([]byte, grow)...)
+		}
+
+		n, info, flags, err := c.SCTPReadFlags(buf[total:])
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			return buf[:total], first, err
+		}
+		if first == nil {
+			first = info
+		}
+		if flags&syscall.MSG_EOR != 0 {
+			return buf[:total], first, nil
 		}
 	}
 }

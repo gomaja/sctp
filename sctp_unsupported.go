@@ -44,6 +44,14 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 	return 0, nil, ErrUnsupported
 }
 
+func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
+	return 0, nil, 0, ErrUnsupported
+}
+
+func (c *SCTPConn) ReadMsg(max int) ([]byte, *SndRcvInfo, error) {
+	return nil, nil, ErrUnsupported
+}
+
 func (c *SCTPConn) Close() error {
 	return ErrUnsupported
 }
