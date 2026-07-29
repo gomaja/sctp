@@ -312,9 +312,13 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		return abortSctpSocket(fd)
 	}
 
-	// Wait for graceful shutdown to complete.
-	// If peer responds, Read returns immediately with ENOTCONN.
-	// If peer is unreachable, Read times out after the configured duration.
+	// Wait for the shutdown handshake to finish. The outcome says which of the
+	// two closes below is correct, so it is not discarded:
+	//
+	//	n == 0, err == nil  the peer completed the handshake and the read hit
+	//	                    end of stream
+	//	ECONNRESET          the peer aborted rather than answering
+	//	EAGAIN              the timeout expired with no answer at all
 	//
 	// The timeout is what bounds this read, so if it cannot be programmed the
 	// read would block indefinitely. Abort rather than risk that.
@@ -324,13 +328,20 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		return abortSctpSocket(fd)
 	}
 	var buf [1]byte
-	// The result is deliberately ignored: this read exists to wait for the
-	// peer's SHUTDOWN-ACK, and any outcome (data, ENOTCONN, timeout) means
-	// the wait is over.
-	_, _ = syscall.Read(fd, buf[:])
+	n, rerr := syscall.Read(fd, buf[:])
+	completed := n == 0 && rerr == nil
 
-	// Set linger=0 so close() sends ABORT if handshake didn't complete,
-	// or just releases resources if it did.
+	if completed {
+		// The association is already shut down, so there is nothing for
+		// linger to bound. Setting linger=0 here makes close() emit an ABORT
+		// on an association that ended cleanly, and a peer still in a read
+		// sees ECONNRESET instead of the end of the stream.
+		return syscall.Close(fd)
+	}
+
+	// No handshake: linger=0 makes close() send ABORT rather than leave the
+	// association half-open, so the address is released promptly instead of
+	// being held by a peer that is not answering.
 	if err := syscall.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER,
 		&syscall.Linger{Onoff: 1, Linger: 0}); err != nil {
 		// Without linger the close may leave the association lingering, but

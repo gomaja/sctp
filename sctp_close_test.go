@@ -21,6 +21,7 @@ package sctp
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -593,3 +594,49 @@ func TestCloseDuringWrite(t *testing.T) {
 }
 
 var _ net.Conn = (*SCTPConn)(nil)
+
+// TestCloseAfterCompletedHandshakeGivesPeerEOF covers a graceful Close that
+// looked like an abort to the peer.
+//
+// closeSctpSocket set SO_LINGER{Onoff:1, Linger:0} before close()
+// unconditionally. Linger 0 makes close() emit an ABORT, which is what makes
+// Close release the address promptly when a peer has stopped answering. But
+// after a completed SHUTDOWN handshake there is nothing left to abort, and the
+// ABORT went out anyway: a peer sitting in a read saw ECONNRESET rather than
+// the end of the stream.
+//
+// Measured before the fix, this failed on every run; the peer read
+// "connection reset by peer" five times out of five.
+func TestCloseAfterCompletedHandshakeGivesPeerEOF(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		client, server := eorPairNoCleanup(t)
+
+		// Send and fully consume, so the association is idle and the peer is
+		// waiting in a read when the close happens.
+		const msgs = 4
+		for j := 0; j < msgs; j++ {
+			if _, err := client.SCTPWrite([]byte("payload"), nil); err != nil {
+				t.Fatalf("round %d: write: %v", i, err)
+			}
+		}
+		buf := make([]byte, 512)
+		for j := 0; j < msgs; j++ {
+			if _, _, err := server.SCTPRead(buf); err != nil {
+				t.Fatalf("round %d: drain: %v", i, err)
+			}
+		}
+
+		if err := client.Close(); err != nil {
+			t.Fatalf("round %d: close: %v", i, err)
+		}
+
+		_, _, err := server.SCTPRead(buf)
+		if errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("round %d: peer saw ECONNRESET after a graceful Close; "+
+				"the completed handshake was followed by an ABORT", i)
+		} else if err != io.EOF {
+			t.Errorf("round %d: peer read = %v, want io.EOF", i, err)
+		}
+		_ = server.Abort()
+	}
+}
