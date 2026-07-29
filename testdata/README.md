@@ -247,6 +247,30 @@ handshake has completed, which under load happens before the call returns, and
 `SCTPConnect` reported that as a failure for a socket that was connected and
 writable. Fixed.
 
+`TestAbortReleasesFdZero` failed about four runs in twenty while passing fifteen
+in fifteen on its own. The test was wrong, not the code: it asked whether fd 0
+was open after `Abort` and called an open descriptor a leak. The kernel hands out
+the lowest free descriptor and the test's own accept loop runs concurrently, so a
+socket created in the instant after `Abort` takes fd 0 back.
+
+A single-threaded C program doing the same accept-then-abort sequence shows it
+without any concurrency at all:
+
+```
+after abort: fcntl(0,F_GETFD) = 0 (errno=0)
+  fd 0 IS a socket bound to port 48556 -> re-claimed, not leaked
+```
+
+It now records the association's local port before `Abort` and compares
+afterwards, so it asks whether *this* association survived rather than whether
+the number is in use. The assertion got stronger, not weaker: removing the close
+from `abortSctpSocket` fails it with `fd 0 is still the aborted association
+(local port 42491); the descriptor leaked`.
+
+The general lesson is the same one the finalizer bug taught — a descriptor number
+identifies nothing once it has been released. Compare the resource, not the
+number.
+
 `TestStreams` used to fail as part of the full suite while passing on its own.
 Three causes, found in that order:
 
