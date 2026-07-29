@@ -86,6 +86,25 @@ case st.Unackdata > threshold:
 `AssocInfo.PeerRwnd` is a useful companion — it stops moving once the peer
 stops acknowledging.
 
+## SO_REUSEADDR does not help here
+
+A reasonable guess is that `SO_REUSEADDR` would let the address be rebound
+while the old association is still lingering. Measured on SCTP, it changes
+nothing:
+
+```
+SO_REUSEADDR=0
+  two live listeners, same port : second bind REFUSED: address already in use
+  rebind after clean close      : rebind ALLOWED
+SO_REUSEADDR=1
+  two live listeners, same port : second bind REFUSED: address already in use
+  rebind after clean close      : rebind ALLOWED
+```
+
+Unlike TCP there is no TIME_WAIT state to bypass, so rebinding after a clean
+close already works without it, and it does not override an address still held
+by a live association. Setting it makes no difference either way.
+
 ## Reproducing it
 
 `iptables` inside a privileged container, dropping traffic between two loopback
