@@ -119,8 +119,8 @@ handshake has completed, which under load happens before the call returns, and
 `SCTPConnect` reported that as a failure for a socket that was connected and
 writable. Fixed.
 
-`TestStreams` used to fail twelve runs in fifteen as part of the full suite,
-while passing on its own. Two causes, and neither shows without the other:
+`TestStreams` used to fail as part of the full suite while passing on its own.
+Three causes, found in that order:
 
 The listen backlog was `syscall.SOMAXCONN`, a Go constant of 128, against a
 kernel allowing 4096. This test opens exactly 128 clients, so it sat on the
@@ -134,13 +134,28 @@ per connection, the listener was never closed, and the accept loop treated the
 `EINVAL` from a shut-down socket as fatal.
 
 The backlog defect masked the rest, which is why fixing either alone measured
-as noise. Together: twelve failures in fifteen runs before, one and two in two
-fifteen-run measurements after.
+as noise. Together they took twelve failures in fifteen runs down to one and
+two in two fifteen-run measurements — but not to zero.
 
-The method matters as much as the fix. The cause was invisible in the test
-output and in a capture of the whole suite, where 1012 INIT chunks and 892
-INIT_ACKs across ninety tests said nothing. Filtering the capture to the one
-listener port under test gave it immediately:
+The residual had nothing to do with `TestStreams`. `TestSCTPListenerNameFromFd`
+passed a live listener's descriptor to `os.NewFile`, which takes ownership of
+what it is given and closes it from a finalizer once the `*os.File` becomes
+unreachable. That scheduled a close of a socket still in use, at a point
+decided by the garbage collector, after the kernel had reused the number for
+an unrelated socket. The failure therefore appeared in whichever test held
+that descriptor when the collector ran — `TestStreams` losing its listener
+mid-run, or `TestListenerCloseUnblocksAccept` getting `EBADF` from `Close`.
+
+`TestListenerSurvivesGCAfterFileListener` forces collection and then dials the
+listener, making it deterministic. Suite over twenty consecutive runs after
+the fix: twenty passes.
+
+The method matters as much as the fixes.
+
+The backlog defect was invisible in the test output and in a capture of the
+whole suite, where 1012 INIT chunks and 892 INIT_ACKs across ninety tests said
+nothing. Filtering the capture to the one listener port under test gave it
+immediately:
 
 ```
 INIT      = 128
@@ -148,5 +163,14 @@ INIT_ACK  =  15
 ABORT     = 121
 ```
 
-Run one measurement at a time, filter captures to the port that matters, and
-pair comparisons against a baseline rather than running separate batches.
+The finalizer defect yielded to descriptor tracing rather than packet capture:
+logging every acquisition and release showed a listener's descriptor going
+invalid with no release recorded between, which rules out every path the
+library itself controls and points outside it.
+
+Three habits did the work. Run one measurement at a time and pair comparisons
+against a baseline rather than running separate batches — several plausible
+theories here died that way, and two candidate fixes measured no better than
+baseline. Filter captures to the port that matters. When a symptom moves
+between tests depending on timing, suspect a shared resource being released by
+something other than its owner, and trace the resource rather than the test.
