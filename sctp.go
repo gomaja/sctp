@@ -24,7 +24,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -244,7 +243,11 @@ const SCTP_POTENTIALLY_FAILED = SCTP_PF
 // PeerAddrinfo Parameters defined in RFC 6458 8.2.2 - Peer Address Information (SCTP_GET_PEER_ADDR_INFO)
 type PeerAddrinfo struct {
 	AssocID SCTPAssocID
-	Address [128]byte // if needed from here, retrieve using resolveFromRawAddr(unsafe.Pointer(&PeerAddrinfo.Address), 1), or get it from *SCTPConn.SCTPGetPrimaryPeerAddr()
+	// Address holds the peer address as a raw sockaddr. Use
+	// (*SCTPConn).SCTPGetPrimaryPeerAddr to obtain it decoded: the decoder
+	// this package uses is unexported, and decoding the bytes by hand means
+	// reproducing the per-entry family and bounds handling it does.
+	Address [128]byte
 	State   PeerState
 	CWND    uint32
 	SRTT    uint32
@@ -342,8 +345,7 @@ func init() {
 	} else {
 		nativeEndian = binary.LittleEndian
 	}
-	info := SndRcvInfo{}
-	sndRcvInfoSize = unsafe.Sizeof(info)
+	sndRcvInfoSize = unsafe.Sizeof(SndRcvInfo{})
 }
 
 // toBuf serialises a fixed-size value in the host's byte order, for handing to
@@ -386,10 +388,6 @@ func setInitOpts(fd int, options InitMsg) error {
 	optlen := unsafe.Sizeof(options)
 	_, _, err := setsockopt(fd, SCTP_INITMSG, uintptr(unsafe.Pointer(&options)), uintptr(optlen))
 	return err
-}
-
-func setNumOstreams(fd, num int) error {
-	return setInitOpts(fd, InitMsg{NumOstreams: uint16(num)})
 }
 
 type SCTPAddr struct {
@@ -844,37 +842,115 @@ func (c *SCTPConn) Setsockopt(optname, optval, optlen uintptr) (uintptr, uintptr
 	return setsockopt(c.fd(), optname, optval, optlen)
 }
 
+// resolveFromRawAddr decodes the packed sockaddr array the kernel returns for
+// SCTP_GET_LOCAL_ADDRS, SCTP_GET_PEER_ADDRS and SCTP_PRIMARY_ADDR.
+//
+// Each entry is sized by its own family: 16 bytes for AF_INET, 28 for
+// AF_INET6. The family is read per entry and the offset advanced by what that
+// entry occupies, rather than reading the first entry's family and striding
+// the whole array by it.
+//
+// On Linux the two are equivalent today. The kernel answers an AF_INET socket
+// with all AF_INET entries and an AF_INET6 socket with all AF_INET6 entries,
+// v4-mapping any IPv4 addresses bound to it, so the reply is uniform even for
+// an association multi-homed across both families. That was measured against
+// the kernel rather than assumed, including a socket explicitly bound to ::1
+// and 127.0.0.1 via sctp_bindx.
+//
+// The per-entry walk is kept because nothing in the interface guarantees that.
+// The reply is a packed array of variable-size sockaddrs, and a fixed stride
+// is only correct while every entry happens to be the same size: if any kernel
+// or any other platform returns a mixed reply, striding by the first family
+// silently decodes every subsequent address from the wrong offset and returns
+// it with no error. The cost of reading the family per entry is a load and a
+// branch.
+//
+// limit bounds the walk to the buffer the caller actually owns. n arrives
+// from the kernel and is trusted for the size of the result slice, but never
+// for how far to read.
 func resolveFromRawAddr(ptr unsafe.Pointer, n int) (*SCTPAddr, error) {
+	return resolveFromRawAddrBuf(ptr, n, 0)
+}
+
+// resolveFromRawAddrBuf is resolveFromRawAddr with an explicit bound on the
+// readable region.
+//
+// A limit of 0 disables the bounds checks, which is what resolveFromRawAddr
+// passes. Every caller inside this package supplies a real bound; the
+// unbounded form remains only because the tests exercise the decode path
+// without one. Prefer this function with the size of the buffer the kernel
+// filled: without it, a count that disagrees with the data walks off the end.
+func resolveFromRawAddrBuf(ptr unsafe.Pointer, n int, limit uintptr) (*SCTPAddr, error) {
+	if n < 0 {
+		return nil, fmt.Errorf("negative address count: %d", n)
+	}
 	addr := &SCTPAddr{
-		IPAddrs: make([]net.IPAddr, n),
+		IPAddrs: make([]net.IPAddr, 0, n),
 	}
 
-	switch family := (*(*syscall.RawSockaddrAny)(ptr)).Addr.Family; family {
-	case syscall.AF_INET:
-		addr.Port = int(ntohs(uint16((*(*syscall.RawSockaddrInet4)(ptr)).Port)))
-		tmp := syscall.RawSockaddrInet4{}
-		size := unsafe.Sizeof(tmp)
-		for i := 0; i < n; i++ {
-			a := *(*syscall.RawSockaddrInet4)(unsafe.Pointer(
-				uintptr(ptr) + size*uintptr(i)))
-			addr.IPAddrs[i] = net.IPAddr{IP: a.Addr[:]}
+	var offset uintptr
+	for i := 0; i < n; i++ {
+		// Reading the family needs the first two bytes of this entry to be
+		// inside the buffer before anything is dereferenced.
+		//
+		// The per-family size checks below reject the same inputs one step
+		// later, so removing this one keeps every test green. It is kept
+		// regardless: those checks run after the family has been read, and
+		// reading the family of an entry that starts past the end is itself
+		// the out-of-bounds access being guarded against.
+		if limit != 0 && offset+2 > limit {
+			return nil, fmt.Errorf(
+				"address %d starts past the end of the %d byte reply", i, limit)
 		}
-	case syscall.AF_INET6:
-		addr.Port = int(ntohs(uint16((*(*syscall.RawSockaddrInet4)(ptr)).Port)))
-		tmp := syscall.RawSockaddrInet6{}
-		size := unsafe.Sizeof(tmp)
-		for i := 0; i < n; i++ {
-			a := *(*syscall.RawSockaddrInet6)(unsafe.Pointer(
-				uintptr(ptr) + size*uintptr(i)))
+		entry := unsafe.Pointer(uintptr(ptr) + offset)
+
+		// Read the family as the two bytes it is, rather than through
+		// RawSockaddrAny. That struct is 112 bytes, so converting to it to
+		// reach a field in its first two claims the whole span: for the last
+		// entry of a tightly sized reply that runs past the allocation, and
+		// -race rejects it as a pointer straddling multiple allocations even
+		// though only the family is ever read. sa_family_t is uint16 and sits
+		// at offset 0 of every sockaddr.
+		switch family := *(*uint16)(entry); family {
+		case syscall.AF_INET:
+			size := unsafe.Sizeof(syscall.RawSockaddrInet4{})
+			if limit != 0 && offset+size > limit {
+				return nil, fmt.Errorf(
+					"IPv4 address %d extends past the end of the %d byte reply",
+					i, limit)
+			}
+			a := (*syscall.RawSockaddrInet4)(entry)
+			if i == 0 {
+				addr.Port = int(ntohs(a.Port))
+			}
+			// Copy out of the kernel buffer: a.Addr[:] aliases memory the
+			// caller is free to reuse once this returns.
+			ip := make(net.IP, net.IPv4len)
+			copy(ip, a.Addr[:])
+			addr.IPAddrs = append(addr.IPAddrs, net.IPAddr{IP: ip})
+			offset += size
+		case syscall.AF_INET6:
+			size := unsafe.Sizeof(syscall.RawSockaddrInet6{})
+			if limit != 0 && offset+size > limit {
+				return nil, fmt.Errorf(
+					"IPv6 address %d extends past the end of the %d byte reply",
+					i, limit)
+			}
+			a := (*syscall.RawSockaddrInet6)(entry)
+			if i == 0 {
+				addr.Port = int(ntohs(a.Port))
+			}
 			var zone string
-			ifi, err := net.InterfaceByIndex(int(a.Scope_id))
-			if err == nil {
+			if ifi, err := net.InterfaceByIndex(int(a.Scope_id)); err == nil {
 				zone = ifi.Name
 			}
-			addr.IPAddrs[i] = net.IPAddr{IP: a.Addr[:], Zone: zone}
+			ip := make(net.IP, net.IPv6len)
+			copy(ip, a.Addr[:])
+			addr.IPAddrs = append(addr.IPAddrs, net.IPAddr{IP: ip, Zone: zone})
+			offset += size
+		default:
+			return nil, fmt.Errorf("unknown address family: %d", family)
 		}
-	default:
-		return nil, fmt.Errorf("unknown address family: %d", family)
 	}
 	return addr, nil
 }
@@ -894,7 +970,10 @@ func sctpGetAddrs(fd, id, optname int) (*SCTPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	return resolveFromRawAddr(unsafe.Pointer(&param.addrs), int(param.addrNum))
+	// addrNum comes from the kernel. Bound the walk by the buffer that was
+	// actually provided rather than trusting it to describe what fits.
+	return resolveFromRawAddrBuf(unsafe.Pointer(&param.addrs), int(param.addrNum),
+		unsafe.Sizeof(param.addrs))
 }
 
 func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
@@ -911,7 +990,8 @@ func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
-	return resolveFromRawAddr(unsafe.Pointer(&param.addrs), 1)
+	return resolveFromRawAddrBuf(unsafe.Pointer(&param.addrs), 1,
+		unsafe.Sizeof(param.addrs))
 }
 
 func (c *SCTPConn) SCTPLocalAddr(id int) (*SCTPAddr, error) {
@@ -1040,7 +1120,6 @@ type SCTPListener struct {
 	// cannot release a descriptor number the kernel has since handed to
 	// another socket. Use fd() to read it.
 	_fd                 int32
-	m                   sync.Mutex
 	notificationHandler NotificationHandler
 }
 
@@ -1058,14 +1137,38 @@ func (ln *SCTPListener) Addr() net.Addr {
 
 type SCTPSndRcvInfoWrappedConn struct {
 	conn *SCTPConn
+	// subErr records a failure to subscribe to SCTP_EVENT_DATA_IO. Reads
+	// report it rather than returning messages with no ancillary data.
+	subErr error
 }
 
+// NewSCTPSndRcvInfoWrappedConn wraps conn so that Read and Write carry a
+// SndRcvInfo header inline, ahead of the payload.
+//
+// The whole type depends on SCTP_EVENT_DATA_IO being subscribed, since that is
+// what makes the kernel return the ancillary data the header is built from.
+// The subscription used to be attempted and its error discarded, which fails
+// quietly in the worst way: every Read then finds no ancillary data and writes
+// a zeroed header, so the caller reads a well-formed SndRcvInfo reporting
+// stream 0 and PPID 0 for every message regardless of which stream it arrived
+// on.
+//
+// This signature cannot return an error without breaking callers, so the
+// failure is kept and returned from the first Read or Write instead.
 func NewSCTPSndRcvInfoWrappedConn(conn *SCTPConn) *SCTPSndRcvInfoWrappedConn {
-	conn.SubscribeEvents(SCTP_EVENT_DATA_IO)
-	return &SCTPSndRcvInfoWrappedConn{conn}
+	c := &SCTPSndRcvInfoWrappedConn{conn: conn}
+	if err := conn.SubscribeEvents(SCTP_EVENT_DATA_IO); err != nil {
+		c.subErr = fmt.Errorf(
+			"sctp: subscribing to SCTP_EVENT_DATA_IO failed, so no message can "+
+				"carry its SndRcvInfo: %w", err)
+	}
+	return c
 }
 
 func (c *SCTPSndRcvInfoWrappedConn) Write(b []byte) (int, error) {
+	if c.subErr != nil {
+		return 0, c.subErr
+	}
 	if len(b) < int(sndRcvInfoSize) {
 		return 0, syscall.EINVAL
 	}
@@ -1075,6 +1178,9 @@ func (c *SCTPSndRcvInfoWrappedConn) Write(b []byte) (int, error) {
 }
 
 func (c *SCTPSndRcvInfoWrappedConn) Read(b []byte) (int, error) {
+	if c.subErr != nil {
+		return 0, c.subErr
+	}
 	if len(b) < int(sndRcvInfoSize) {
 		return 0, syscall.EINVAL
 	}

@@ -91,14 +91,6 @@ func supportsIPv4() bool {
 }
 
 //from https://github.com/golang/go
-// supportsIPv6 reports whether the platform supports IPv6 networking
-// functionality.
-func supportsIPv6() bool {
-	ipStackCaps.Once.Do(ipStackCaps.probe)
-	return ipStackCaps.ipv6Enabled
-}
-
-//from https://github.com/golang/go
 // supportsIPv4map reports whether the platform supports mapping an
 // IPv4 address inside an IPv6 address at transport layer
 // protocols. See RFC 4291, RFC 4038 and RFC 3493.
@@ -123,7 +115,9 @@ func (p *ipStackCapabilities) probe() {
 	switch err {
 	case syscall.EAFNOSUPPORT, syscall.EPROTONOSUPPORT:
 	case nil:
-		syscall.Close(s)
+		// Probe only: the socket is not used past this point, and a failure to
+		// close it says nothing about whether IPv4 is supported.
+		_ = syscall.Close(s)
 		p.ipv4Enabled = true
 	}
 	var probes = []struct {
@@ -141,8 +135,11 @@ func (p *ipStackCapabilities) probe() {
 		if err != nil {
 			continue
 		}
-		defer syscall.Close(s)
-		syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, probes[i].value)
+		defer func() { _ = syscall.Close(s) }()
+		// A failure here means the probe cannot answer for this combination,
+		// so fall through to the bind: it is the bind that decides the result,
+		// and an unsupported option shows up there.
+		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, probes[i].value)
 		sa, err := sockaddr(&(probes[i].laddr), syscall.AF_INET6)
 		if err != nil {
 			continue
@@ -164,7 +161,7 @@ func (a *SCTPAddr) isWildcard() bool {
 	if a == nil {
 		return true
 	}
-	if 0 == len(a.IPAddrs) {
+	if len(a.IPAddrs) == 0 {
 		return true
 	}
 
@@ -212,10 +209,11 @@ func favoriteAddrFamily(network string, laddr *SCTPAddr, raddr *SCTPAddr, mode s
 //Changes: it is for SCTP only
 func setDefaultSockopts(s int, family int, ipv6only bool) error {
 	if family == syscall.AF_INET6 {
-		// Allow both IP versions even if the OS default
-		// is otherwise. Note that some operating systems
-		// never admit this option.
-		syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, boolint(ipv6only))
+		// Allow both IP versions even if the OS default is otherwise. Some
+		// operating systems never admit this option, and a socket that cannot
+		// be made dual-stack is still usable for the family it was created
+		// with, so the failure is deliberately not fatal.
+		_ = syscall.SetsockoptInt(s, syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, boolint(ipv6only))
 	}
 	// Allow broadcast.
 	return os.NewSyscallError("setsockopt", syscall.SetsockoptInt(s, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1))

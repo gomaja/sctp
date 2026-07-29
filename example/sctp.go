@@ -93,7 +93,11 @@ func main() {
 			}
 			log.Printf("SndBufSize: %d, RcvBufSize: %d", *sndbuf, *rcvbuf)
 
-			go serveClient(wconn, *bufsize)
+			go func() {
+				if err := serveClient(wconn, *bufsize); err != nil {
+					log.Printf("serveClient: %v", err)
+				}
+			}()
 		}
 
 	} else {
@@ -140,9 +144,14 @@ func main() {
 				PPID:   uint32(ppid),
 			}
 			ppid += 1
-			conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
+			if err := conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO); err != nil {
+				log.Fatalf("failed to subscribe to data io events: %v", err)
+			}
 			buf := make([]byte, *bufsize)
 			n, err := rand.Read(buf)
+			if err != nil {
+				log.Fatalf("failed to generate random string: %v", err)
+			}
 			if n != *bufsize {
 				log.Fatalf("failed to generate random string len: %d", *bufsize)
 			}

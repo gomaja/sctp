@@ -111,6 +111,42 @@ read buffer = 16 bytes; real kernel notifications:
 kernel. Removing the length check in ParseNotification makes it panic with
 `slice bounds out of range [:20] with capacity 16` inside the read path.
 
+## Address decoding
+
+`SCTP_GET_LOCAL_ADDRS`, `SCTP_GET_PEER_ADDRS` and `SCTP_PRIMARY_ADDR` return a
+packed array of sockaddrs, each sized by its own family: 16 bytes for
+`AF_INET`, 28 for `AF_INET6`. The decoder used to read the family from the
+first entry and stride the whole array by it.
+
+Linux does not currently expose that. A C probe against the running kernel,
+binding both `::1` and `127.0.0.1` to one socket with `sctp_bindx`, showed the
+reply normalised to a single family:
+
+```
+RESULT: kernel ACCEPTS a mixed-family binding
+addr_num = 2
+  entry 0: family=10 (AF_INET6), stride=28
+  entry 1: family=10 (AF_INET6), stride=28
+```
+
+So the fixed stride was correct in practice, and no live defect was
+demonstrated. The decoder now reads the family per entry regardless, because
+nothing in the interface guarantees a uniform reply, and a wrong stride
+produces a wrong address rather than an error: an IPv6 address after an IPv4
+one decodes as `0.0.0.0` and is returned to the caller as though it were real.
+
+Two things came out of this that were live. Decoded addresses aliased the
+kernel buffer, which for `SCTPGetPrimaryPeerAddr` is a stack local that goes
+out of scope on return; they are copied now. And the address count from the
+kernel was trusted as a walk bound with no reference to the buffer size.
+
+`TestResolveFromRawAddr*` covers the decode, `TestKernelAddrsRoundTrip` covers
+what the running kernel actually returns, and `FuzzResolveFromRawAddr` covers
+arbitrary bytes. Note what the fuzzer does *not* cover: removing the bounds
+checks and fuzzing for 90 seconds survives 4.3M executions, because an
+over-read still lands inside the same Go allocation. The bounds are covered by
+the unit tests, each confirmed by removing the check it guards.
+
 ## Test flakiness
 
 `TestSCTPConcurrentAccept` used to fail about one run in four with

@@ -45,8 +45,8 @@ func TestNotificationHandlerAssignmentOnDialing(t *testing.T) {
 	if conn == nil || conn.notificationHandler(nil) != testErr {
 		t.Fatalf("notification handler has not been assigned")
 	}
-	listener.Close()
-	conn.Close()
+	_ = listener.Close()
+	_ = conn.Close()
 }
 
 func TestNotificationHandlerAssignmentOnListening(t *testing.T) {
@@ -62,7 +62,7 @@ func TestNotificationHandlerAssignmentOnListening(t *testing.T) {
 	if listener == nil || listener.notificationHandler(nil) != testErr {
 		t.Fatalf("notification handler has not been assigned")
 	}
-	listener.Close()
+	_ = listener.Close()
 }
 
 func TestDialUseControlFuncWithoutLocalAddress(t *testing.T) {
@@ -74,7 +74,7 @@ func TestDialUseControlFuncWithoutLocalAddress(t *testing.T) {
 	if err != nil && !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("failed to dial connection due to: %v", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 func TestListenUseControlFuncWithoutLocalAddress(t *testing.T) {
@@ -85,7 +85,7 @@ func TestListenUseControlFuncWithoutLocalAddress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start listener: %v", err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 }
 
 func validationControlFunc(t *testing.T, network string) func(networkFunc, address string, c syscall.RawConn) error {
@@ -110,7 +110,7 @@ func TestSyscallConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	raw, err := listener.SyscallConn()
 	if err != nil {
 		t.Fatalf("Expected no error, got %v", err)
@@ -122,7 +122,7 @@ func TestSyscallConn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create SCTP connection: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	raw, err = conn.SyscallConn()
 	if err != nil {
@@ -144,7 +144,7 @@ func TestSyscallConn(t *testing.T) {
 	}
 
 	t.Run("after close", func(t *testing.T) {
-		conn.Close()
+		_ = conn.Close()
 		raw, err := conn.SyscallConn()
 		if err != syscall.EINVAL {
 			t.Errorf("Expected EINVAL, got %v", err)
@@ -161,7 +161,7 @@ func TestSCTPListenerNameFromFd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	la, ok := ln.Addr().(*SCTPAddr)
 	if !ok || la.Port == 0 {
@@ -174,7 +174,9 @@ func TestSCTPListenerNameFromFd(t *testing.T) {
 	}
 
 	var fln *SCTPListener
-	raw.Control(func(fd uintptr) {
+	// A Control error means the callback never ran, which would leave fln nil
+	// and fail below for an unrelated-looking reason.
+	if cerr := raw.Control(func(fd uintptr) {
 		// os.NewFile takes ownership of the descriptor it is handed, and its
 		// finalizer closes it once the *os.File becomes unreachable. Passing
 		// the listener's own descriptor hands ownership of a socket that ln
@@ -192,16 +194,18 @@ func TestSCTPListenerNameFromFd(t *testing.T) {
 		// FileListener dups again for the returned listener, so this file has
 		// no owner once it returns and must be closed explicitly rather than
 		// left to the finalizer.
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		fln, err = FileListener(f)
-	})
+	}); cerr != nil {
+		t.Fatalf("control: %v", cerr)
+	}
 	if err != nil {
 		t.Fatalf("FileListener: %v", err)
 	}
 	if fln == nil {
 		t.Fatal("FileListener returned no listener")
 	}
-	defer fln.Close()
+	defer func() { _ = fln.Close() }()
 
 	fla, ok := fln.Addr().(*SCTPAddr)
 	if !ok || fla.Port == 0 {
@@ -231,7 +235,7 @@ func TestListenerSurvivesGCAfterFileListener(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	raw, err := ln.SyscallConn()
 	if err != nil {
@@ -248,7 +252,7 @@ func TestListenerSurvivesGCAfterFileListener(t *testing.T) {
 			return
 		}
 		f := os.NewFile(uintptr(dup), "listener")
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		fln, err = FileListener(f)
 	}); cerr != nil {
 		t.Fatalf("control: %v", cerr)
@@ -259,7 +263,7 @@ func TestListenerSurvivesGCAfterFileListener(t *testing.T) {
 	if fln == nil {
 		t.Fatal("FileListener returned no listener")
 	}
-	defer fln.Close()
+	defer func() { _ = fln.Close() }()
 
 	// Run finalizers for anything the block above dropped. Twice: the first
 	// collection queues the finalizer, the second lets it run.

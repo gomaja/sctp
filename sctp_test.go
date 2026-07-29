@@ -93,7 +93,7 @@ func TestSCTPListenerName(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer ln.Close()
+		defer func() { _ = ln.Close() }()
 		la := ln.Addr()
 		if a, ok := la.(*SCTPAddr); !ok || a.Port == 0 {
 			t.Fatalf("got %v; expected a proper address with non-zero port number", la)
@@ -118,7 +118,7 @@ func TestSCTPConcurrentAccept(t *testing.T) {
 				if err != nil {
 					break
 				}
-				c.Close()
+				_ = c.Close()
 			}
 			wg.Done()
 		}()
@@ -139,13 +139,13 @@ func TestSCTPConcurrentAccept(t *testing.T) {
 			fails++
 			t.Logf("dial %d failed: %v", i, err)
 		} else {
-			c.Close()
+			_ = c.Close()
 		}
 	}
 	if refused > 0 {
 		t.Logf("%d of %d dials hit a full backlog (ECONNREFUSED)", refused, attempts)
 	}
-	ln.Close()
+	_ = ln.Close()
 	// Close releases the listening descriptor and sets it to -1, so a blocked
 	// Accept returns an error and the goroutines above exit. Waiting for them
 	// keeps this test from leaking accept loops into the rest of the suite.
@@ -252,7 +252,7 @@ func TestGetStatus(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create listener: %v", err)
 			}
-			defer ln.Close()
+			defer func() { _ = ln.Close() }()
 
 			// Channel to communicate server errors
 			errChan := make(chan error, 1)
@@ -272,7 +272,7 @@ func TestGetStatus(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to dial: %v", err)
 			}
-			defer c.Close()
+			defer func() { _ = c.Close() }()
 
 			// Check for server errors
 			select {
@@ -335,7 +335,7 @@ func TestGetStatusUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 
 	// Channel to communicate server errors
 	errChan := make(chan error, 1)
@@ -355,7 +355,7 @@ func TestGetStatusUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to dial: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	// Check for server errors
 	select {

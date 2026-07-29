@@ -80,14 +80,22 @@ func TestStreams(t *testing.T) {
 				return
 			}
 
-			sconn.SubscribeEvents(SCTP_EVENT_DATA_IO)
+			// This test asserts on info.Stream for every message, which only
+			// arrives as ancillary data while this subscription holds. An
+			// unreported failure here would make every read return nil info
+			// and the stream checks would compare against zero.
+			if err := sconn.SubscribeEvents(SCTP_EVENT_DATA_IO); err != nil {
+				t.Errorf("server subscribe: %v", err)
+				_ = sconn.Close()
+				return
+			}
 			serverWG.Add(1)
 			go func(sconn *SCTPConn) {
 				// Close per connection, not per accept loop: the original
 				// deferred this inside the loop, so nothing was released
 				// until the loop itself ended.
 				defer serverWG.Done()
-				defer sconn.Close()
+				defer func() { _ = sconn.Close() }()
 				totalrcvd := 0
 				for {
 					buf := make([]byte, 512)
@@ -110,9 +118,17 @@ func TestStreams(t *testing.T) {
 					}
 					totalrcvd += n
 					t.Logf("server read: info: %+v, payload: %s", info, string(buf[:n]))
-					n, err = sconn.SCTPWrite(buf[:n], info)
+					// Check what was written rather than discarding it: a short
+					// write here would desynchronise the echo the client is
+					// waiting on, and the client would report a payload
+					// mismatch far from the cause.
+					wn, err := sconn.SCTPWrite(buf[:n], info)
 					if err != nil {
 						t.Error(err)
+						return
+					}
+					if wn != n {
+						t.Errorf("echoed %d of %d bytes", wn, n)
 						return
 					}
 				}
@@ -131,8 +147,11 @@ func TestStreams(t *testing.T) {
 				t.Errorf("failed to dial address %s, test #%d: %v", addr.String(), test, err)
 				return
 			}
-			defer conn.Close()
-			conn.SubscribeEvents(SCTP_EVENT_DATA_IO)
+			defer func() { _ = conn.Close() }()
+			if err := conn.SubscribeEvents(SCTP_EVENT_DATA_IO); err != nil {
+				t.Errorf("client %d subscribe: %v", test, err)
+				return
+			}
 			for ppid := uint16(0); ppid < STREAM_TEST_STREAMS; ppid++ {
 				info := &SndRcvInfo{
 					Stream: uint16(ppid),
