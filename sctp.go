@@ -162,6 +162,15 @@ type SackTimer struct {
 	SackFrequency uint32
 }
 
+// AssocValue mirrors struct sctp_assoc_value, the association-id-and-value
+// pair several socket options take.
+//
+// AssocID is ignored on the one-to-one style sockets this package creates.
+type AssocValue struct {
+	AssocID  SCTPAssocID
+	AssocVal uint32
+}
+
 // RtoInfo mirrors struct sctp_rtoinfo (RFC 6458 8.1.1, SCTP_RTOINFO). It
 // governs the retransmission timer, and with it how quickly the stack gives up
 // on an unresponsive peer.
@@ -755,6 +764,44 @@ func (c *SCTPConn) GetAssocInfo() (*AssocInfo, error) {
 		return nil, err
 	}
 	return info, nil
+}
+
+// SetMaxSegSize sets the maximum fragment size the association will use
+// (SCTP_MAXSEG, RFC 6458 8.1.16). Messages larger than this are fragmented
+// across multiple DATA chunks rather than being sent as one.
+//
+// A value of zero restores the default, which is derived from the path MTU.
+// The kernel clamps the request to what the path can carry, so read it back
+// with GetMaxSegSize if the effective value matters.
+func (c *SCTPConn) SetMaxSegSize(size int) error {
+	if size < 0 || int64(size) > int64(^uint32(0)) {
+		return errors.New("sctp: max segment size out of range")
+	}
+	val := AssocValue{AssocVal: uint32(size)}
+	optlen := unsafe.Sizeof(val)
+	_, _, err := setsockopt(
+		c.fd(),
+		SCTP_MAXSEG,
+		uintptr(unsafe.Pointer(&val)),
+		optlen,
+	)
+	return err
+}
+
+// GetMaxSegSize reports the association's current maximum fragment size.
+func (c *SCTPConn) GetMaxSegSize() (int, error) {
+	val := AssocValue{}
+	optlen := unsafe.Sizeof(val)
+	_, _, err := getsockopt(
+		c.fd(),
+		SCTP_MAXSEG,
+		uintptr(unsafe.Pointer(&val)),
+		uintptr(unsafe.Pointer(&optlen)),
+	)
+	if err != nil {
+		return 0, err
+	}
+	return int(val.AssocVal), nil
 }
 
 func (c *SCTPConn) GetStatus() (*Status, error) { // Status
