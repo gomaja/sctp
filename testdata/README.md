@@ -20,11 +20,8 @@ docker run --rm --privileged -v "$PWD":/src -w /src sctp-test \
     bash testdata/run-tests.sh -count=1
 ```
 
-`TestStreams` opens 128 concurrent associations against one listener and fails
-occasionally. It is rare — about one run in thirty — and it fails on an
-unmodified tree as well. See "Test flakiness" below before concluding anything
-from it, and run the suite one container at a time: several at once makes it
-look far worse than it is.
+Run the suite one container at a time. Several at once contend for cores and
+make the timing-sensitive tests look far worse than they are.
 
 ## Truncation reproducer
 
