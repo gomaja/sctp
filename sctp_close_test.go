@@ -303,16 +303,64 @@ func abortFdZeroChild() {
 		report("SKIP association landed on fd %d, not 0", fd)
 		os.Exit(0)
 	}
+	// Identify the socket before releasing it. "Is fd 0 open afterwards" cannot
+	// answer whether Abort released it: the accept loop above runs concurrently
+	// and the kernel hands out the lowest free descriptor, so a socket created
+	// in the instant after Abort takes fd 0 back and the fd reads as open
+	// through no fault of Abort. That was measured — even a single-threaded C
+	// program doing the same accept-then-abort sequence finds fd 0 occupied by a
+	// different socket bound to a different port — and it is why this check asks
+	// whether *this* association is gone rather than whether the number is free.
+	before, nameErr := localPortOf(0)
+	if nameErr != nil {
+		report("SKIP cannot read the local port of fd 0: %v", nameErr)
+		os.Exit(0)
+	}
+
 	if err := conn.Abort(); err != nil {
 		report("FAIL Abort on fd 0 returned %v, want nil", err)
 		os.Exit(1)
 	}
-	if fdIsOpen(0) {
-		report("FAIL fd 0 is still open after Abort; the descriptor leaked")
+
+	if !fdIsOpen(0) {
+		// The descriptor was released and nothing has claimed it yet.
+		report("ok: Abort on fd 0 released the descriptor")
+		os.Exit(0)
+	}
+	// fd 0 is open. That is only a leak if it is still the same socket.
+	after, err := localPortOf(0)
+	if err != nil {
+		// Open but not a socket, or not nameable: whatever holds fd 0 now, it is
+		// not the association Abort was given.
+		report("ok: fd 0 was reclaimed by a non-socket after Abort (%v)", err)
+		os.Exit(0)
+	}
+	if after == before {
+		report("FAIL fd 0 is still the aborted association (local port %d); "+
+			"the descriptor leaked", before)
 		os.Exit(1)
 	}
-	report("ok: Abort on fd 0 released the descriptor")
+	report("ok: Abort released fd 0; it was reclaimed by a different socket "+
+		"(port %d, was %d)", after, before)
 	os.Exit(0)
+}
+
+// localPortOf reports the port fd is bound to, and fails if fd is not a bound
+// socket. It is what distinguishes "this association is still open" from "some
+// other socket has taken this descriptor number".
+func localPortOf(fd int) (int, error) {
+	sa, err := syscall.Getsockname(fd)
+	if err != nil {
+		return 0, err
+	}
+	switch a := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return a.Port, nil
+	case *syscall.SockaddrInet6:
+		return a.Port, nil
+	default:
+		return 0, fmt.Errorf("fd %d is a %T, not an IP socket", fd, sa)
+	}
 }
 
 // TestCloseDoesNotLeakDescriptors is the general form: repeated dial/close
