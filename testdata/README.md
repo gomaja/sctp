@@ -144,8 +144,11 @@ while the server is still reading, so the server sometimes reads that ABORT as
 ECONNRESET instead of a clean EOF.
 
 This is not a regression from the changes on this branch. The merge base
-(`65af41a`) sets the same linger before the same `close()`, and measures the
-same way: 14 of 15 runs pass there, and 15 consecutive runs pass on this tree.
+(`65af41a`) sets the same linger before the same `close()` and fails the same
+way at the same rate: measured back to back, 14 of 15 runs pass at the merge
+base and 13 of 15 on this tree, which is the same rate within the noise of a
+sample that size.
+
 Making the linger conditional on whether the handshake completed would fix it,
 but that changes teardown behaviour every caller depends on and is left alone
 for now.
