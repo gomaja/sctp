@@ -24,3 +24,5 @@ testdata/repro/go.sum
 *.pcap
 testdata/closeprobe/go.mod
 testdata/closeprobe/go.sum
+testdata/notifyprobe/go.mod
+testdata/notifyprobe/go.sum

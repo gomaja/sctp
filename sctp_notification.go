@@ -38,9 +38,12 @@ type Notification interface {
 }
 
 // ErrShortNotification is returned by ParseNotification when the buffer is
-// too short to contain the notification it claims to be. This happens when a
-// notification is truncated to a read buffer smaller than the event, so the
-// caller should read with a buffer of at least NotificationMaxSize.
+// too short to hold the notification it declares itself to be.
+//
+// The kernel truncates a notification to whatever buffer the caller passed:
+// reading with a 16 byte buffer delivers a 16 byte SCTP_ASSOC_CHANGE, four
+// bytes short of the 20 byte event, and the remainder is dropped rather than
+// queued. Read with a buffer of at least NotificationMaxSize to avoid it.
 var ErrShortNotification = errors.New("sctp: notification truncated")
 
 // NotificationMaxSize is a read buffer size large enough for any notification

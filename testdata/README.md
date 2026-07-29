@@ -76,3 +76,43 @@ docker run --rm --privileged --net=host -v "$PWD":/src -w /src sctp-test \
 
 Each mode runs on its own port so the capture can be split per association.
 `closeprobe/` is the driver it builds.
+
+## Notification wire verification
+
+Confirms that the notifications `ParseNotification` decodes describe the
+association teardown that actually happened on the wire, which in-process
+assertions cannot show on their own.
+
+```sh
+docker run --rm --privileged --net=host -v "$PWD":/src -w /src sctp-test \
+    bash testdata/tshark-notify.sh
+```
+
+Three cases run. Subscribed with a graceful close: SHUTDOWN, SHUTDOWN_ACK and
+SHUTDOWN_COMPLETE on the wire, and SCTP_SHUTDOWN_EVENT plus
+ASSOC_CHANGE(SHUTDOWN_COMP) at the API. Subscribed with an abort: an ABORT
+chunk on the wire and ASSOC_CHANGE(COMM_LOST) at the API. Unsubscribed: the
+same teardown chunks on the wire and no notifications at all.
+
+The unsubscribed case is the one that gives the other two their meaning. A
+build that emitted notifications unconditionally would pass the first two and
+fail only this one.
+
+`notifyprobe/` is the driver it builds.
+
+### Truncation
+
+The kernel truncates a notification to the caller's read buffer and drops the
+remainder rather than queueing it. Reading with a 16 byte buffer delivers a 16
+byte SCTP_ASSOC_CHANGE, four bytes short of the 20 byte event:
+
+```
+read buffer = 16 bytes; real kernel notifications:
+  [0] type=0x8005 len=12    SHUTDOWN
+  [1] type=0x8001 len=16    ASSOC_CHANGE, truncated from 20
+  [2] type=0x150e len=4     fragment
+```
+
+`TestKernelTruncatesNotificationToReadBuffer` covers this against a real
+kernel. Removing the length check in ParseNotification makes it panic with
+`slice bounds out of range [:20] with capacity 16` inside the read path.

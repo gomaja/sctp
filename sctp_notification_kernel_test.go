@@ -19,6 +19,7 @@
 package sctp
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -137,4 +138,105 @@ func TestParseNotificationAgainstKernel(t *testing.T) {
 		}
 	}
 	t.Logf("parsed %d kernel notifications, types seen: %v", len(captured), seen)
+}
+
+// TestKernelTruncatesNotificationToReadBuffer establishes that the length
+// checks in ParseNotification guard a reachable case rather than a theoretical
+// one.
+//
+// The kernel truncates a notification to the caller's read buffer and drops
+// the remainder. With a 16 byte buffer it delivers a 16 byte
+// SCTP_ASSOC_CHANGE, four bytes short of the 20 byte event. A parser that
+// reads its fields without checking the length walks off the end of that
+// buffer and panics inside the read path.
+func TestKernelTruncatesNotificationToReadBuffer(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		sizes []int
+		bad   []error
+	)
+	cfg := &SocketConfig{
+		NotificationHandler: func(b []byte) error {
+			mu.Lock()
+			sizes = append(sizes, len(b))
+			// Parsing must report truncation, not panic and not invent a value.
+			if _, err := ParseNotification(b); err != nil && !errors.Is(err, ErrShortNotification) {
+				bad = append(bad, err)
+			}
+			mu.Unlock()
+			return nil
+		},
+	}
+
+	addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	ln, err := cfg.Listen("sctp", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	accCh := make(chan *SCTPConn, 1)
+	go func() {
+		c, _ := ln.AcceptSCTP()
+		accCh <- c
+	}()
+
+	client, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	server := <-accCh
+	if server == nil {
+		t.Fatal("accept returned no connection")
+	}
+	if err := server.SubscribeEvents(SCTP_EVENT_ASSOCIATION | SCTP_EVENT_SHUTDOWN); err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+
+	// Deliberately smaller than sctp_assoc_change.
+	buf := make([]byte, 16)
+	for i := 0; i < 8; i++ {
+		if _, _, err := server.SCTPRead(buf); err != nil {
+			break
+		}
+	}
+	_ = server.Abort()
+
+	mu.Lock()
+	got := append([]int(nil), sizes...)
+	errs := append([]error(nil), bad...)
+	mu.Unlock()
+
+	for _, err := range errs {
+		t.Errorf("ParseNotification on a truncated notification = %v, "+
+			"want nil or ErrShortNotification", err)
+	}
+
+	if len(got) == 0 {
+		t.Skip("kernel delivered no notification; nothing to verify")
+	}
+	t.Logf("notification sizes delivered into a 16 byte buffer: %v", got)
+
+	// At least one must come back short of the 20 byte assoc change, or this
+	// test is not actually exercising the truncation it claims to.
+	short := false
+	for _, n := range got {
+		if n > 16 {
+			t.Errorf("kernel delivered %d bytes into a 16 byte buffer", n)
+		}
+		if n < assocChangeMinSize {
+			short = true
+		}
+	}
+	if !short {
+		t.Errorf("no notification came back shorter than %d bytes, so the "+
+			"truncation path was never exercised: sizes were %v",
+			assocChangeMinSize, got)
+	}
 }
