@@ -151,12 +151,33 @@ pins this; `layoutprobe/` is the C program the numbers came from. The test earns
 its place on field *reorders*, which keep the struct size identical and are
 otherwise silent — the same class as the `sctp_pdapi_event` bug recorded above.
 
+Re-run the probe when targeting a new kernel, and update the test if the numbers
+move:
+
+```sh
+docker run --rm --privileged -v "$PWD":/src -w /src sctp-test bash -c '
+  apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null 2>&1
+  gcc -o /tmp/lp /src/testdata/layoutprobe/main.c -lsctp && /tmp/lp'
+```
+
+```
+sctp_paddrinfo size=152 assoc@0 addr@4 state@132 cwnd@136 srtt@140 rto@144 mtu@148
+sctp_status size=176 assoc@0 state@4 rwnd@8 unack@12 pend@14 in@16 out@18 frag@20 prim@24
+sctp_rtoinfo size=16  sctp_assocparams size=20  sctp_initmsg size=8
+sctp_assoc_value size=8  sctp_sndrcvinfo size=32  sctp_event_subscribe size=14
+```
+
+The test asserts the Go side against these; it cannot detect a kernel that
+changes its own layout.
+
 **Two RFC-deprecated APIs are still in use.** RFC 6458 §6.2.2 deprecates
 `SCTP_EVENTS`, and §5.3.2 titles `SCTP_SNDRCV` "DEPRECATED", directing callers
 to `SCTP_SNDINFO`/`SCTP_RCVINFO`. `SubscribeEvent` now provides the `SCTP_EVENT`
 replacement; `SCTPRead`/`SCTPWrite` still use `SCTP_SNDRCV`, and
 `SetRecvRcvInfo`/`SetRecvNxtInfo` enable the modern ancillary data for callers
-driving `recvmsg` themselves.
+driving `recvmsg` themselves. That the option changes delivery rather than only
+the flag was checked with a C `recvmsg` probe walking the control messages:
+enabled, an `SCTP_RCVINFO` cmsg is present; disabled, it is absent.
 
 **`SCTP_EVENT` and `SCTP_EVENTS` are not one state once an association exists.**
 Measured, and contrary to the obvious assumption: on an unconnected socket a
