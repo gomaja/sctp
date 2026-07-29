@@ -196,12 +196,43 @@ bytes and leaves the caller's remaining buffer untouched.
 and RFC 6458 — they are Linux behaviour, so the residual `SCTPConnect`
 `EALREADY` gap needs the kernel source, not the specification.
 
-Options present in RFC 6458 §8 but not yet bound: `SCTP_FRAGMENT_INTERLEAVE`,
-`SCTP_PARTIAL_DELIVERY_POINT`, `SCTP_MAX_BURST`, `SCTP_CONTEXT`,
-`SCTP_REUSE_PORT`, `SCTP_DEFAULT_SNDINFO`, `SCTP_AUTO_ASCONF`,
-`SCTP_DEFAULT_PRINFO`, and the RFC 4895 `SCTP_AUTH_*` family. The
-`SCTP_GET_ASSOC_*` options apply to one-to-many sockets, which this package does
-not create.
+**Three kernel behaviours differ from what RFC 6458 describes**, each measured
+with a C probe before the option was bound:
+
+| Option | RFC says | Linux does |
+|---|---|---|
+| `SCTP_FRAGMENT_INTERLEAVE` | levels other than 0/1/2 "return an error" | accepts level 3 silently — so `SetFragmentInterleave` validates in Go |
+| `SCTP_FRAGMENT_INTERLEAVE` level 2 | applies to one-to-many sockets | accepted on one-to-one but reads back as level 1; the test asserts the cap |
+| `SCTP_REUSE_PORT` | set it before bind | **EFAULT** on a bound or connected socket rather than being ignored |
+
+`SCTP_MAX_BURST` defaults to 4, as §8.1.24 documents. Its `int` and
+`sctp_assoc_value` forms are genuinely interchangeable on a one-to-one socket
+(same readback, same reported length, `assoc_id` ignored), which is why a
+mutation swapping them survives — recorded rather than papered over.
+
+**The read path accepts both ancillary-data forms.** RFC 6458 §5.3.2 titles
+`SCTP_SNDRCV` "DEPRECATED" in favour of `SCTP_SNDINFO`/`SCTP_RCVINFO`. Enabling
+only `SCTP_RECVRCVINFO` used to lose the message's stream and PPID silently — the
+kernel sent a cmsg type nothing recognised and `SCTPRead` returned a nil
+`SndRcvInfo` with no error:
+
+```
+sndrcv   n=1 stream=3 ppid=7
+rcvinfo  n=1 info=nil   <-- stream/ppid LOST
+both     n=1 stream=3 ppid=7
+```
+
+`parseSndRcvInfo` now handles both, with `SCTP_SNDRCV` winning when both are
+present so existing callers see unchanged bytes. `RcvInfo` orders its fields
+differently from `SndRcvInfo` — `TSN` and `CumTSN` precede `Context` instead of
+following it — so the conversion copies fields rather than reinterpreting memory,
+and `TestRcvInfoAndSndRcvBothParsed` anchors `Context` against a known
+`SetContext` value to catch a mapping slip that `Stream`/`PPID` alone would miss.
+
+Options present in RFC 6458 §8 but still not bound: `SCTP_DEFAULT_SNDINFO`,
+`SCTP_AUTO_ASCONF`, `SCTP_DEFAULT_PRINFO`, and the RFC 4895 `SCTP_AUTH_*`
+family. The `SCTP_GET_ASSOC_*` options apply to one-to-many sockets, which this
+package does not create.
 
 ## Address decoding
 
