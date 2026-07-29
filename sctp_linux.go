@@ -23,6 +23,8 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -458,7 +460,20 @@ func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, contr
 			return nil, err
 		}
 	}
-	err = syscall.Listen(sock, syscall.SOMAXCONN)
+	// syscall.SOMAXCONN is a compile-time constant of 128 in Go, not the
+	// running kernel's net.core.somaxconn, which has defaulted to 4096 since
+	// Linux 5.4. Passing 128 caps the accept backlog an order of magnitude
+	// below what the system allows, and a listener that is handed more
+	// simultaneous INITs than that answers the excess with ABORT: the peer
+	// sees ECONNREFUSED even though the listener is healthy and accepting.
+	//
+	// The kernel clamps whatever is passed to its own somaxconn, so asking
+	// for more than it permits is safe and gets the configured maximum.
+	backlog := syscall.SOMAXCONN
+	if n, err := readSomaxconn(); err == nil && n > backlog {
+		backlog = n
+	}
+	err = syscall.Listen(sock, backlog)
 	if err != nil {
 		return nil, err
 	}
@@ -600,4 +615,20 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 		return nil, err
 	}
 	return NewSCTPConn(sock, notificationHandler), nil
+}
+
+// readSomaxconn reports the kernel's net.core.somaxconn, which bounds the
+// accept backlog a listener may request. It is read rather than assumed
+// because syscall.SOMAXCONN is a Go constant of 128 and has not tracked the
+// kernel default since Linux 5.4 raised it to 4096.
+func readSomaxconn() (int, error) {
+	b, err := os.ReadFile("/proc/sys/net/core/somaxconn")
+	if err != nil {
+		return 0, err
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
