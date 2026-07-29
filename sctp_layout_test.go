@@ -98,6 +98,22 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 		assertSize(t, "EventSubscribe", unsafe.Sizeof(e), 10)
 	})
 
+	t.Run("RcvInfo", func(t *testing.T) {
+		var r RcvInfo
+		// struct sctp_rcvinfo, RFC 6458 §5.3.5. The field order differs from
+		// SndRcvInfo — TSN and CumTSN precede Context here — so these offsets are
+		// what stops the two being confused as raw memory.
+		assertSize(t, "RcvInfo", unsafe.Sizeof(r), 28)
+		assertOffset(t, "SID", unsafe.Offsetof(r.SID), 0)
+		assertOffset(t, "SSN", unsafe.Offsetof(r.SSN), 2)
+		assertOffset(t, "Flags", unsafe.Offsetof(r.Flags), 4)
+		assertOffset(t, "PPID", unsafe.Offsetof(r.PPID), 8)
+		assertOffset(t, "TSN", unsafe.Offsetof(r.TSN), 12)
+		assertOffset(t, "CumTSN", unsafe.Offsetof(r.CumTSN), 16)
+		assertOffset(t, "Context", unsafe.Offsetof(r.Context), 20)
+		assertOffset(t, "AssocID", unsafe.Offsetof(r.AssocID), 24)
+	})
+
 	t.Run("Event", func(t *testing.T) {
 		var e Event
 		assertSize(t, "Event", unsafe.Sizeof(e), 8)

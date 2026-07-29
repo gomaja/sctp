@@ -90,6 +90,50 @@ const (
 	// SCTP_RECVNXTINFO makes the kernel return SCTP_NXTINFO, describing the
 	// message *after* the one being read (RFC 6458 §8.1.30).
 	SCTP_RECVNXTINFO = 33
+
+	// SCTP_FRAGMENT_INTERLEAVE controls whether a partial delivery on one
+	// stream blocks messages on the others (RFC 6458 §8.1.20).
+	SCTP_FRAGMENT_INTERLEAVE = 18
+	// SCTP_PARTIAL_DELIVERY_POINT is the message size at which the partial
+	// delivery API is invoked (RFC 6458 §8.1.21).
+	SCTP_PARTIAL_DELIVERY_POINT = 19
+	// SCTP_MAX_BURST bounds how many packets may be emitted back to back
+	// (RFC 6458 §8.1.24). The kernel default is 4.
+	SCTP_MAX_BURST = 20
+	// SCTP_CONTEXT is the default context reported with messages received from
+	// the peer (RFC 6458 §8.1.25).
+	SCTP_CONTEXT = 17
+	// SCTP_REUSE_PORT allows several endpoints to bind the same port
+	// (RFC 6458 §8.1.27). One-to-one sockets only, which is all this package
+	// creates.
+	SCTP_REUSE_PORT = 36
+)
+
+// Fragmented interleave levels for SetFragmentInterleave (RFC 6458 §8.1.20).
+//
+// The kernel does not police these — a level of 3 is accepted and leaves the
+// receiver in a state the specification does not describe, which was measured.
+// SetFragmentInterleave rejects anything outside this set so that the invalid
+// value fails at the call rather than silently later.
+const (
+	// SCTPFragmentInterleaveNone blocks every other message while a partial
+	// delivery is in progress. This is the kernel default.
+	SCTPFragmentInterleaveNone = 0
+	// SCTPFragmentInterleaveOther allows messages from other associations to be
+	// delivered during a partial delivery, but not from other streams of this
+	// one.
+	SCTPFragmentInterleaveOther = 1
+	// SCTPFragmentInterleaveStreams additionally allows messages from other
+	// streams of the same association.
+	//
+	// RFC 6458 §8.1.20 describes this level as applying to one-to-many style
+	// sockets, and Linux enforces that: setting it on the one-to-one sockets
+	// this package creates succeeds but reads back as
+	// SCTPFragmentInterleaveOther. That was measured on both connected and
+	// unconnected sockets. It is defined here for completeness and for callers
+	// working with a descriptor from elsewhere; do not expect it to stick on a
+	// socket from this package.
+	SCTPFragmentInterleaveStreams = 2
 )
 
 const (
@@ -165,6 +209,39 @@ type EventSubscribe struct {
 // to make the layout the kernel expects visible at the declaration rather than
 // implied by alignment rules. TestEventStructMatchesKernel asserts the size and
 // every offset.
+// RcvInfo mirrors struct sctp_rcvinfo (RFC 6458 §5.3.5), the per-message
+// receive information the kernel attaches as SCTP_RCVINFO ancillary data once
+// SetRecvRcvInfo is enabled.
+//
+// It is the non-deprecated half of what SndRcvInfo carries: RFC 6458 §5.3.2
+// titles SCTP_SNDRCV "DEPRECATED" and splits it into SCTP_SNDINFO for sending
+// and this for receiving. The field order is not the same as SndRcvInfo's —
+// TSN and CumTSN come before Context here and after it there — so the two are
+// not interchangeable as raw memory.
+//
+// TestStructLayoutsMatchKernel pins the layout. Callers normally do not need
+// this type: SCTPRead converts whichever form the kernel sent into SndRcvInfo.
+type RcvInfo struct {
+	// SID is the stream the message arrived on.
+	SID uint16
+	// SSN is the stream sequence number.
+	SSN uint16
+	// Flags carries SCTP_UNORDERED and friends.
+	Flags uint16
+	_     uint16
+	// PPID is the payload protocol identifier, in network byte order as the
+	// kernel delivers it. SCTPRead converts it.
+	PPID uint32
+	// TSN is the transmission sequence number.
+	TSN uint32
+	// CumTSN is the cumulative TSN acknowledged.
+	CumTSN uint32
+	// Context is the value set with SetContext.
+	Context uint32
+	// AssocID identifies the association; ignored on one-to-one sockets.
+	AssocID SCTPAssocID
+}
+
 type Event struct {
 	// AssocID is ignored on the one-to-one style sockets this package creates.
 	AssocID SCTPAssocID
@@ -948,6 +1025,159 @@ func (c *SCTPConn) GetMaxSegSize() (int, error) {
 		return 0, err
 	}
 	return int(val.AssocVal), nil
+}
+
+// SetFragmentInterleave controls whether a partial delivery on one stream
+// blocks delivery of messages on the others (RFC 6458 §8.1.20).
+//
+// level must be one of SCTPFragmentInterleaveNone, ...Other or ...Streams. The
+// kernel accepts out-of-range levels without complaint — a level of 3 is taken
+// and leaves the receiver in a state the specification does not define, which
+// was measured against a live kernel — so the check here is what keeps an
+// invalid value from becoming undefined behaviour later.
+//
+// The default is SCTPFragmentInterleaveNone, which blocks every other message
+// while a partial delivery is in progress. ...Other is the highest level that
+// takes effect on the one-to-one sockets this package creates: Linux accepts
+// ...Streams but reads it back as ...Other, which was measured. Callers wanting
+// to relax head-of-line blocking on a one-to-one socket should therefore set
+// ...Other and read the value back rather than assume ...Streams applied.
+func (c *SCTPConn) SetFragmentInterleave(level int) error {
+	switch level {
+	case SCTPFragmentInterleaveNone, SCTPFragmentInterleaveOther,
+		SCTPFragmentInterleaveStreams:
+	default:
+		return fmt.Errorf("sctp: fragment interleave level %d is not one of 0, 1 or 2", level)
+	}
+	return setsockoptInt32(c.fd(), SCTP_FRAGMENT_INTERLEAVE, int32(level))
+}
+
+// GetFragmentInterleave reports the current fragmented interleave level.
+func (c *SCTPConn) GetFragmentInterleave() (int, error) {
+	v, err := getsockoptInt32(c.fd(), SCTP_FRAGMENT_INTERLEAVE)
+	return int(v), err
+}
+
+// SetPartialDeliveryPoint sets the message size, in bytes, at which the kernel
+// starts delivering a message piecewise to free receive window for the peer
+// (RFC 6458 §8.1.21).
+//
+// A lower value makes partial delivery happen more often. RFC 6458 notes the
+// call fails if the value exceeds the socket receive buffer, so a caller raising
+// this should raise SO_RCVBUF first.
+//
+// The negative check below is for the message, not for safety: a negative value
+// reaches the kernel as a large unsigned number, which it already rejects with
+// EINVAL for exceeding the receive buffer. Removing the check therefore keeps
+// the tests green — it changes "partial delivery point -1 is negative" into
+// "invalid argument", which is correct but says less.
+func (c *SCTPConn) SetPartialDeliveryPoint(bytes int) error {
+	if bytes < 0 {
+		return fmt.Errorf("sctp: partial delivery point %d is negative", bytes)
+	}
+	return setsockoptInt32(c.fd(), SCTP_PARTIAL_DELIVERY_POINT, int32(bytes))
+}
+
+// GetPartialDeliveryPoint reports the current partial delivery point in bytes.
+func (c *SCTPConn) GetPartialDeliveryPoint() (int, error) {
+	v, err := getsockoptInt32(c.fd(), SCTP_PARTIAL_DELIVERY_POINT)
+	return int(v), err
+}
+
+// SetMaxBurst bounds how many packets the association may emit back to back
+// (RFC 6458 §8.1.24).
+//
+// Zero disables burst mitigation. The kernel default is 4, which was read back
+// rather than taken from the specification.
+func (c *SCTPConn) SetMaxBurst(burst int) error {
+	if burst < 0 || int64(burst) > int64(^uint32(0)) {
+		return fmt.Errorf("sctp: max burst %d out of range", burst)
+	}
+	return setAssocValue(c.fd(), SCTP_MAX_BURST, uint32(burst))
+}
+
+// GetMaxBurst reports the current maximum burst.
+func (c *SCTPConn) GetMaxBurst() (int, error) {
+	v, err := getAssocValue(c.fd(), SCTP_MAX_BURST)
+	return int(v), err
+}
+
+// SetContext sets the context value reported with messages received from the
+// peer (RFC 6458 §8.1.25).
+//
+// Per the RFC this affects received messages only; it does not change the
+// context saved with outbound messages, which SCTPWrite carries per message in
+// SndRcvInfo.Context.
+func (c *SCTPConn) SetContext(context uint32) error {
+	return setAssocValue(c.fd(), SCTP_CONTEXT, context)
+}
+
+// GetContext reports the current default context.
+func (c *SCTPConn) GetContext() (uint32, error) {
+	return getAssocValue(c.fd(), SCTP_CONTEXT)
+}
+
+// SetReusePort enables or disables binding several endpoints to one port
+// (RFC 6458 §8.1.27).
+//
+// RFC 6458 restricts this to one-to-one style sockets, which is the only style
+// this package creates, and says it has to be set before bind.
+//
+// Linux enforces that strictly: on a socket that is already bound or connected
+// the call fails with EFAULT rather than being ignored, which was measured. A
+// connection returned by DialSCTP or AcceptSCTP is therefore always too late —
+// the option is only useful on a descriptor obtained before bind, for example
+// inside the Control hook of a SocketConfig.
+func (c *SCTPConn) SetReusePort(on bool) error {
+	return setsockoptInt(c.fd(), SCTP_REUSE_PORT, on)
+}
+
+// GetReusePort reports whether port reuse is enabled.
+func (c *SCTPConn) GetReusePort() (bool, error) {
+	v, err := getsockoptInt32(c.fd(), SCTP_REUSE_PORT)
+	return v != 0, err
+}
+
+// setsockoptInt32 sets one of the plain integer-valued SCTP options. RFC 6458
+// specifies these as taking an integer, and the kernel reports a 4 byte option
+// length for each of them.
+func setsockoptInt32(fd int, optname uintptr, val int32) error {
+	_, _, err := setsockopt(fd, optname, uintptr(unsafe.Pointer(&val)),
+		unsafe.Sizeof(val))
+	return err
+}
+
+// getsockoptInt32 reads one of the plain integer-valued SCTP options.
+func getsockoptInt32(fd int, optname uintptr) (int32, error) {
+	var val int32
+	optlen := unsafe.Sizeof(val)
+	_, _, err := getsockopt(fd, optname, uintptr(unsafe.Pointer(&val)),
+		uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return 0, err
+	}
+	return val, nil
+}
+
+// setAssocValue sets one of the options carrying struct sctp_assoc_value. The
+// association id is left zero, which one-to-one sockets ignore.
+func setAssocValue(fd int, optname uintptr, val uint32) error {
+	av := AssocValue{AssocVal: val}
+	_, _, err := setsockopt(fd, optname, uintptr(unsafe.Pointer(&av)),
+		unsafe.Sizeof(av))
+	return err
+}
+
+// getAssocValue reads one of the options carrying struct sctp_assoc_value.
+func getAssocValue(fd int, optname uintptr) (uint32, error) {
+	av := AssocValue{}
+	optlen := unsafe.Sizeof(av)
+	_, _, err := getsockopt(fd, optname, uintptr(unsafe.Pointer(&av)),
+		uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return 0, err
+	}
+	return av.AssocVal, nil
 }
 
 func (c *SCTPConn) GetStatus() (*Status, error) { // Status

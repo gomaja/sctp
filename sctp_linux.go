@@ -118,23 +118,67 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
 }
 
+// parseSndRcvInfo extracts the per-message information from a control message
+// buffer, accepting either form the kernel may have sent.
+//
+// SCTP_SNDRCV is what SubscribeEvents(SCTP_EVENT_DATA_IO) asks for, and RFC 6458
+// §5.3.2 titles it "DEPRECATED", directing callers to SCTP_SNDINFO for sending
+// and SCTP_RCVINFO (§5.3.5) for receiving. SetRecvRcvInfo enables the latter.
+//
+// Both are handled here because enabling only the modern option used to lose the
+// message's stream and PPID silently: the kernel sent SCTP_RCVINFO, nothing here
+// recognised it, and SCTPRead returned a nil SndRcvInfo with no error. That was
+// measured, and it is the reason this function does not simply prefer one type.
+//
+// SCTP_SNDRCV wins when both are present, so a caller that has enabled both
+// keeps the exact bytes it had before. The result is always an *SndRcvInfo, which
+// keeps the return type of SCTPRead unchanged; RcvInfo carries no TTL, so that
+// field stays zero when the information came from SCTP_RCVINFO.
 func parseSndRcvInfo(b []byte) (*SndRcvInfo, error) {
 	msgs, err := syscall.ParseSocketControlMessage(b)
 	if err != nil {
 		return nil, err
 	}
+	var fromRcvInfo *SndRcvInfo
 	for _, m := range msgs {
-		if m.Header.Level == syscall.IPPROTO_SCTP {
-			switch m.Header.Type {
-			case SCTP_CMSG_SNDRCV:
-				dst := (*SndRcvInfo)(unsafe.Pointer(&m.Data[0]))
-				// Fix PPID to host byte order
-				dst.PPID = ntohl(dst.PPID)
-				return dst, nil
+		if m.Header.Level != syscall.IPPROTO_SCTP {
+			continue
+		}
+		switch m.Header.Type {
+		case SCTP_CMSG_SNDRCV:
+			if len(m.Data) < int(unsafe.Sizeof(SndRcvInfo{})) {
+				// A short control message would make the cast read past the
+				// buffer the kernel filled. No test covers this branch and
+				// removing it keeps the suite green: reaching it needs a kernel
+				// that sends a truncated cmsg, which is not reproducible from
+				// here. It is kept because the cost is a length comparison and
+				// the alternative is an out-of-bounds read.
+				continue
+			}
+			dst := (*SndRcvInfo)(unsafe.Pointer(&m.Data[0]))
+			// Fix PPID to host byte order
+			dst.PPID = ntohl(dst.PPID)
+			return dst, nil
+		case SCTP_CMSG_RCVINFO:
+			if len(m.Data) < int(unsafe.Sizeof(RcvInfo{})) {
+				continue
+			}
+			ri := (*RcvInfo)(unsafe.Pointer(&m.Data[0]))
+			// Copy rather than alias: the field order differs from SndRcvInfo,
+			// so this is a conversion and not a reinterpretation.
+			fromRcvInfo = &SndRcvInfo{
+				Stream:  ri.SID,
+				SSN:     ri.SSN,
+				Flags:   ri.Flags,
+				PPID:    ntohl(ri.PPID),
+				Context: ri.Context,
+				TSN:     ri.TSN,
+				CumTSN:  ri.CumTSN,
+				AssocID: int32(ri.AssocID),
 			}
 		}
 	}
-	return nil, nil
+	return fromRcvInfo, nil
 }
 
 // SCTPRead reads one message, or as much of one message as fits in b.
