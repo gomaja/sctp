@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"reflect"
 	"runtime"
@@ -235,9 +234,9 @@ func TestGetStatus(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Create a random port to avoid conflicts when running tests in parallel
-			port := 5000 + rand.Intn(1000)
-			addr, err := ResolveSCTPAddr("sctp", fmt.Sprintf("127.0.0.1:%d", port))
+			// See TestGetStatusUsage: let the kernel choose the port rather
+			// than gambling on a free one.
+			addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatalf("Failed to resolve address: %v", err)
 			}
@@ -317,9 +316,12 @@ func TestGetStatus(t *testing.T) {
 }
 
 func TestGetStatusUsage(t *testing.T) {
-	// Create a random port to avoid conflicts when running tests in parallel
-	port := 5000 + rand.Intn(1000)
-	addr, err := ResolveSCTPAddr("sctp", fmt.Sprintf("127.0.0.1:%d", port))
+	// Port 0 lets the kernel pick a free port. Drawing a random one from a
+	// fixed range does not avoid conflicts, it only makes them rare: nothing
+	// checks the port is free, and TestGetStatus draws four more from the same
+	// thousand values, so roughly one full-suite run in a hundred picks a
+	// number already in use and fails on the bind.
+	addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to resolve address: %v", err)
 	}
