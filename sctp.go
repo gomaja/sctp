@@ -162,13 +162,75 @@ type SackTimer struct {
 	SackFrequency uint32
 }
 
+// RtoInfo mirrors struct sctp_rtoinfo (RFC 6458 8.1.1, SCTP_RTOINFO). It
+// governs the retransmission timer, and with it how quickly the stack gives up
+// on an unresponsive peer.
+//
+// All durations are milliseconds. A zero field means "leave unchanged" on a
+// set, which is how the kernel reads it.
+type RtoInfo struct {
+	AssocID SCTPAssocID
+	// Initial is the RTO used before any round trip has been measured.
+	Initial uint32
+	// Max caps the exponential backoff. Combined with AssocInfo.AsocMaxRxt it
+	// bounds how long a send can sit unacknowledged before the association is
+	// declared failed: the retransmission intervals double up to Max, so a
+	// large Max means a peer that vanishes is noticed only after minutes.
+	Max uint32
+	// Min floors the RTO.
+	Min uint32
+}
+
+// AssocInfo mirrors struct sctp_assocparams (RFC 6458 8.1.2, SCTP_ASSOCINFO).
+//
+// AsocMaxRxt is the field that matters for detecting an unreachable peer: it
+// is Association.Max.Retrans from RFC 4960 section 8.2. Once that many
+// consecutive retransmissions to a peer go unacknowledged, the association is
+// torn down and the socket becomes readable with an error. Lowering it, and
+// lowering RtoInfo.Max, is what turns a silent black hole into a prompt,
+// reportable failure.
+type AssocInfo struct {
+	AssocID SCTPAssocID
+	// AsocMaxRxt is the maximum retransmission attempts for the association.
+	AsocMaxRxt uint16
+	// NumberPeerDestinations is how many destination addresses the peer has.
+	NumberPeerDestinations uint16
+	// PeerRwnd is the peer's last reported receive window, minus outstanding
+	// data. It stops shrinking and stays put when a peer stops acknowledging,
+	// which makes it a useful companion signal to Status.Unackdata.
+	PeerRwnd uint32
+	// LocalRwnd is the last receive window reported to the peer.
+	LocalRwnd uint32
+	// CookieLife is the association's cookie lifetime, in milliseconds.
+	CookieLife uint32
+}
+
 type PeerState int32
 
+// Per-path states, from enum sctp_spinfo_state in the kernel's uapi
+// linux/sctp.h. The order is load-bearing: callers compare PeerAddrinfo.State
+// against these to decide whether a path is still usable, so the values must
+// match what the kernel reports rather than read in a natural-looking order.
 const (
-	SCTP_UNCONFIRMED PeerState = iota
+	// SCTP_INACTIVE means the path has failed: it has exceeded
+	// Path.Max.Retrans without a response. See RFC 4960 section 8.2.
+	SCTP_INACTIVE PeerState = iota
+	// SCTP_PF ("potentially failed") is an intermediate state from RFC 7829:
+	// some retransmissions have failed but the path is not yet declared
+	// inactive.
+	SCTP_PF
+	// SCTP_ACTIVE means the path is reachable and in use.
 	SCTP_ACTIVE
-	SCTP_INACTIVE
+	// SCTP_UNCONFIRMED means the path has not yet been validated by a
+	// heartbeat exchange.
+	SCTP_UNCONFIRMED
+
+	// SCTP_UNKNOWN is reported when the transport state is not known.
+	SCTP_UNKNOWN PeerState = 0xffff
 )
+
+// SCTP_POTENTIALLY_FAILED is the spelling RFC 7829 uses for SCTP_PF.
+const SCTP_POTENTIALLY_FAILED = SCTP_PF
 
 // PeerAddrinfo Parameters defined in RFC 6458 8.2.2 - Peer Address Information (SCTP_GET_PEER_ADDR_INFO)
 type PeerAddrinfo struct {
@@ -183,10 +245,15 @@ type PeerAddrinfo struct {
 
 type StatusState int32
 
+// Association states, from enum sctp_sstat_state in the kernel's uapi
+// linux/sctp.h, as reported by GetStatus.
+//
+// The enum begins at SCTP_EMPTY rather than SCTP_CLOSED, and has no SCTP_BOUND
+// or SCTP_LISTEN members. Numbering from SCTP_CLOSED = 0 shifts every state by
+// one, so an established association compares equal to SCTP_COOKIE_ECHOED.
 const (
-	SCTP_CLOSED StatusState = iota
-	SCTP_BOUND
-	SCTP_LISTEN
+	SCTP_EMPTY StatusState = iota
+	SCTP_CLOSED
 	SCTP_COOKIE_WAIT
 	SCTP_COOKIE_ECHOED
 	SCTP_ESTABLISHED
@@ -634,6 +701,62 @@ func (c *SCTPConn) GetSackTimer() (*SackTimer, error) { // SackTimer
 	return timer, err
 }
 
+// SetRtoInfo sets the association's retransmission timer parameters
+// (SCTP_RTOINFO). Fields left zero are unchanged.
+//
+// Reducing Max is half of making an unreachable peer detectable promptly; see
+// SetAssocInfo for the other half.
+func (c *SCTPConn) SetRtoInfo(info *RtoInfo) error {
+	optlen := unsafe.Sizeof(*info)
+	_, _, err := setsockopt(c.fd(), SCTP_RTOINFO, uintptr(unsafe.Pointer(info)), optlen)
+	return err
+}
+
+// GetRtoInfo reports the association's retransmission timer parameters.
+func (c *SCTPConn) GetRtoInfo() (*RtoInfo, error) {
+	info := &RtoInfo{}
+	optlen := unsafe.Sizeof(*info)
+	_, _, err := getsockopt(
+		c.fd(),
+		SCTP_RTOINFO,
+		uintptr(unsafe.Pointer(info)),
+		uintptr(unsafe.Pointer(&optlen)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// SetAssocInfo sets association parameters (SCTP_ASSOCINFO). Fields left zero
+// are unchanged.
+//
+// Setting AsocMaxRxt bounds how many unacknowledged retransmissions the stack
+// tolerates before declaring the association failed, which is what converts a
+// peer that has silently gone away into an error the application can see.
+func (c *SCTPConn) SetAssocInfo(info *AssocInfo) error {
+	optlen := unsafe.Sizeof(*info)
+	_, _, err := setsockopt(c.fd(), SCTP_ASSOCINFO, uintptr(unsafe.Pointer(info)), optlen)
+	return err
+}
+
+// GetAssocInfo reports association parameters, including the peer's last
+// advertised receive window.
+func (c *SCTPConn) GetAssocInfo() (*AssocInfo, error) {
+	info := &AssocInfo{}
+	optlen := unsafe.Sizeof(*info)
+	_, _, err := getsockopt(
+		c.fd(),
+		SCTP_ASSOCINFO,
+		uintptr(unsafe.Pointer(info)),
+		uintptr(unsafe.Pointer(&optlen)),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
 func (c *SCTPConn) GetStatus() (*Status, error) { // Status
 	sctpStatus := &Status{}
 	optlen := unsafe.Sizeof(*sctpStatus)
@@ -846,13 +969,20 @@ func toDeadlineErr(err error) error {
 }
 
 type SCTPListener struct {
-	fd                  int
+	// _fd is accessed atomically and set to -1 by Close, so a second Close
+	// cannot release a descriptor number the kernel has since handed to
+	// another socket. Use fd() to read it.
+	_fd                 int32
 	m                   sync.Mutex
 	notificationHandler NotificationHandler
 }
 
+func (ln *SCTPListener) fd() int {
+	return int(atomic.LoadInt32(&ln._fd))
+}
+
 func (ln *SCTPListener) Addr() net.Addr {
-	laddr, err := sctpGetAddrs(ln.fd, 0, SCTP_GET_LOCAL_ADDRS)
+	laddr, err := sctpGetAddrs(ln.fd(), 0, SCTP_GET_LOCAL_ADDRS)
 	if err != nil {
 		return nil
 	}

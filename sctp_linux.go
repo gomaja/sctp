@@ -452,7 +452,7 @@ func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, contr
 		return nil, err
 	}
 	return &SCTPListener{
-			fd:                  sock,
+			_fd:                 int32(sock),
 			notificationHandler: notificationHandler,
 		},
 		nil
@@ -475,15 +475,22 @@ func FileListener(file *os.File) (*SCTPListener, error) {
 	}
 
 	return &SCTPListener{
-		fd:                  int(r1),
+		_fd:                 int32(r1),
 		notificationHandler: nil,
 	}, nil
 }
 
 // AcceptSCTP waits for and returns the next SCTP connection to the listener.
 func (ln *SCTPListener) AcceptSCTP() (*SCTPConn, error) {
-	fd, _, err := syscall.Accept4(ln.fd, 0)
-	return NewSCTPConn(fd, ln.notificationHandler), err
+	lnfd := ln.fd()
+	if lnfd < 0 {
+		return nil, syscall.EBADF
+	}
+	fd, _, err := syscall.Accept4(lnfd, 0)
+	if err != nil {
+		return nil, err
+	}
+	return NewSCTPConn(fd, ln.notificationHandler), nil
 }
 
 // Accept waits for and returns the next connection connection to the listener.
@@ -491,13 +498,27 @@ func (ln *SCTPListener) Accept() (net.Conn, error) {
 	return ln.AcceptSCTP()
 }
 
+// Close releases the listening socket.
+//
+// The descriptor is swapped out atomically, so concurrent or repeated calls
+// report EBADF rather than closing the number a second time. That matters
+// because the kernel reuses descriptor numbers: without it, a second Close
+// could release a socket that had since been opened elsewhere in the process.
 func (ln *SCTPListener) Close() error {
-	syscall.Shutdown(ln.fd, syscall.SHUT_RDWR)
-	return syscall.Close(ln.fd)
+	fd := atomic.SwapInt32(&ln._fd, -1)
+	// Zero is a valid descriptor, so guard against negatives only.
+	if fd < 0 {
+		return syscall.EBADF
+	}
+	// Shutdown unblocks any Accept parked on this socket. It is expected to
+	// fail on a listening socket that never connected (ENOTCONN), so its
+	// result is not treated as a close failure.
+	_ = syscall.Shutdown(int(fd), syscall.SHUT_RDWR)
+	return syscall.Close(int(fd))
 }
 
 func (ln *SCTPListener) SyscallConn() (syscall.RawConn, error) {
-	fd := ln.fd
+	fd := ln.fd()
 	if fd < 0 {
 		return nil, syscall.EINVAL
 	}
