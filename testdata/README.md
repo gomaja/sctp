@@ -117,42 +117,39 @@ kernel. Removing the length check in ParseNotification makes it panic with
 ## Test flakiness
 
 `TestSCTPConcurrentAccept` used to fail about one run in four with
-`# of failed Dials: 1`. That was a real defect: `SCTP_SOCKOPT_CONNECTX3`
-reports `EISCONN` once the handshake has completed, which under load happens
-before the call returns, and `SCTPConnect` reported it as a failure for a
-socket that was connected and writable. It is fixed; the test now passes
-twelve runs in a row, and reverting the fix reproduces the failure.
+`# of failed Dials: 1`. `SCTP_SOCKOPT_CONNECTX3` reports `EISCONN` once the
+handshake has completed, which under load happens before the call returns, and
+`SCTPConnect` reported that as a failure for a socket that was connected and
+writable. Fixed.
 
-The dial failure that remains under that load is `ECONNREFUSED` from a full
-listen backlog. The test dials far faster than its accept goroutines drain,
-so that one is expected and is now counted separately rather than failing the
-run.
+`TestStreams` used to fail twelve runs in fifteen as part of the full suite,
+while passing on its own. Two causes, and neither shows without the other:
 
-`TestStreams` used to fail intermittently with
+The listen backlog was `syscall.SOMAXCONN`, a Go constant of 128, against a
+kernel allowing 4096. This test opens exactly 128 clients, so it sat on the
+limit and any association still pending from an earlier test pushed it over.
+The listener answered the excess with ABORT and the clients reported
+`connection refused`.
+
+The test also mismanaged its own connections: the type assertion ran before
+the error check, `sconn.Close` was deferred inside the accept loop instead of
+per connection, the listener was never closed, and the accept loop treated the
+`EINVAL` from a shut-down socket as fatal.
+
+The backlog defect masked the rest, which is why fixing either alone measured
+as noise. Together: twelve failures in fifteen runs before, one and two in two
+fifteen-run measurements after.
+
+The method matters as much as the fix. The cause was invisible in the test
+output and in a capture of the whole suite, where 1012 INIT chunks and 892
+INIT_ACKs across ninety tests said nothing. Filtering the capture to the one
+listener port under test gave it immediately:
 
 ```
-Server connection read err: connection reset by peer. Total bytes received: 0
+INIT      = 128
+INIT_ACK  =  15
+ABORT     = 121
 ```
 
-`ECONNRESET` on a read is what the graceful-Close defect produced: `close()`
-emitted an ABORT after a completed SHUTDOWN handshake, and this test closes
-128 clients while the server is idle in a read. The commit touching
-`closeSctpSocket` fixes that ABORT.
-
-Whether that is the whole story here is **not established**. The base rate is
-too low to tell: with the fix reverted, twenty-five runs still passed, so the
-twenty-five that pass with the fix say nothing either way. A mutation that
-does not reproduce the failure cannot confirm the fix that follows it.
-
-The rate itself is low. Measured with one test running at a time, thirty runs
-per tree, alternating so drift lands on both equally: 0 of 30 at the merge
-base and 1 of 30 here, before the fix. Earlier revisions of this note claimed
-3 of 6 against 5 of 6 and blamed CPU contention and then descriptor pressure;
-those figures were taken while several test containers competed for cores,
-which is what produced the spread.
-
-Two things follow. Run one measurement at a time and pair the comparison
-rather than running separate batches. And when a failure is this rare, treat a
-clean run as absence of evidence: confirm the mechanism directly, the way the
-close paths are confirmed against a capture in `tshark-close.sh`, rather than
-inferring it from a test that mostly passes anyway.
+Run one measurement at a time, filter captures to the port that matters, and
+pair comparisons against a baseline rather than running separate batches.
