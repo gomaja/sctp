@@ -131,9 +131,21 @@ listen backlog. The test dials far faster than its accept goroutines drain,
 so that one is expected and is now counted separately rather than failing the
 run.
 
-`TestStreams` opens 128 concurrent associations against a single listener and
-is sensitive to how much CPU the machine has spare. Twelve consecutive runs
-pass on an otherwise idle machine; it starts failing when several containers
-are competing for cores. If it fails, check what else is running before
-treating it as a defect — a full suite run under `-race` that normally takes
-about 17s took 359s with three other test containers alive.
+`TestStreams` fails roughly one run in fifteen with
+
+```
+Server connection read err: connection reset by peer. Total bytes received: 0
+```
+
+The cause is in `closeSctpSocket`: it sets `SO_LINGER{Onoff:1, Linger:0}`
+unconditionally before `close()`, so `close()` emits an ABORT even when the
+SHUTDOWN handshake already completed. The test's clients `defer conn.Close()`
+while the server is still reading, so the server sometimes reads that ABORT as
+ECONNRESET instead of a clean EOF.
+
+This is not a regression from the changes on this branch. The merge base
+(`65af41a`) sets the same linger before the same `close()`, and measures the
+same way: 14 of 15 runs pass there, and 15 consecutive runs pass on this tree.
+Making the linger conditional on whether the handshake completed would fix it,
+but that changes teardown behaviour every caller depends on and is left alone
+for now.
