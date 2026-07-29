@@ -16,10 +16,12 @@
 package sctp
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -51,18 +53,41 @@ func TestStreams(t *testing.T) {
 	addr = ln.Addr().(*SCTPAddr)
 	t.Logf("Listen on %s", ln.Addr())
 
+	var serverWG sync.WaitGroup
+	serverWG.Add(1)
 	go func() {
+		defer serverWG.Done()
 		for {
 			c, err := ln.Accept()
-			sconn := c.(*SCTPConn)
 			if err != nil {
+				// Closing the listener is how this loop is meant to stop.
+				// Close shuts the listening socket down before releasing it,
+				// so accept4 reports EINVAL on a socket that has been shut
+				// down and EBADF once the descriptor is gone. Either means
+				// the listener is closing, not that accepting failed.
+				if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.EINVAL) {
+					return
+				}
 				t.Errorf("failed to accept: %v", err)
 				return
 			}
-			defer sconn.Close()
+			// Assert only once err is known to be nil. Accept returns a nil
+			// connection alongside its error, and asserting first yields a
+			// nil *SCTPConn whose every call then fails with EBADF.
+			sconn, ok := c.(*SCTPConn)
+			if !ok || sconn == nil {
+				t.Errorf("accept returned %T, want *SCTPConn", c)
+				return
+			}
 
 			sconn.SubscribeEvents(SCTP_EVENT_DATA_IO)
-			go func() {
+			serverWG.Add(1)
+			go func(sconn *SCTPConn) {
+				// Close per connection, not per accept loop: the original
+				// deferred this inside the loop, so nothing was released
+				// until the loop itself ended.
+				defer serverWG.Done()
+				defer sconn.Close()
 				totalrcvd := 0
 				for {
 					buf := make([]byte, 512)
@@ -73,11 +98,17 @@ func TestStreams(t *testing.T) {
 								break
 							}
 							t.Logf("EOF on server connection. Total bytes received: %d, bytes received: %d", totalrcvd, n)
+						} else if errors.Is(err, syscall.ECONNRESET) {
+							// The client has gone. Whether it shut down or
+							// aborted is its business; this echo loop is done.
+							t.Logf("peer reset after %d bytes", totalrcvd)
+							return
 						} else {
 							t.Errorf("Server connection read err: %v. Total bytes received: %d, bytes received: %d", err, totalrcvd, n)
 							return
 						}
 					}
+					totalrcvd += n
 					t.Logf("server read: info: %+v, payload: %s", info, string(buf[:n]))
 					n, err = sconn.SCTPWrite(buf[:n], info)
 					if err != nil {
@@ -85,15 +116,15 @@ func TestStreams(t *testing.T) {
 						return
 					}
 				}
-			}()
+			}(sconn)
 		}
 	}()
 
-	wait := make(chan struct{})
-	i := 0
-	for ; i < STREAM_TEST_CLIENTS; i++ {
+	var clientWG sync.WaitGroup
+	clientWG.Add(STREAM_TEST_CLIENTS)
+	for i := 0; i < STREAM_TEST_CLIENTS; i++ {
 		go func(test int) {
-			defer func() { wait <- struct{}{} }()
+			defer clientWG.Done()
 			conn, err := DialSCTPExt(
 				"sctp", nil, addr, InitMsg{NumOstreams: STREAM_TEST_STREAMS, MaxInstreams: STREAM_TEST_STREAMS})
 			if err != nil {
@@ -140,17 +171,44 @@ func TestStreams(t *testing.T) {
 				}
 				rtext := string(buf[:rn])
 				if rtext != text {
-					t.Fatalf("Mismatched payload: %s != %s", rtext, text)
+					// Errorf, not Fatalf: this runs on a client goroutine,
+					// and Fatalf may only be called from the test goroutine.
+					t.Errorf("Mismatched payload: %s != %s", rtext, text)
+					return
 				}
 			}
 		}(i)
 	}
-	for ; i > 0; i-- {
-		select {
-		case <-wait:
-		case <-time.After(time.Second * 30):
-			close(wait)
-			t.Fatal("timed out")
-		}
+
+	// Wait for every client before touching the listener. Closing it while
+	// clients are still exchanging data tears down the associations they are
+	// using, and each peer then reports ECONNRESET.
+	clientDone := make(chan struct{})
+	go func() {
+		clientWG.Wait()
+		close(clientDone)
+	}()
+	select {
+	case <-clientDone:
+	case <-time.After(time.Second * 30):
+		t.Fatal("timed out waiting for clients")
+	}
+
+	// Now stop accepting. Without this the accept loop outlives the test and
+	// its t.Errorf calls are attributed to whichever test is running when
+	// they fire.
+	if err := ln.Close(); err != nil {
+		t.Errorf("listener close: %v", err)
+	}
+
+	serverDone := make(chan struct{})
+	go func() {
+		serverWG.Wait()
+		close(serverDone)
+	}()
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second * 30):
+		t.Fatal("timed out waiting for the server goroutines")
 	}
 }
