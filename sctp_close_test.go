@@ -54,6 +54,8 @@ func eorPairNoCleanup(t testingTB) (client, server *SCTPConn) {
 	t.Helper()
 	client, server, ok := eorPairMaybe(t)
 	if !ok {
+		// eorPairMaybe logs the dial or accept error before returning false,
+		// so that appears immediately above this line.
 		t.Fatalf("could not establish association")
 	}
 	return client, server
@@ -87,11 +89,16 @@ func eorPairMaybe(t testingTB) (client, server *SCTPConn, ok bool) {
 
 	client, err = dialRetry(ln.Addr().(*SCTPAddr))
 	if err != nil {
+		// Log rather than discard: callers that turn this into a failure
+		// would otherwise report only that no association could be made,
+		// leaving nothing to say why.
+		t.Logf("eorPair: dial failed after retries: %v", err)
 		return nil, nil, false
 	}
 
 	a := <-ch
 	if a.err != nil {
+		t.Logf("eorPair: accept failed: %v", a.err)
 		_ = client.Close()
 		return nil, nil, false
 	}

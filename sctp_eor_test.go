@@ -32,6 +32,7 @@ import (
 type testingTB interface {
 	Helper()
 	Fatalf(format string, args ...interface{})
+	Logf(format string, args ...interface{})
 	Cleanup(func())
 }
 
