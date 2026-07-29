@@ -499,10 +499,20 @@ func SCTPConnect(fd int, addr *SCTPAddr) (int, error) {
 	_, _, err := getsockopt(fd, SCTP_SOCKOPT_CONNECTX3, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
 	if err == nil {
 		return int(param.AssocID), nil
+	} else if err == syscall.EISCONN {
+		// The association is already up. CONNECTX3 reports EISCONN once the
+		// handshake has completed, which under load can happen before it
+		// returns: the socket is established and writable, so reporting a
+		// failure here throws away a working connection. AssocID is not filled
+		// in on this path; callers that need it read it back from the socket.
+		return 0, nil
 	} else if err != syscall.ENOPROTOOPT {
 		return 0, err
 	}
 	r0, _, err := setsockopt(fd, SCTP_SOCKOPT_CONNECTX, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	if err == syscall.EISCONN {
+		return int(r0), nil
+	}
 	return int(r0), err
 }
 
