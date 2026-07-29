@@ -346,9 +346,19 @@ func init() {
 	sndRcvInfoSize = unsafe.Sizeof(info)
 }
 
+// toBuf serialises a fixed-size value in the host's byte order, for handing to
+// the kernel as a socket address or control message.
+//
+// binary.Write only fails when v is not a fixed-size type, which is a mistake
+// in this package rather than anything a caller can cause. Returning the empty
+// buffer that failure produces would send a truncated address or control
+// message to the kernel, or panic later at buf[0] in ToRawSockAddrBuf, a long
+// way from the cause. Panicking here names it.
 func toBuf(v interface{}) []byte {
 	var buf bytes.Buffer
-	binary.Write(&buf, nativeEndian, v)
+	if err := binary.Write(&buf, nativeEndian, v); err != nil {
+		panic(fmt.Sprintf("sctp: cannot serialise %T: %v", v, err))
+	}
 	return buf.Bytes()
 }
 
