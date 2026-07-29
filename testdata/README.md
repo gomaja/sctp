@@ -111,6 +111,77 @@ read buffer = 16 bytes; real kernel notifications:
 kernel. Removing the length check in ParseNotification makes it panic with
 `slice bounds out of range [:20] with capacity 16` inside the read path.
 
+## Event subscription wire verification
+
+Confirms that `SubscribeEvent` (the RFC 6458 §6.2.2 `SCTP_EVENT` option) changes
+what the kernel delivers, rather than only what the option struct contains.
+
+```sh
+docker run --rm --privileged -v "$PWD":/src -w /src/testdata/eventprobe sctp-test bash -c '
+  printf "module eventprobe\ngo 1.21\nrequire github.com/ishidawataru/sctp v0.0.0\nreplace github.com/ishidawataru/sctp => /src\n" > go.mod
+  go mod tidy >/dev/null 2>&1
+  go run .
+  rm -f go.mod go.sum'
+```
+
+Three cases run against a real association, identical except for the
+subscription:
+
+```
+subscribed:   notification=true  want=true  type=0x8001  ok
+unsubscribed: notification=false want=false type=0x0000  ok
+bulk:         notification=true  want=true  type=0x8001  ok
+```
+
+The unsubscribed case is what gives the other two meaning — a build that
+delivered notifications unconditionally would pass the first and third and fail
+only that one. Making `SubscribeEvent` a no-op turns the first case into
+`MISMATCH` and exits non-zero while the other two stay correct.
+
+## RFC conformance notes
+
+Verified against RFC 6458 (Sockets API) and RFC 9260 (base protocol, which
+obsoleted RFC 4960), each claim cross-checked against `linux/sctp.h` and a C
+probe on a live kernel.
+
+**Struct layouts all match the kernel.** `sctp_status`, `sctp_paddrinfo`,
+`sctp_rtoinfo`, `sctp_assocparams`, `sctp_initmsg`, `sctp_assoc_value` and
+`sctp_sndrcvinfo` agree on size and every field offset. `TestStructLayoutsMatchKernel`
+pins this; `layoutprobe/` is the C program the numbers came from. The test earns
+its place on field *reorders*, which keep the struct size identical and are
+otherwise silent — the same class as the `sctp_pdapi_event` bug recorded above.
+
+**Two RFC-deprecated APIs are still in use.** RFC 6458 §6.2.2 deprecates
+`SCTP_EVENTS`, and §5.3.2 titles `SCTP_SNDRCV` "DEPRECATED", directing callers
+to `SCTP_SNDINFO`/`SCTP_RCVINFO`. `SubscribeEvent` now provides the `SCTP_EVENT`
+replacement; `SCTPRead`/`SCTPWrite` still use `SCTP_SNDRCV`, and
+`SetRecvRcvInfo`/`SetRecvNxtInfo` enable the modern ancillary data for callers
+driving `recvmsg` themselves.
+
+**`SCTP_EVENT` and `SCTP_EVENTS` are not one state once an association exists.**
+Measured, and contrary to the obvious assumption: on an unconnected socket a
+per-event subscription reads back through the bulk struct, but on a connected
+one it does not, because `AssocID` 0 scopes to the association while the bulk
+option reads endpoint defaults. Both cases are pinned by tests so the
+distinction cannot quietly become false.
+
+**`sctp_event_subscribe` is 10 bytes here against the kernel's 14.** Linux adds
+four events RFC 6458 does not define, so they are unreachable through that
+struct. The short option length is safe, which was measured rather than assumed:
+`setsockopt` accepts and applies it, and `getsockopt` writes only the first 10
+bytes and leaves the caller's remaining buffer untouched.
+
+**`EALREADY`/`EISCONN` are not in either RFC.** Zero occurrences across RFC 9260
+and RFC 6458 — they are Linux behaviour, so the residual `SCTPConnect`
+`EALREADY` gap needs the kernel source, not the specification.
+
+Options present in RFC 6458 §8 but not yet bound: `SCTP_FRAGMENT_INTERLEAVE`,
+`SCTP_PARTIAL_DELIVERY_POINT`, `SCTP_MAX_BURST`, `SCTP_CONTEXT`,
+`SCTP_REUSE_PORT`, `SCTP_DEFAULT_SNDINFO`, `SCTP_AUTO_ASCONF`,
+`SCTP_DEFAULT_PRINFO`, and the RFC 4895 `SCTP_AUTH_*` family. The
+`SCTP_GET_ASSOC_*` options apply to one-to-many sockets, which this package does
+not create.
+
 ## Address decoding
 
 `SCTP_GET_LOCAL_ADDRS`, `SCTP_GET_PEER_ADDRS` and `SCTP_PRIMARY_ADDR` return a

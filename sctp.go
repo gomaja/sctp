@@ -77,6 +77,19 @@ const (
 	SCTP_GET_LOCAL_ADDRS   = 109
 	SCTP_SOCKOPT_CONNECTX  = 110
 	SCTP_SOCKOPT_CONNECTX3 = 111
+
+	// SCTP_EVENT is the per-event subscription option RFC 6458 §6.2.2
+	// introduced to replace SCTP_EVENTS. Its value is not part of the
+	// contiguous block above, so it is spelled out.
+	SCTP_EVENT = 127
+
+	// SCTP_RECVRCVINFO makes the kernel return SCTP_RCVINFO as ancillary data
+	// on recvmsg (RFC 6458 §8.1.29). It is the non-deprecated counterpart of
+	// the SCTP_SNDRCV data SubscribeEvents(SCTP_EVENT_DATA_IO) asks for.
+	SCTP_RECVRCVINFO = 32
+	// SCTP_RECVNXTINFO makes the kernel return SCTP_NXTINFO, describing the
+	// message *after* the one being read (RFC 6458 §8.1.30).
+	SCTP_RECVNXTINFO = 33
 )
 
 const (
@@ -114,6 +127,21 @@ const (
 
 type NotificationHandler func([]byte) error
 
+// EventSubscribe mirrors struct sctp_event_subscribe, the bulk subscription
+// used by SCTP_EVENTS.
+//
+// The fields are the ten RFC 6458 §6.2.1 events. Linux appends four of its own
+// (stream reset, association reset, stream change, and a second send-failure
+// event), so the kernel's struct is 14 bytes against this one's 10. That is
+// safe in both directions and was measured rather than assumed: setsockopt
+// with a 10 byte option length is accepted and applied, and getsockopt with
+// one writes only the first 10 bytes and leaves the rest of the caller's
+// buffer untouched. The cost is that those four Linux-only events cannot be
+// reached through this struct.
+//
+// RFC 6458 §6.2.2 deprecates SCTP_EVENTS for precisely this reason — the
+// struct has to grow as events are added — and replaces it with SCTP_EVENT,
+// which names one event per call. See SubscribeEvent.
 type EventSubscribe struct {
 	DataIO          uint8
 	Association     uint8
@@ -125,6 +153,26 @@ type EventSubscribe struct {
 	AdaptationLayer uint8
 	Authentication  uint8
 	SenderDry       uint8
+}
+
+// Event mirrors struct sctp_event (RFC 6458 §6.2.2), which subscribes to or
+// unsubscribes from one notification type at a time.
+//
+// Both this struct and the kernel's are 8 bytes: three fields totalling 7,
+// rounded up for the alignment of the leading 4 byte association id. The
+// trailing field below is that padding written out. Go would insert it either
+// way — removing it does not change the size, which was checked — so it is here
+// to make the layout the kernel expects visible at the declaration rather than
+// implied by alignment rules. TestEventStructMatchesKernel asserts the size and
+// every offset.
+type Event struct {
+	// AssocID is ignored on the one-to-one style sockets this package creates.
+	AssocID SCTPAssocID
+	// Type is a notification type, e.g. SCTP_ASSOC_CHANGE.
+	Type uint16
+	// On is 1 to subscribe and 0 to unsubscribe.
+	On uint8
+	_  uint8
 }
 
 const (
@@ -192,7 +240,8 @@ type RtoInfo struct {
 // AssocInfo mirrors struct sctp_assocparams (RFC 6458 8.1.2, SCTP_ASSOCINFO).
 //
 // AsocMaxRxt is the field that matters for detecting an unreachable peer: it
-// is Association.Max.Retrans from RFC 4960 section 8.2. Once that many
+// is Association.Max.Retrans from RFC 9260 section 8.2 (which obsoleted RFC
+// 4960). Once that many
 // consecutive retransmissions to a peer go unacknowledged, the association is
 // torn down and the socket becomes readable with an error. Lowering it, and
 // lowering RtoInfo.Max, is what turns a silent black hole into a prompt,
@@ -221,7 +270,8 @@ type PeerState int32
 // match what the kernel reports rather than read in a natural-looking order.
 const (
 	// SCTP_INACTIVE means the path has failed: it has exceeded
-	// Path.Max.Retrans without a response. See RFC 4960 section 8.2.
+	// Path.Max.Retrans without a response. See RFC 9260 section 8.2, which
+	// obsoleted RFC 4960.
 	SCTP_INACTIVE PeerState = iota
 	// SCTP_PF ("potentially failed") is an intermediate state from RFC 7829:
 	// some retransmissions have failed but the path is not yet declared
@@ -635,6 +685,84 @@ func (c *SCTPConn) SubscribeEvents(flags int) error {
 	}
 	optlen := unsafe.Sizeof(param)
 	_, _, err := setsockopt(c.fd(), SCTP_EVENTS, uintptr(unsafe.Pointer(&param)), uintptr(optlen))
+	return err
+}
+
+// SubscribeEvent subscribes to a single notification type, or unsubscribes from
+// it when on is false.
+//
+// This is the SCTP_EVENT option from RFC 6458 §6.2.2, which exists because
+// SCTP_EVENTS — what SubscribeEvents uses — is deprecated: its struct has to
+// grow every time an event is added, so a binary built against an older
+// definition silently cannot reach the newer events. Naming one event per call
+// has no such limit.
+//
+// eventType is a notification type such as SCTP_ASSOC_CHANGE. The kernel
+// validates it and reports EINVAL for a type it does not know.
+//
+// The two options do not read the same state once an association exists, which
+// was measured rather than assumed. On a socket with no association, an event
+// set here reads back as set in the struct SubscribeEvents sends. On a connected
+// socket it does not: AssocID 0 acts on that association, while SCTP_EVENTS
+// reads the endpoint defaults, so the subscription shows as on through
+// EventSubscribed and off through SCTP_EVENTS. Do not mix the two on a connected
+// socket and expect either to report what the other set. Set whichever you use
+// before connecting if you need one consistent view.
+func (c *SCTPConn) SubscribeEvent(eventType SCTPNotificationType, on bool) error {
+	param := Event{Type: uint16(eventType)}
+	if on {
+		param.On = 1
+	}
+	optlen := unsafe.Sizeof(param)
+	_, _, err := setsockopt(c.fd(), SCTP_EVENT,
+		uintptr(unsafe.Pointer(&param)), uintptr(optlen))
+	return err
+}
+
+// EventSubscribed reports whether a single notification type is subscribed.
+//
+// It is the getsockopt direction of SCTP_EVENT: the type to query goes in, and
+// the kernel fills in whether it is on.
+func (c *SCTPConn) EventSubscribed(eventType SCTPNotificationType) (bool, error) {
+	param := Event{Type: uint16(eventType)}
+	optlen := unsafe.Sizeof(param)
+	_, _, err := getsockopt(c.fd(), SCTP_EVENT,
+		uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return false, err
+	}
+	return param.On != 0, nil
+}
+
+// SetRecvRcvInfo enables or disables delivery of SCTP_RCVINFO as ancillary data
+// on each received message (RFC 6458 §8.1.29).
+//
+// This is the non-deprecated counterpart of the SCTP_SNDRCV data that
+// SubscribeEvents(SCTP_EVENT_DATA_IO) asks for: RFC 6458 §5.3.2 marks
+// SCTP_SNDRCV deprecated and directs callers to SCTP_SNDINFO and SCTP_RCVINFO.
+// SCTPRead still reads the SCTP_SNDRCV form, so enabling this changes what the
+// kernel is willing to send rather than what this package parses; it is here
+// for callers driving recvmsg themselves through SyscallConn.
+func (c *SCTPConn) SetRecvRcvInfo(on bool) error {
+	return setsockoptInt(c.fd(), SCTP_RECVRCVINFO, on)
+}
+
+// SetRecvNxtInfo enables or disables delivery of SCTP_NXTINFO, which describes
+// the message following the one being read (RFC 6458 §8.1.30).
+func (c *SCTPConn) SetRecvNxtInfo(on bool) error {
+	return setsockoptInt(c.fd(), SCTP_RECVNXTINFO, on)
+}
+
+// setsockoptInt sets one of the boolean-valued SCTP options. RFC 6458 specifies
+// these as taking "an integer boolean flag", so the value is a 32 bit int
+// rather than a single byte.
+func setsockoptInt(fd int, optname uintptr, on bool) error {
+	var val int32
+	if on {
+		val = 1
+	}
+	_, _, err := setsockopt(fd, optname, uintptr(unsafe.Pointer(&val)),
+		unsafe.Sizeof(val))
 	return err
 }
 
