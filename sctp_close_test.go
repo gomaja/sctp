@@ -85,7 +85,7 @@ func eorPairMaybe(t testingTB) (client, server *SCTPConn, ok bool) {
 		ch <- accepted{c, err}
 	}()
 
-	client, err = DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+	client, err = dialRetry(ln.Addr().(*SCTPAddr))
 	if err != nil {
 		return nil, nil, false
 	}
@@ -139,6 +139,8 @@ func TestDialUnderChurnReportsEISCONN(t *testing.T) {
 	const cycles = 300
 	failures := map[string]int{}
 	for i := 0; i < cycles; i++ {
+		// Dial directly, not through dialRetry: observing the raw failure is
+		// the point of this test.
 		conn, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
 		if err != nil {
 			failures[err.Error()]++
@@ -218,7 +220,7 @@ func fdZeroChild() {
 		os.Exit(0)
 	}
 
-	conn, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+	conn, err := dialRetry(ln.Addr().(*SCTPAddr))
 	if err != nil {
 		report("SKIP dial: %v", err)
 		os.Exit(0)
@@ -284,7 +286,7 @@ func abortFdZeroChild() {
 		report("SKIP cannot close stdin: %v", err)
 		os.Exit(0)
 	}
-	conn, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+	conn, err := dialRetry(ln.Addr().(*SCTPAddr))
 	if err != nil {
 		report("SKIP dial: %v", err)
 		os.Exit(0)
@@ -338,7 +340,7 @@ func TestCloseDoesNotLeakDescriptors(t *testing.T) {
 
 	before := countOpenFds(t)
 	for i := 0; i < 50; i++ {
-		conn, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+		conn, err := dialRetry(ln.Addr().(*SCTPAddr))
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}

@@ -23,6 +23,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -32,6 +33,29 @@ type testingTB interface {
 	Helper()
 	Fatalf(format string, args ...interface{})
 	Cleanup(func())
+}
+
+// dialRetry dials raddr, retrying past the transient failures that rapid
+// reconnect churn provokes.
+//
+// SCTPConnect can return EISCONN or EALREADY on a freshly created socket when
+// associations are being torn down concurrently; see
+// TestDialUnderChurnReportsEISCONN, which documents that behaviour
+// deliberately. Every other test wants a working association rather than a
+// lottery, so they dial through here.
+func dialRetry(raddr *SCTPAddr) (*SCTPConn, error) {
+	var (
+		conn *SCTPConn
+		err  error
+	)
+	for attempt := 0; attempt < 50; attempt++ {
+		conn, err = DialSCTP("sctp", nil, raddr)
+		if err == nil {
+			return conn, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil, err
 }
 
 // eorPair brings up a loopback association and returns both ends.
@@ -58,17 +82,20 @@ func eorPair(t testingTB) (client, server *SCTPConn) {
 		ch <- accepted{c, err}
 	}()
 
-	client, err = DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+	client, err = dialRetry(ln.Addr().(*SCTPAddr))
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	t.Cleanup(func() { _ = client.Close() })
+	// Bound the cleanup close. A test that leaves its peer aborted would
+	// otherwise make this wait out the full default grace period with nothing
+	// left to answer the shutdown.
+	t.Cleanup(func() { _ = client.CloseWithTimeout(200 * time.Millisecond) })
 
 	a := <-ch
 	if a.err != nil {
 		t.Fatalf("accept: %v", a.err)
 	}
-	t.Cleanup(func() { _ = a.conn.Close() })
+	t.Cleanup(func() { _ = a.conn.CloseWithTimeout(200 * time.Millisecond) })
 
 	return client, a.conn
 }

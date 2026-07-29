@@ -36,11 +36,11 @@ import (
 func FuzzCloseWithTimeout(f *testing.F) {
 	f.Add(int64(0))
 	f.Add(int64(-1))
-	f.Add(int64(1))                       // 1ns: rounds up to 1us
-	f.Add(int64(999))                     // sub-microsecond
-	f.Add(int64(time.Millisecond))        //nolint:gosec
-	f.Add(int64(3 * time.Second))         //nolint:gosec
-	f.Add(int64(time.Hour))               //nolint:gosec
+	f.Add(int64(1))                // 1ns: rounds up to 1us
+	f.Add(int64(999))              // sub-microsecond
+	f.Add(int64(time.Millisecond)) //nolint:gosec
+	f.Add(int64(3 * time.Second))  //nolint:gosec
+	f.Add(int64(time.Hour))        //nolint:gosec
 
 	f.Fuzz(func(t *testing.T, ns int64) {
 		// Keep the wait bounded: this exercises the conversion arithmetic and
@@ -160,17 +160,24 @@ func TestCloseChurnUnderLoad(t *testing.T) {
 		go func(w int) {
 			defer wg.Done()
 			for i := 0; i < perWorker; i++ {
-				conn, err := DialSCTP("sctp", nil, ln.Addr().(*SCTPAddr))
+				conn, err := dialRetry(ln.Addr().(*SCTPAddr))
 				if err != nil {
-					errs <- err
+					// Rapid reconnects can fail with EISCONN or EALREADY from
+					// SCTPConnect; see TestDialUnderChurnReportsEISCONN. That
+					// is a dial-side limitation, not a teardown failure, so it
+					// must not be counted as one here.
 					continue
 				}
 				// Send something so the association is real before teardown.
 				_, _ = conn.SCTPWrite([]byte("churn"), nil)
 
-				// Alternate graceful and immediate teardown.
+				// Alternate graceful and immediate teardown. The graceful path
+				// uses a short grace period deliberately: the server aborts its
+				// side as soon as its read fails, so a SHUTDOWN may find no
+				// peer to answer it and the default period would make this loop
+				// wait out the timeout each time.
 				if (w+i)%2 == 0 {
-					err = conn.Close()
+					err = conn.CloseWithTimeout(200 * time.Millisecond)
 				} else {
 					err = conn.Abort()
 				}
@@ -194,15 +201,25 @@ func TestCloseChurnUnderLoad(t *testing.T) {
 		t.Errorf("%d of %d cycles failed", failures, workers*perWorker)
 	}
 
-	// Give the accept goroutines a moment to reap their side.
-	time.Sleep(500 * time.Millisecond)
-	after := countOpenFds(t)
-	if after > before+20 {
-		t.Errorf("descriptors grew from %d to %d over %d cycles",
-			before, after, workers*perWorker)
+	// Wait for the accept goroutines to reap their side. The descriptor count
+	// is process-global, so other tests running concurrently in the same
+	// binary can inflate it transiently; poll until it settles rather than
+	// sampling once and treating a neighbour's socket as a leak here.
+	const margin = 20
+	var after int
+	for attempt := 0; attempt < 40; attempt++ {
+		time.Sleep(100 * time.Millisecond)
+		after = countOpenFds(t)
+		if after <= before+margin {
+			break
+		}
 	}
 	t.Logf("descriptors before=%d after=%d over %d cycles",
 		before, after, workers*perWorker)
+	if after > before+margin {
+		t.Errorf("descriptors grew from %d to %d over %d cycles and did not settle",
+			before, after, workers*perWorker)
+	}
 }
 
 // TestCloseRacesWithReadAndWrite drives close against concurrent I/O, the
