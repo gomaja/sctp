@@ -22,6 +22,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -174,11 +175,32 @@ func TestSCTPListenerNameFromFd(t *testing.T) {
 
 	var fln *SCTPListener
 	raw.Control(func(fd uintptr) {
-		fln, err = FileListener(os.NewFile(uintptr(fd), "listener"))
-		if err != nil {
-			t.Fatal(err)
+		// os.NewFile takes ownership of the descriptor it is handed, and its
+		// finalizer closes it once the *os.File becomes unreachable. Passing
+		// the listener's own descriptor hands ownership of a socket that ln
+		// still uses to the garbage collector: at the next GC the finalizer
+		// closes it, the kernel reuses the number for an unrelated socket, and
+		// the failure surfaces in whichever test is holding it by then.
+		//
+		// Duplicate it so the *os.File owns a descriptor of its own.
+		dup, derr := syscall.Dup(int(fd))
+		if derr != nil {
+			t.Errorf("dup listener fd: %v", derr)
+			return
 		}
+		f := os.NewFile(uintptr(dup), "listener")
+		// FileListener dups again for the returned listener, so this file has
+		// no owner once it returns and must be closed explicitly rather than
+		// left to the finalizer.
+		defer f.Close()
+		fln, err = FileListener(f)
 	})
+	if err != nil {
+		t.Fatalf("FileListener: %v", err)
+	}
+	if fln == nil {
+		t.Fatal("FileListener returned no listener")
+	}
 	defer fln.Close()
 
 	fla, ok := fln.Addr().(*SCTPAddr)
@@ -188,5 +210,79 @@ func TestSCTPListenerNameFromFd(t *testing.T) {
 
 	if la.String() != fla.String() {
 		t.Fatalf("got %v; expected %v", la.String(), fla.String())
+	}
+}
+
+// TestListenerSurvivesGCAfterFileListener checks that building an SCTPListener
+// from a listener's own descriptor leaves that descriptor owned by the
+// listener alone.
+//
+// os.NewFile takes ownership of the descriptor it is given and closes it from
+// a finalizer once the *os.File is unreachable. Handing it a live listener's
+// descriptor therefore schedules a close of a socket still in use, and the
+// kernel reuses the number immediately: the damage lands on whichever
+// unrelated socket is holding it when the collector next runs, which is why
+// this reproduces only in a full suite and never in isolation.
+//
+// Forcing collection here makes that deterministic.
+func TestListenerSurvivesGCAfterFileListener(t *testing.T) {
+	addr, _ := ResolveSCTPAddr("sctp", "127.0.0.1:0")
+	ln, err := ListenSCTP("sctp", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	raw, err := ln.SyscallConn()
+	if err != nil {
+		t.Fatalf("syscallconn: %v", err)
+	}
+
+	var lnFd int
+	var fln *SCTPListener
+	if cerr := raw.Control(func(fd uintptr) {
+		lnFd = int(fd)
+		dup, derr := syscall.Dup(int(fd))
+		if derr != nil {
+			t.Errorf("dup: %v", derr)
+			return
+		}
+		f := os.NewFile(uintptr(dup), "listener")
+		defer f.Close()
+		fln, err = FileListener(f)
+	}); cerr != nil {
+		t.Fatalf("control: %v", cerr)
+	}
+	if err != nil {
+		t.Fatalf("FileListener: %v", err)
+	}
+	if fln == nil {
+		t.Fatal("FileListener returned no listener")
+	}
+	defer fln.Close()
+
+	// Run finalizers for anything the block above dropped. Twice: the first
+	// collection queues the finalizer, the second lets it run.
+	runtime.GC()
+	runtime.GC()
+
+	if _, _, e := syscall.Syscall(syscall.SYS_FCNTL, uintptr(lnFd),
+		syscall.F_GETFD, 0); e != 0 {
+		t.Fatalf("listener descriptor %d was closed by a finalizer while the "+
+			"listener still owned it: %v", lnFd, e)
+	}
+
+	// The listener must still be usable, not merely still hold a descriptor.
+	// A dial that completes proves the socket is the one still listening.
+	la, ok := ln.Addr().(*SCTPAddr)
+	if !ok {
+		t.Fatal("listener address unavailable after GC")
+	}
+	conn, err := DialSCTP("sctp", nil, la)
+	if err != nil {
+		t.Fatalf("dial listener after GC: %v", err)
+	}
+	if cerr := conn.Close(); cerr != nil {
+		t.Errorf("close dialled conn: %v", cerr)
 	}
 }

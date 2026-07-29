@@ -171,14 +171,18 @@ func TestSCTPCloseRecv(t *testing.T) {
 		var xerr error
 		conn, xerr = ln.Accept()
 		if xerr != nil {
-			t.Fatal(xerr)
+			// Errorf, not Fatal: this is not the test goroutine, and Fatal here
+			// would call runtime.Goexit, leaving the main goroutine blocked on
+			// connReady for the whole test timeout instead of failing promptly.
+			t.Errorf("accept: %v", xerr)
+			return
 		}
 		connReady <- struct{}{}
 		buf := make([]byte, 256)
 		_, xerr = conn.Read(buf)
 		t.Logf("got error while read: %v", xerr)
 		if xerr != io.EOF && xerr != syscall.EBADF {
-			t.Fatalf("read failed: %v", xerr)
+			t.Errorf("read failed: %v", xerr)
 		}
 	}()
 
@@ -187,7 +191,14 @@ func TestSCTPCloseRecv(t *testing.T) {
 		t.Fatalf("failed to dial: %s", err)
 	}
 
-	<-connReady
+	// Bound the wait: if Accept failed, the goroutine reported it and returned
+	// without sending, and an unbounded receive would hang until the suite
+	// timeout rather than failing here.
+	select {
+	case <-connReady:
+	case <-time.After(10 * time.Second):
+		t.Fatal("accept did not complete")
+	}
 	err = conn.Close()
 	if err != nil {
 		t.Fatalf("close failed: %v", err)
