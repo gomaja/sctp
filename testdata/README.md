@@ -20,14 +20,11 @@ docker run --rm --privileged -v "$PWD":/src -w /src sctp-test \
     bash testdata/run-tests.sh -count=1
 ```
 
-`TestStreams` fails in this environment on an unmodified tree as well — it
-opens 128 concurrent associations against one listener and is flaky under
-container networking. Skip it to see the rest:
-
-```sh
-docker run --rm --privileged -v "$PWD":/src -w /src sctp-test \
-    go test -count=1 -skip TestStreams ./...
-```
+`TestStreams` opens 128 concurrent associations against one listener and fails
+occasionally. It is rare — about one run in thirty — and it fails on an
+unmodified tree as well. See "Test flakiness" below before concluding anything
+from it, and run the suite one container at a time: several at once makes it
+look far worse than it is.
 
 ## Truncation reproducer
 
@@ -131,35 +128,31 @@ listen backlog. The test dials far faster than its accept goroutines drain,
 so that one is expected and is now counted separately rather than failing the
 run.
 
-`TestStreams` fails roughly one run in fifteen with
+`TestStreams` used to fail intermittently with
 
 ```
 Server connection read err: connection reset by peer. Total bytes received: 0
 ```
 
-The cause is in `closeSctpSocket`: it sets `SO_LINGER{Onoff:1, Linger:0}`
-unconditionally before `close()`, so `close()` emits an ABORT even when the
-SHUTDOWN handshake already completed. The test's clients `defer conn.Close()`
-while the server is still reading, so the server sometimes reads that ABORT as
-ECONNRESET instead of a clean EOF.
+`ECONNRESET` on a read is what the graceful-Close defect produced: `close()`
+emitted an ABORT after a completed SHUTDOWN handshake, and this test closes
+128 clients while the server is idle in a read. The commit touching
+`closeSctpSocket` fixes that ABORT.
 
-It fails far more often as part of the full suite than on its own, so measure
-it the way it is run. Six full-suite runs under `-race`, back to back:
+Whether that is the whole story here is **not established**. The base rate is
+too low to tell: with the fix reverted, twenty-five runs still passed, so the
+twenty-five that pass with the fix say nothing either way. A mutation that
+does not reproduce the failure cannot confirm the fix that follows it.
 
-| | `TestStreams` fails | `TestSCTPConcurrentAccept` fails |
-|---|---|---|
-| merge base `65af41a` | 3 of 6 | 3 of 6 |
-| this branch | 5 of 6 | 0 of 6 |
+The rate itself is low. Measured with one test running at a time, thirty runs
+per tree, alternating so drift lands on both equally: 0 of 30 at the merge
+base and 1 of 30 here, before the fix. Earlier revisions of this note claimed
+3 of 6 against 5 of 6 and blamed CPU contention and then descriptor pressure;
+those figures were taken while several test containers competed for cores,
+which is what produced the spread.
 
-Standalone it is much quieter — 13 of 15 runs pass here, 14 of 15 at the merge
-base — which is why an earlier version of this note under-reported it.
-
-`TestStreams` is not a regression: the merge base sets the byte-identical
-linger before the same `close()` and fails the same way. Whether this branch
-fails it more often than the merge base is not established; six runs is too
-small a sample to separate 3/6 from 5/6.
-
-Making the linger conditional on whether the handshake completed would fix
-the underlying ABORT, but that changes teardown behaviour every caller depends
-on, including the prompt teardown the black-hole handling relies on, so it is
-left alone pending a decision.
+Two things follow. Run one measurement at a time and pair the comparison
+rather than running separate batches. And when a failure is this rare, treat a
+clean run as absence of evidence: confirm the mechanism directly, the way the
+close paths are confirmed against a capture in `tshark-close.sh`, rather than
+inferring it from a test that mostly passes anyway.
