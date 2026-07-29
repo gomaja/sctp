@@ -143,12 +143,23 @@ SHUTDOWN handshake already completed. The test's clients `defer conn.Close()`
 while the server is still reading, so the server sometimes reads that ABORT as
 ECONNRESET instead of a clean EOF.
 
-This is not a regression from the changes on this branch. The merge base
-(`65af41a`) sets the same linger before the same `close()` and fails the same
-way at the same rate: measured back to back, 14 of 15 runs pass at the merge
-base and 13 of 15 on this tree, which is the same rate within the noise of a
-sample that size.
+It fails far more often as part of the full suite than on its own, so measure
+it the way it is run. Six full-suite runs under `-race`, back to back:
 
-Making the linger conditional on whether the handshake completed would fix it,
-but that changes teardown behaviour every caller depends on and is left alone
-for now.
+| | `TestStreams` fails | `TestSCTPConcurrentAccept` fails |
+|---|---|---|
+| merge base `65af41a` | 3 of 6 | 3 of 6 |
+| this branch | 5 of 6 | 0 of 6 |
+
+Standalone it is much quieter — 13 of 15 runs pass here, 14 of 15 at the merge
+base — which is why an earlier version of this note under-reported it.
+
+`TestStreams` is not a regression: the merge base sets the byte-identical
+linger before the same `close()` and fails the same way. Whether this branch
+fails it more often than the merge base is not established; six runs is too
+small a sample to separate 3/6 from 5/6.
+
+Making the linger conditional on whether the handshake completed would fix
+the underlying ABORT, but that changes teardown behaviour every caller depends
+on, including the prompt teardown the black-hole handling relies on, so it is
+left alone pending a decision.
