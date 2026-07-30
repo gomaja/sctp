@@ -274,10 +274,18 @@ func parseSndRcvInfo(b []byte) (*SndRcvInfo, error) {
 				// the alternative is an out-of-bounds read.
 				continue
 			}
-			dst := (*SndRcvInfo)(unsafe.Pointer(&m.Data[0]))
-			// Fix PPID to host byte order
-			dst.PPID = ntohl(dst.PPID)
-			return dst, nil
+			// Copy out rather than returning a pointer into m.Data.
+			//
+			// This used to alias the caller's control-message buffer and
+			// byte-swap PPID in place, which had two consequences. Parsing the
+			// same bytes twice swapped twice, so the second call returned
+			// 0x44332211 for an 0x11223344 payload — reachable by any caller
+			// driving recvmsg itself through SyscallConn. And it made the oob
+			// buffer in SCTPReadFlags impossible to reuse, since the returned
+			// value outlived the read.
+			info := *(*SndRcvInfo)(unsafe.Pointer(&m.Data[0]))
+			info.PPID = ntohl(info.PPID)
+			return &info, nil
 		case SCTP_CMSG_RCVINFO:
 			if len(m.Data) < int(unsafe.Sizeof(RcvInfo{})) {
 				continue

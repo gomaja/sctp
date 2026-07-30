@@ -234,6 +234,97 @@ func TestBuildSndRcvCmsgRoundTripsThroughParser(t *testing.T) {
 	}
 }
 
+// TestParseSndRcvInfoDoesNotAliasInput covers the read-side counterpart of the
+// write-side race: parseSndRcvInfo used to return a pointer into the control
+// message it was given, and byte-swap PPID inside that buffer.
+//
+// Two consequences, both real rather than theoretical:
+//
+//   - Parsing the same bytes twice swapped PPID twice. An 0x11223344 payload read
+//     back as 0x11223344 and then 0x44332211. Any caller driving recvmsg itself
+//     through SyscallConn could hit that.
+//   - The oob buffer in SCTPReadFlags could not be pooled or reused, because the
+//     returned value outlived the read that produced it.
+//
+// It now copies, so the result is independent of the buffer.
+func TestParseSndRcvInfoDoesNotAliasInput(t *testing.T) {
+	const ppid = 0x11223344
+	buf := buildSndRcvCmsg(&SndRcvInfo{Stream: 1, PPID: ppid})
+
+	first, err := parseSndRcvInfo(buf)
+	if err != nil {
+		t.Fatalf("first parse: %v", err)
+	}
+	second, err := parseSndRcvInfo(buf)
+	if err != nil {
+		t.Fatalf("second parse: %v", err)
+	}
+
+	if first.PPID != ppid {
+		t.Errorf("first parse PPID = %#x, want %#x", first.PPID, ppid)
+	}
+	if second.PPID != ppid {
+		t.Errorf("second parse PPID = %#x, want %#x — parsing twice must be "+
+			"idempotent, and a byte-swapped value here means the parser is "+
+			"mutating its input", second.PPID, ppid)
+	}
+	if first == second {
+		t.Error("both parses returned the same pointer, so the result still " +
+			"aliases the input buffer; it has to be a copy for the buffer to " +
+			"be reusable")
+	}
+
+	// Overwriting the buffer must not disturb an already-returned result. This is
+	// the property that makes reusing the read buffer safe.
+	for i := range buf {
+		buf[i] = 0xff
+	}
+	if first.PPID != ppid {
+		t.Errorf("PPID became %#x after the source buffer was overwritten; the "+
+			"returned struct still points into it", first.PPID)
+	}
+	if first.Stream != 1 {
+		t.Errorf("Stream became %d after the source buffer was overwritten",
+			first.Stream)
+	}
+}
+
+// TestSCTPReadInfoSurvivesLaterReads is the same property through the public API:
+// the info from one read must stay valid across subsequent reads.
+//
+// While parseSndRcvInfo aliased its input this only held by accident, because
+// SCTPReadFlags allocated a fresh oob buffer every call. A caller keeping the info
+// from several messages would break the moment that allocation was reused.
+func TestSCTPReadInfoSurvivesLaterReads(t *testing.T) {
+	client, server := sndinfoPair(t)
+
+	// Distinct PPIDs so a stale or overwritten struct is identifiable.
+	const messages = 4
+	for i := 0; i < messages; i++ {
+		info := &SndRcvInfo{Stream: uint16(i), PPID: uint32(0x1000 + i)}
+		if _, err := client.SCTPWrite([]byte("keep"), info); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+
+	// Hold every returned info, then check them all after the reads are done.
+	got := make([]*SndRcvInfo, 0, messages)
+	for i := 0; i < messages; i++ {
+		_, info := readOne(t, server)
+		got = append(got, info)
+	}
+
+	for i, info := range got {
+		wantStream := uint16(i)
+		wantPPID := uint32(0x1000 + i)
+		if info.Stream != wantStream || info.PPID != wantPPID {
+			t.Errorf("info %d held across later reads is stream=%d ppid=%#x, "+
+				"want stream=%d ppid=%#x", i, info.Stream, info.PPID,
+				wantStream, wantPPID)
+		}
+	}
+}
+
 // TestSCTPWriteDoesNotMutateInfo covers the race fix through the public API, on a
 // real association, rather than only against the builder.
 func TestSCTPWriteDoesNotMutateInfo(t *testing.T) {
