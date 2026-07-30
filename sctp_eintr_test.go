@@ -303,7 +303,7 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 		rounds        = 4
 		dialsPerRound = 500
 	)
-	var dead, failed int64
+	var dead, failed, torndown int64
 	for r := 0; r < rounds; r++ {
 		var wg sync.WaitGroup
 		for i := 0; i < dialsPerRound; i++ {
@@ -318,9 +318,27 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 					return
 				}
 				defer func() { _ = c.Close() }()
-				// The dial claimed success, so an association must exist.
-				if st, serr := c.GetStatus(); serr != nil || st == nil || st.State == 0 {
-					atomic.AddInt64(&dead, 1)
+
+				// The dial claimed success, so the association must be usable.
+				//
+				// Checked by writing rather than by reading GetStatus. Status
+				// cannot distinguish "never established" from "established and
+				// since torn down by the peer", and the echo server here does
+				// close connections — measured at 2 in 300 when the server
+				// closes immediately, which would count healthy dials as dead
+				// and made this test fail spuriously in the full suite.
+				//
+				// A write reports EPIPE either way, so the two are separated by
+				// checking status only when the write fails: a socket that
+				// never had an association reports EINVAL from SCTP_STATUS,
+				// while one whose peer closed reports a real association.
+				if _, werr := c.SCTPWrite([]byte("probe"), nil); werr != nil {
+					st, serr := c.GetStatus()
+					if serr != nil || st == nil || st.State == 0 {
+						atomic.AddInt64(&dead, 1)
+					} else {
+						atomic.AddInt64(&torndown, 1)
+					}
 				}
 			}()
 		}
@@ -338,6 +356,10 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 	}
 	if n := atomic.LoadInt64(&failed); n > 0 {
 		t.Logf("%d of %d dials reported an error (acceptable)", n, dials)
+	}
+	if n := atomic.LoadInt64(&torndown); n > 0 {
+		t.Logf("%d of %d dials had a real association the peer had already "+
+			"closed (acceptable, and not the defect this covers)", n, dials)
 	}
 }
 
