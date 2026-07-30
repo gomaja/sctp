@@ -930,6 +930,44 @@ func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
 	}, nil
 }
 
+// SCTPConnect establishes an association with addr on the socket fd.
+//
+// EISCONN and EALREADY are both reported as success, because they are the same
+// kernel branch at two different association states. net/sctp/socket.c has, in
+// __sctp_connect and again in sctp_connect_add_peer:
+//
+//	asoc = sctp_endpoint_lookup_assoc(ep, daddr, &transport);
+//	if (asoc)
+//	        return asoc->state >= SCTP_STATE_ESTABLISHED ? -EISCONN
+//	                                                     : -EALREADY;
+//
+// So both mean "an association to this peer already exists on this endpoint".
+// EISCONN says the handshake finished; EALREADY says it is still in CLOSED,
+// COOKIE_WAIT or COOKIE_ECHOED. Neither is a failure to connect to somewhere the
+// caller did not ask for — the association is the one that was requested.
+//
+// This matters because the early return skips the sctp_wait_for_connect that
+// ends __sctp_connect on the normal path. On a blocking socket, which is what
+// this package's dial path uses, that wait is what makes SCTPConnect synchronous;
+// a caller that races itself into the EALREADY branch would otherwise be handed a
+// hard error for an association that goes on to establish normally.
+//
+// Reproduced with testdata/optprobe/already.c: two CONNECTX3 calls against an
+// unreachable address on one non-blocking socket give EINPROGRESS then EALREADY,
+// repeatably.
+//
+// The blocking distinction is deliberate and is why EALREADY is not simply mapped
+// to success unconditionally. On a blocking socket the kernel has already waited
+// for the handshake, so an existing association means a connected socket. On a
+// non-blocking one it does not wait, and EALREADY there means genuinely not yet
+// connected — reporting success would hand the caller a socket that is still
+// handshaking. Non-blocking callers get EALREADY unchanged, matching the
+// EINPROGRESS they already have to handle. This package's own dial path creates
+// blocking sockets, so it takes the first branch; SCTPConnect is exported, so the
+// second is reachable.
+//
+// AssocID is not filled in on either early-return path, so 0 is returned with a
+// nil error; callers needing the id read it back from the socket.
 func SCTPConnect(fd int, addr *SCTPAddr) (int, error) {
 	buf := addr.ToRawSockAddrBuf()
 	param := GetAddrsOld{
@@ -940,21 +978,45 @@ func SCTPConnect(fd int, addr *SCTPAddr) (int, error) {
 	_, _, err := getsockopt(fd, SCTP_SOCKOPT_CONNECTX3, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
 	if err == nil {
 		return int(param.AssocID), nil
-	} else if err == syscall.EISCONN {
-		// The association is already up. CONNECTX3 reports EISCONN once the
-		// handshake has completed, which under load can happen before it
-		// returns: the socket is established and writable, so reporting a
-		// failure here throws away a working connection. AssocID is not filled
-		// in on this path; callers that need it read it back from the socket.
+	} else if isEstablishedAssoc(fd, err) {
 		return 0, nil
 	} else if err != syscall.ENOPROTOOPT {
 		return 0, err
 	}
 	r0, _, err := setsockopt(fd, SCTP_SOCKOPT_CONNECTX, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-	if err == syscall.EISCONN {
+	if isEstablishedAssoc(fd, err) {
 		return int(r0), nil
 	}
 	return int(r0), err
+}
+
+// isEstablishedAssoc reports whether err from a connect attempt means the socket
+// already carries the association the caller asked for, and is connected.
+//
+// EISCONN always does. EALREADY does only on a blocking socket, where the kernel
+// has waited for the handshake before returning; see SCTPConnect for why the two
+// errnos are the same kernel branch at different association states.
+func isEstablishedAssoc(fd int, err error) bool {
+	switch err {
+	case syscall.EISCONN:
+		return true
+	case syscall.EALREADY:
+		return !isNonblocking(fd)
+	}
+	return false
+}
+
+// isNonblocking reports whether fd has O_NONBLOCK set. A descriptor that cannot
+// be queried is treated as non-blocking, which is the conservative answer: it
+// keeps EALREADY as an error rather than reporting a possibly unconnected socket
+// as ready.
+func isNonblocking(fd int) bool {
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd),
+		syscall.F_GETFL, 0)
+	if errno != 0 {
+		return true
+	}
+	return flags&syscall.O_NONBLOCK != 0
 }
 
 func SCTPBind(fd int, addr *SCTPAddr, flags int) error {
