@@ -39,15 +39,30 @@ else
     echo "Could not enable net.sctp.auth_enable; the AUTH tests will skip." >&2
 fi
 
-# TestKernelAddrsRoundTrip needs a second local address to prove the kernel's
-# multi-address reply is decoded per entry. With one address the loop body runs
-# once and a per-entry decoding bug cannot show.
-if ip addr show dev lo 2>/dev/null | grep -q '127\.0\.0\.2'; then
-    echo "127.0.0.2 already configured."
-elif ip addr add 127.0.0.2/8 dev lo 2>/dev/null; then
-    echo "Added 127.0.0.2 for the multi-address tests."
+# Extra loopback addresses. TestKernelAddrsRoundTrip needs a second one to prove
+# the kernel's multi-address reply is decoded per entry — with one address the
+# loop body runs once and a per-entry decoding bug cannot show. The multi-homing
+# tests need more: an association with two addresses on each side, which is
+# SCTP's defining feature over TCP and cannot be exercised at all on a host with
+# a single address.
+added=""
+for a in 127.0.0.2 127.0.0.3 127.0.0.4; do
+    if ip addr show dev lo 2>/dev/null | grep -q "inet $a"; then
+        continue
+    fi
+    if ip addr add "$a/8" dev lo 2>/dev/null; then
+        added="$added $a"
+    fi
+done
+have=$(ip -4 addr show dev lo 2>/dev/null | grep -cE 'inet 127\.0\.0\.[0-9]+')
+if [ -n "$added" ]; then
+    echo "Added loopback addresses:$added (now $have total)."
 else
-    echo "Could not add 127.0.0.2; the multi-address test will skip." >&2
+    echo "Loopback addresses already configured ($have total)."
+fi
+if [ "${have:-0}" -lt 3 ]; then
+    echo "Fewer than 3 loopback addresses; the multi-homing tests will skip." \
+         "The container needs --privileged." >&2
 fi
 
 go build ./...
