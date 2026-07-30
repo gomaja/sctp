@@ -522,9 +522,21 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 	// sees ECONNRESET instead of the end of the stream — with no error
 	// reported on either side.
 	//
-	// SO_RCVTIMEO is already programmed above and is not restarted by the
-	// retry, so this cannot loop past the caller's timeout: once it expires
-	// the read returns EAGAIN and the association is treated as unfinished.
+	// The loop is bounded by SO_RCVTIMEO, programmed above — the early return
+	// on a failed setsockopt is what guarantees one is in force.
+	//
+	// The bound is loose in principle: on a socket that simply has no data,
+	// the kernel restarts much of the remaining timeout after each
+	// interruption, and a direct probe measured 7351 retries over 15.9s
+	// against a 1s timeout. It does not bite here, because this read follows
+	// the shutdown above — the association is no longer able to receive, so
+	// the read returns ENOTCONN or end-of-stream on its first call rather than
+	// blocking. Measured through Close: one iteration, about a millisecond.
+	//
+	// Recorded because the reasoning matters if this read ever moves ahead of
+	// the shutdown: it would then be genuinely unbounded from the caller's
+	// point of view, and would need the deadline tracked across retries the
+	// way SCTPReadFlags does it.
 	var buf [1]byte
 	var n int
 	var rerr error

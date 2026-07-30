@@ -461,3 +461,48 @@ func TestSCTPReadRetriesEINTRUnderLoad(t *testing.T) {
 	_ = ln.Close()
 	srvWG.Wait()
 }
+
+// TestCloseTerminatesPromptlyUnderSignals pins the bound on the close-path
+// retry.
+//
+// Retrying that read on EINTR is what stops a signal from turning a graceful
+// close into an ABORT, but a retry loop needs a bound or a server tearing down
+// many associations could hang in one of them. The bound is SO_RCVTIMEO,
+// programmed just above the read.
+//
+// It is loose in principle — on a socket with no data the kernel restarts much
+// of the remaining timeout after each interruption, measured at 7351 retries
+// over 15.9s against a 1s timeout — but it does not bite, because the read
+// follows the shutdown and so returns on its first call instead of blocking.
+// This asserts the reachable behaviour rather than the theoretical one, and
+// would fail if the read ever moved ahead of the shutdown and became genuinely
+// unbounded.
+func TestCloseTerminatesPromptlyUnderSignals(t *testing.T) {
+	const rounds = 20
+
+	stop := eintrSignaller(t)
+	defer stop()
+
+	const grace = 500 * time.Millisecond
+	var worst time.Duration
+	for i := 0; i < rounds; i++ {
+		client, server := eorPairNoCleanup(t)
+
+		start := time.Now()
+		_ = server.CloseWithTimeout(grace)
+		if d := time.Since(start); d > worst {
+			worst = d
+		}
+		_ = client.Close()
+	}
+
+	t.Logf("worst CloseWithTimeout(%v) across %d rounds under continuous "+
+		"signals: %v", grace, rounds, worst.Round(time.Millisecond))
+
+	// Generous, because this is a bound on a retry loop rather than a latency
+	// assertion: what would fail it is the loop not terminating.
+	if worst > 30*time.Second {
+		t.Errorf("a close took %v against a %v grace period; the EINTR retry "+
+			"is not bounded in practice", worst, grace)
+	}
+}
