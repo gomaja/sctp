@@ -935,7 +935,7 @@ read again; that second read is what dequeues `SCTP_COMM_LOST`. Aborting while
 the server has not yet read leaves the notification unobserved and the handler
 never fires — the first version of the test skipped for exactly that reason.
 
-### Verified on the wire
+### Peer separation verified on the wire
 
 In-process assertions only prove the struct was populated. A local tshark
 harness (six peers, four streams each, PPID encoding the sender) confirms the
@@ -1042,6 +1042,22 @@ listener bound 3 addrs: [127.0.0.1 127.0.0.2 127.0.0.3]
 client local [127.0.0.1 127.0.0.4]   client peer [127.0.0.1 127.0.0.2 127.0.0.3]
 server local [127.0.0.1 127.0.0.2 127.0.0.3]   server peer [127.0.0.1 127.0.0.4]
 ```
+
+### Address advertisement verified on the wire
+
+The readbacks above prove the struct was populated. A capture proves the
+addresses were actually advertised, which is a different claim — the kernel
+carries them as IPv4 Address parameters in the INIT and INIT-ACK chunks
+(RFC 9260 3.3.2), and a bind that dropped one would still return a working
+association over the primary path:
+
+```
+sctp.chunk_type  sctp.parameter_ipv4_address
+1 (INIT)         127.0.0.3,127.0.0.4      <- the client's set
+2 (INIT_ACK)     127.0.0.1,127.0.0.2      <- the server's set
+```
+
+Both sets are on the wire, each advertised by the side that bound it.
 
 `run-tests.sh` adds 127.0.0.2 through 127.0.0.4. The tests skip rather than pass
 vacuously below three usable addresses, since a single-address host exercises
