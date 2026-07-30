@@ -891,11 +891,14 @@ the code around a performance question, not by looking for bugs.
 
 ### Not measured
 
-Throughput and latency under concurrency, multi-homed paths, and large messages
-crossing the fragmentation point. Pooling the `oob` buffer is now *possible*
-— the aliasing that blocked it is fixed — but has not been done or measured. The
-benchmarks here are single-association loopback on one host and one kernel; they
+Large messages crossing the fragmentation point. Pooling the `oob` buffer is now
+*possible* — the aliasing that blocked it is fixed — but has not been done or
+measured. The benchmarks here are loopback on one host and one kernel; they
 compare revisions of this package rather than characterising the stack.
+
+Throughput under concurrency and multi-homed paths were on this list and are no
+longer: see *Throughput under concurrency* and *Multi-homing* below. Path
+failover remains uncovered, and is noted there with the reason.
 
 ## One listener, many peers
 
@@ -973,11 +976,108 @@ decoded from hex and counted per payload. `data.data` is the field that carries
 the DATA chunk payload; `sctp.chunk_payload` and `sctp.payload` are not fields
 in tshark 4.0 and silently yield nothing, which reads as a clean zero.
 
-### Scale
+### Scale, and where the ceiling actually is
 
 1000 simultaneous peers, five messages each, repeated eight times: 8000 sessions,
-zero errors, zero mismatches. Beyond that the *harness* runs out of memory on a
-7.6 GiB Docker VM (exit 137, OOM) — a limit of the test host, not of the package.
+zero errors, zero mismatches.
+
+The ceiling on this host was then measured rather than left as "it OOMs
+somewhere". 1200 peers establish concurrently with no error; 1500 is killed by
+the OOM killer before finishing. What matters is *whose* limit that is, so it
+was attributed rather than assumed:
+
+```
+1200 associations open, measured:
+  ceiling process RSS       3 MB      <- the Go side, including this package
+  SCTP kernel slab          3 MB
+  system memory used     7361 MB      <- of 7650 MB total
+  delta over baseline    6769 MB  ->  ~5.8 MB per association
+```
+
+Nearly six megabytes per association, against a Go-side cost of three megabytes
+for all twelve hundred. The memory is kernel socket buffers: `wmem_default` and
+`rmem_default` are 212992 bytes each and the kernel commits far more than the
+nominal figure per association. **The ceiling belongs to the host, not to this
+package** — every failure at 1500 is `Killed`, never an error returned by the
+library.
+
+Lowering it is not possible here: `/proc/sys/net/core/wmem_default` is `r--r--r--`
+in the Docker Desktop VM and `sysctl -w` returns EINVAL even privileged.
+`SetWriteBuffer`/`SetReadBuffer` after connect do not help either, since the
+commitment is made at association setup. A host that allows the sysctl, or one
+with more memory, would push the number up; nothing was found that this package
+does per association to bound it.
+
+## Multi-homing
+
+Multi-homing is SCTP's defining feature over TCP — one association spans several
+addresses on each side (RFC 9260 §6.4) — and this package exposes it through
+`SCTPAddr.IPAddrs`, `SCTPBind` and the `SCTP_GET_LOCAL_ADDRS` /
+`SCTP_GET_PEER_ADDRS` readbacks. **None of it had a test against a live kernel.**
+The coverage that existed parses address strings and decodes a reply buffer built
+by hand, which proves the encoding and never that an association forms across
+several addresses or that the peer learns them.
+
+`sctp_multihome_test.go` covers three directions:
+
+| Test | What would fail it |
+|---|---|
+| `TestMultihomedAssociationExchangesAddresses` | a peer learning fewer addresses than were bound; all four readbacks are checked, and data must flow so a passing address check cannot come from an association that never formed |
+| `TestMultihomedListenerServesManyPeers` | twelve multi-homed peers on one multi-homed listener — the multi-client isolation assertion carried onto multi-homed associations |
+| `TestMultihomedBindRejectsAnUnusableAddress` | a bind that silently drops an address the host does not own, leaving an association that looks healthy and is missing a path |
+
+Verified by mutating `ToRawSockAddrBuf` to encode only the first address. All
+three fail with exact diagnostics, and so does `TestKernelAddrsRoundTrip`:
+
+```
+listener bound [127.0.0.1], want [127.0.0.1 127.0.0.2]
+client peer addresses = [127.0.0.1], want [127.0.0.1 127.0.0.2]
+listen on [127.0.0.1 192.0.2.1] succeeded and bound [127.0.0.1]
+```
+
+Observed on a live association, both sides seeing the other's full set:
+
+```
+listener bound 3 addrs: [127.0.0.1 127.0.0.2 127.0.0.3]
+client local [127.0.0.1 127.0.0.4]   client peer [127.0.0.1 127.0.0.2 127.0.0.3]
+server local [127.0.0.1 127.0.0.2 127.0.0.3]   server peer [127.0.0.1 127.0.0.4]
+```
+
+`run-tests.sh` adds 127.0.0.2 through 127.0.0.4. The tests skip rather than pass
+vacuously below three usable addresses, since a single-address host exercises
+none of this. **Not covered:** failover between paths. That needs a path to be
+taken down mid-association, which loopback aliases cannot simulate — the kernel
+never marks a loopback path unreachable.
+
+## Throughput under concurrency
+
+Previously unmeasured. `BenchmarkConcurrentEcho` reports ns/op per round trip so
+peer counts are comparable:
+
+```
+peers=1    33419 ns/op   606 B/op   4 allocs/op
+peers=4    15348 ns/op   665 B/op   4 allocs/op
+peers=16   14041 ns/op   813 B/op   4 allocs/op
+peers=64   13141 ns/op  1459 B/op   4 allocs/op
+```
+
+Per-round-trip cost *improves* with concurrency rather than degrading: the
+single-peer case is latency-bound waiting for each echo, while concurrent peers
+keep the kernel busy. Allocations per message stay flat at four; the growth in
+bytes per op is the per-peer goroutine and buffer set, not per-message cost.
+
+`BenchmarkDial` answers the question the `EALREADY` fix raised — whether
+confirming the association made dialing more expensive — against the commit
+before it, 500x and three runs each:
+
+```
+baseline  1974259 / 1477438 / 1396742 ns/op   320 B/op  12 allocs/op
+fixed     1515316 / 1394870 / 1483919 ns/op   320 B/op  12 allocs/op
+```
+
+Identical allocations and overlapping ranges. The confirmation runs only on the
+`EALREADY` branch, so the common path is unchanged — which is what the placement
+was chosen for.
 
 ## `EINTR`: no blocking syscall was retried
 
