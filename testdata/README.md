@@ -1067,15 +1067,31 @@ rather than hiding a gap.
 
 ### Suite state
 
-188 pass, 0 fail, 3 skip under `-race`, and six consecutive clean runs of the
-full suite.
+189 pass, 0 fail, 3 skip under `-race`.
 
-The measurement needs a caveat, because the first attempt at it produced 5 of 8
-and would have been wrong to report as flakiness: the failing runs were sharing
-an 8-core, 7.6 GiB Docker VM with a 1000-peer scale probe running concurrently.
-Re-run with nothing else competing, the same suite passed 6 of 6. **Timing tests
-against a real kernel need an otherwise idle host**; a failure measured under
-contention says nothing about the code.
+Getting a trustworthy number took three attempts, and the first two were wrong
+in the same way. Eight runs gave 5 pass / 3 fail, and a re-run failed
+`TestSCTPConnectEALREADYOnBlockingSocketMidHandshake` after 340s against its
+usual 0.00s. Both measurements shared an 8-core, 7.6 GiB Docker VM with a
+1000-peer scale probe left running from earlier work — `docker ps` showed a
+27-minute-old container. The failing runs produced no `--- FAIL` line at all,
+which is the signature of host contention rather than a defect.
+
+Measured properly, on a host with no other containers, against the baseline this
+branch started from:
+
+```
+baseline (3bf7b9c)   full suite  12 pass  0 fail
+fixed tree           full suite  12 pass  0 fail
+baseline   EALREADY test alone   40 pass  0 fail
+fixed tree EALREADY test alone   40 pass  0 fail
+```
+
+So nothing was introduced, and the 340s failure belongs to the contention, not
+to the tree. This is the rule the `TestStreams` work already recorded above,
+re-learned the hard way: **never call a failure pre-existing or introduced
+without a baseline measured at a sample size that could distinguish them** — and
+never measure timing against a real kernel on a busy host.
 
 The two skipped AUTH-off tests are the deliberate inverses of the AUTH-on ones
 and skip precisely because the harness now enables the sysctl.
