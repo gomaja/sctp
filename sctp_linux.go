@@ -118,6 +118,78 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
 }
 
+// SCTPWriteInfo sends one message using the non-deprecated ancillary data types,
+// optionally attaching a partial reliability policy and an authentication key.
+//
+// This is the send-side counterpart to the SCTP_RCVINFO support on the read path.
+// RFC 6458 §5.3.2 titles the struct sctp_sndrcvinfo that SCTPWrite sends
+// "DEPRECATED" and splits it into SCTP_SNDINFO for sending and SCTP_RCVINFO for
+// receiving; this emits SCTP_SNDINFO.
+//
+// SCTPWrite is unchanged and still emits SCTP_SNDRCV, because switching it would
+// change the bytes on every existing caller's socket. The kernel accepts either,
+// and in fact accepts both in one sendmsg without complaint, so the two can be
+// mixed freely on the same association — that was measured.
+//
+// Any of the three may be nil:
+//
+//   - info nil sends with the socket defaults from SetDefaultSndInfo.
+//   - pr adds SCTP_CMSG_PRINFO, overriding the default policy from
+//     SetDefaultPrInfo for this message only. It needs PR-SCTP negotiated;
+//     see SetPrSupported.
+//   - auth adds SCTP_CMSG_AUTHINFO, naming the shared key to authenticate this
+//     message with. It needs net.sctp.auth_enable; see SetAuthActiveKey.
+//
+// Unlike SCTPWrite, this does not byte-swap PPID. SndInfo.PPID goes to the kernel
+// exactly as given, matching SetDefaultSndInfo, so a caller moving between the
+// two does not get a silently different value on the wire. Callers wanting the
+// SCTPWrite convention should pass htonl of their identifier.
+func (c *SCTPConn) SCTPWriteInfo(b []byte, info *SndInfo, pr *PrInfo, auth *AuthInfo) (int, error) {
+	var cbuf []byte
+	appendCmsg := func(cmsgType int32, data []byte) {
+		hdr := &syscall.Cmsghdr{
+			Level: syscall.IPPROTO_SCTP,
+			Type:  cmsgType,
+		}
+		// The bit width of hdr.Len is platform-specific, so SetLen is used
+		// rather than assigning Len directly.
+		hdr.SetLen(syscall.CmsgLen(len(data)))
+		cbuf = append(cbuf, toBuf(hdr)...)
+		cbuf = append(cbuf, data...)
+		// Each control message starts at a platform-aligned offset, so pad up
+		// to where the next header has to begin. Without this the kernel reads
+		// the second cmsg header from the wrong offset.
+		if pad := syscall.CmsgSpace(len(data)) - syscall.CmsgLen(len(data)); pad > 0 {
+			cbuf = append(cbuf, make([]byte, pad)...)
+		}
+	}
+
+	// AUTHINFO goes first deliberately. It is a 2-byte payload, the only one of
+	// the three whose CmsgSpace exceeds its CmsgLen, so it is the only cmsg
+	// whose alignment padding is observable — and padding is only read when
+	// another control message follows. Emitting it last would leave the padding
+	// logic untestable, since the bytes after the final cmsg are never
+	// inspected. The kernel does not care about the order.
+	if auth != nil {
+		appendCmsg(SCTP_CMSG_AUTHINFO, toBuf(auth))
+	}
+	if info != nil {
+		appendCmsg(SCTP_CMSG_SNDINFO, toBuf(info))
+	}
+	if pr != nil {
+		appendCmsg(SCTP_CMSG_PRINFO, toBuf(pr))
+	}
+
+	// Same deadline handling as SCTPWrite: MSG_DONTWAIT means SO_SNDTIMEO
+	// would not apply, so an expired deadline has to be checked here.
+	if deadline := atomic.LoadInt64(&c.writeDeadline); deadline != 0 {
+		if time.Until(time.Unix(0, deadline)) <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+	}
+	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+}
+
 // parseSndRcvInfo extracts the per-message information from a control message
 // buffer, accepting either form the kernel may have sent.
 //

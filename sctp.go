@@ -145,6 +145,12 @@ const (
 	// SCTP_ADD_STREAMS asks the peer to widen the association's stream count
 	// (RFC 6525 §6.5).
 	SCTP_ADD_STREAMS = 121
+	// SCTP_RESET_STREAMS restarts the sequence numbering of some or all
+	// streams (RFC 6525 §6.3.2).
+	SCTP_RESET_STREAMS = 119
+	// SCTP_RESET_ASSOC restarts the whole association's sequence numbering
+	// (RFC 6525 §6.3.3).
+	SCTP_RESET_ASSOC = 120
 
 	// SCTP_HMAC_IDENT carries struct sctp_hmacalgo, the ordered list of HMAC
 	// algorithms this endpoint offers (RFC 4895 §6.2).
@@ -152,6 +158,18 @@ const (
 	// SCTP_AUTH_ACTIVE_KEY carries struct sctp_authkeyid and selects the key
 	// used for outbound AUTH chunks (RFC 4895 §6.5).
 	SCTP_AUTH_ACTIVE_KEY = 24
+	// SCTP_AUTH_CHUNK adds one chunk type to the set this endpoint requires
+	// the peer to authenticate (RFC 4895 §6.1). Set only.
+	SCTP_AUTH_CHUNK = 21
+	// SCTP_AUTH_KEY installs a shared key, carrying struct sctp_authkey with
+	// the key bytes appended (RFC 4895 §6.3). Set only.
+	SCTP_AUTH_KEY = 23
+	// SCTP_AUTH_DELETE_KEY removes a shared key (RFC 4895 §6.8). Set only.
+	SCTP_AUTH_DELETE_KEY = 25
+	// SCTP_AUTH_DEACTIVATE_KEY stops a shared key being used for new packets
+	// while leaving it able to verify what is already in flight
+	// (RFC 4895 §6.9). Set only.
+	SCTP_AUTH_DEACTIVATE_KEY = 35
 	// SCTP_PEER_AUTH_CHUNKS reads the chunk types the peer requires to be
 	// authenticated (RFC 4895 §6.6). Read only.
 	SCTP_PEER_AUTH_CHUNKS = 26
@@ -344,12 +362,35 @@ type Event struct {
 	_  uint8
 }
 
+// Ancillary data types, enum sctp_cmsg_type. The values are positional in the C
+// enum, so the order here is the contract — SCTP_CMSG_PRINFO must stay 5.
 const (
 	SCTP_CMSG_INIT = iota
 	SCTP_CMSG_SNDRCV
 	SCTP_CMSG_SNDINFO
 	SCTP_CMSG_RCVINFO
 	SCTP_CMSG_NXTINFO
+	// SCTP_CMSG_PRINFO carries struct sctp_prinfo on a send, setting the
+	// partial reliability policy for that one message (RFC 6458 §5.3.7).
+	SCTP_CMSG_PRINFO
+	// SCTP_CMSG_AUTHINFO carries struct sctp_authinfo, naming the shared key
+	// to authenticate that one message with (RFC 6458 §5.3.8).
+	SCTP_CMSG_AUTHINFO
+	// SCTP_CMSG_DSTADDRV4 and SCTP_CMSG_DSTADDRV6 add a destination address to
+	// a send on an unconnected one-to-many socket (RFC 6458 §5.3.9, §5.3.10).
+	// This package creates only one-to-one sockets, so they are defined for
+	// completeness.
+	SCTP_CMSG_DSTADDRV4
+	SCTP_CMSG_DSTADDRV6
+)
+
+// Direction flags for ResetStreams (RFC 6525 §6.3.2). At least one is required:
+// a request with neither is rejected with EINVAL, which was measured.
+const (
+	// SCTPStreamResetIncoming resets the streams the peer sends on.
+	SCTPStreamResetIncoming = 0x01
+	// SCTPStreamResetOutgoing resets the streams this endpoint sends on.
+	SCTPStreamResetOutgoing = 0x02
 )
 
 const (
@@ -484,6 +525,25 @@ type AddStreamsReq struct {
 	InStreams uint16
 	// OutStreams is how many outbound streams to add.
 	OutStreams uint16
+}
+
+// PrInfo mirrors struct sctp_prinfo (RFC 6458 §5.3.7), the per-message partial
+// reliability policy carried as SCTP_CMSG_PRINFO ancillary data.
+//
+// Note the padding: the C struct is a __u16 followed by a __u32, so the value
+// sits at offset 4 and the struct is 8 bytes rather than 6.
+type PrInfo struct {
+	// Policy is one of the SCTPPrPolicy constants.
+	Policy uint16
+	_      uint16
+	// Value is a lifetime, retransmission count or priority, per Policy.
+	Value uint32
+}
+
+// AuthInfo mirrors struct sctp_authinfo (RFC 6458 §5.3.8), naming the shared key
+// to authenticate one message with, carried as SCTP_CMSG_AUTHINFO.
+type AuthInfo struct {
+	KeyNumber uint16
 }
 
 // AuthKeyID mirrors struct sctp_authkeyid (RFC 4895 §6.5), naming one of the
@@ -1548,6 +1608,204 @@ func (c *SCTPConn) AddStreams(inStreams, outStreams uint16) error {
 	_, _, err := setsockopt(c.fd(), SCTP_ADD_STREAMS,
 		uintptr(unsafe.Pointer(&as)), optlen)
 	return err
+}
+
+// ResetStreams restarts the sequence numbering of the named streams, or of every
+// stream when streams is empty (RFC 6525 §6.3.2).
+//
+// direction is a combination of SCTPStreamResetIncoming and
+// SCTPStreamResetOutgoing; at least one is required, since the kernel rejects a
+// request with neither.
+//
+// Like AddStreams this needs the reconfiguration extension negotiated —
+// SetReconfigSupported on both ends before connecting — plus
+// SCTPEnableResetStreamReq in the SetEnableStreamReset mask. Without them the
+// kernel answers ENOPROTOOPT, which reads like the option not existing.
+//
+// The option length has to cover the stream list, not just the fixed header:
+// naming one stream while passing the bare struct length is rejected with
+// EINVAL. That is handled here, and is the reason this takes a slice rather than
+// exposing the raw struct.
+func (c *SCTPConn) ResetStreams(direction uint16, streams ...uint16) error {
+	if direction&^uint16(SCTPStreamResetIncoming|SCTPStreamResetOutgoing) != 0 {
+		return fmt.Errorf("sctp: stream reset direction %#x has unknown bits",
+			direction)
+	}
+	if direction == 0 {
+		return fmt.Errorf("sctp: stream reset needs at least one of " +
+			"SCTPStreamResetIncoming or SCTPStreamResetOutgoing")
+	}
+	if len(streams) > int(^uint16(0)) {
+		return fmt.Errorf("sctp: %d streams exceeds the %d the request can "+
+			"name", len(streams), int(^uint16(0)))
+	}
+
+	buf := buildResetStreams(direction, streams)
+	_, _, err := setsockopt(c.fd(), SCTP_RESET_STREAMS,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return err
+}
+
+// buildResetStreams lays out struct sctp_reset_streams: an association id, the
+// direction flags, the stream count, then the stream ids.
+//
+// Built as bytes rather than from a Go struct because the C struct ends in a
+// flexible array, and the list has to be contiguous with the header in one
+// allocation. Split out from ResetStreams so the offsets can be asserted
+// directly — flags and count are adjacent uint16s, so a transposition is
+// invisible to any length check.
+func buildResetStreams(direction uint16, streams []uint16) []byte {
+	const hdr = 8
+	buf := make([]byte, hdr+2*len(streams))
+	// AssocID at [0:4] stays zero: one-to-one sockets ignore it.
+	nativeEndian.PutUint16(buf[4:6], direction)
+	nativeEndian.PutUint16(buf[6:8], uint16(len(streams)))
+	for i, sid := range streams {
+		nativeEndian.PutUint16(buf[hdr+2*i:], sid)
+	}
+	return buf
+}
+
+// ResetAssoc restarts the association's sequence numbering as a whole
+// (RFC 6525 §6.3.3).
+//
+// This needs the reconfiguration extension negotiated and
+// SCTPEnableResetAssocReq in the SetEnableStreamReset mask.
+func (c *SCTPConn) ResetAssoc() error {
+	var id SCTPAssocID
+	_, _, err := setsockopt(c.fd(), SCTP_RESET_ASSOC,
+		uintptr(unsafe.Pointer(&id)), unsafe.Sizeof(id))
+	return err
+}
+
+// SetAuthChunk adds one chunk type to the set this endpoint requires the peer to
+// authenticate (RFC 4895 §6.1).
+//
+// The option is additive and set-only: each call adds a type, and there is no
+// way to remove one or to read the set back other than LocalAuthChunks.
+//
+// RFC 4895 §6.1 says this must be set before the association is established. The
+// kernel does not enforce that — a call on a connected socket succeeds — but the
+// requirement stands, because the set is advertised in the INIT and a later
+// addition cannot be communicated to the peer.
+//
+// See SetAuthActiveKey about net.sctp.auth_enable.
+func (c *SCTPConn) SetAuthChunk(chunkType uint8) error {
+	// struct sctp_authchunk is a single __u8, so the option is one byte and
+	// setsockoptInt's 32-bit value would be rejected.
+	_, _, err := setsockopt(c.fd(), SCTP_AUTH_CHUNK,
+		uintptr(unsafe.Pointer(&chunkType)), unsafe.Sizeof(chunkType))
+	return err
+}
+
+// SetAuthKey installs a shared key for authenticating chunks (RFC 4895 §6.3).
+//
+// keyNumber names the key for SetAuthActiveKey, DeleteAuthKey and
+// DeactivateAuthKey. Key 0 is the null key every association starts with;
+// overwriting it is permitted.
+//
+// The key may not be empty: the kernel rejects a zero-length key with EINVAL
+// rather than treating it as a deletion. The upper bound measured here is 8192
+// bytes, and the kernel validates the length against the option size, so a
+// mismatch cannot make it read past the buffer.
+//
+// See SetAuthActiveKey about net.sctp.auth_enable.
+func (c *SCTPConn) SetAuthKey(keyNumber uint16, key []byte) error {
+	if len(key) == 0 {
+		return fmt.Errorf("sctp: auth key %d is empty; the kernel rejects a "+
+			"zero-length key rather than treating it as a deletion, so use "+
+			"DeleteAuthKey instead", keyNumber)
+	}
+	if len(key) > int(^uint16(0)) {
+		return fmt.Errorf("sctp: auth key of %d bytes exceeds the %d the "+
+			"length field can express", len(key), int(^uint16(0)))
+	}
+
+	buf := buildAuthKey(keyNumber, key)
+	_, _, err := setsockopt(c.fd(), SCTP_AUTH_KEY,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return err
+}
+
+// buildAuthKey lays out struct sctp_authkey: an association id, the key number,
+// the key length, then the key bytes.
+//
+// Split out from SetAuthKey for the same reason as buildResetStreams — the two
+// uint16s are adjacent, so swapping them produces a buffer the kernel may still
+// accept while installing a key of the wrong length under the wrong number.
+func buildAuthKey(keyNumber uint16, key []byte) []byte {
+	const hdr = 8
+	buf := make([]byte, hdr+len(key))
+	nativeEndian.PutUint16(buf[4:6], keyNumber)
+	nativeEndian.PutUint16(buf[6:8], uint16(len(key)))
+	copy(buf[hdr:], key)
+	return buf
+}
+
+// DeleteAuthKey removes a shared key (RFC 4895 §6.8).
+//
+// The active key cannot be deleted — the kernel reports EINVAL — so select
+// another with SetAuthActiveKey first, or deactivate this one. A key still needed
+// to verify packets in flight should be deactivated rather than deleted.
+//
+// See SetAuthActiveKey about net.sctp.auth_enable.
+func (c *SCTPConn) DeleteAuthKey(keyNumber uint16) error {
+	return c.authKeyOp(SCTP_AUTH_DELETE_KEY, keyNumber)
+}
+
+// DeactivateAuthKey stops a shared key being used for new packets while leaving
+// it able to verify packets already in flight (RFC 4895 §6.9).
+//
+// This is the safe half of key rollover: deactivate, let the peer's in-flight
+// packets drain, then delete.
+//
+// See SetAuthActiveKey about net.sctp.auth_enable.
+func (c *SCTPConn) DeactivateAuthKey(keyNumber uint16) error {
+	return c.authKeyOp(SCTP_AUTH_DEACTIVATE_KEY, keyNumber)
+}
+
+// authKeyOp issues one of the set-only options taking a struct sctp_authkeyid.
+func (c *SCTPConn) authKeyOp(optname uintptr, keyNumber uint16) error {
+	id := AuthKeyID{KeyNumber: keyNumber}
+	_, _, err := setsockopt(c.fd(), optname,
+		uintptr(unsafe.Pointer(&id)), unsafe.Sizeof(id))
+	return err
+}
+
+// SetHmacIdent sets the HMAC algorithms this endpoint offers, most preferred
+// first (RFC 4895 §6.2).
+//
+// The kernel validates the identifiers and reports EOPNOTSUPP for one it does not
+// implement — identifier 2 is unassigned in the IANA registry and is refused,
+// which was measured. Use the SCTPAuthHmacID constants.
+//
+// See SetAuthActiveKey about net.sctp.auth_enable.
+func (c *SCTPConn) SetHmacIdent(idents ...uint16) error {
+	if len(idents) == 0 {
+		return fmt.Errorf("sctp: SetHmacIdent needs at least one algorithm")
+	}
+
+	buf := buildHmacAlgo(idents)
+	_, _, err := setsockopt(c.fd(), SCTP_HMAC_IDENT,
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+	return err
+}
+
+// buildHmacAlgo lays out struct sctp_hmacalgo: a __u32 count followed by that
+// many __u16 identifiers.
+//
+// Split out from SetHmacIdent so the byte layout can be asserted without a
+// kernel. That matters because the count is 32 bits: writing it as a uint16
+// leaves the correct bytes on a little-endian host and the wrong ones on a
+// big-endian one, so no test on amd64 can catch the mistake through behaviour.
+func buildHmacAlgo(idents []uint16) []byte {
+	const hdr = 4
+	buf := make([]byte, hdr+2*len(idents))
+	nativeEndian.PutUint32(buf[:4], uint32(len(idents)))
+	for i, id := range idents {
+		nativeEndian.PutUint16(buf[hdr+2*i:], id)
+	}
+	return buf
 }
 
 // SetPeerAddrThlds sets the per-path retransmission thresholds that drive

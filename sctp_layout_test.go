@@ -196,6 +196,25 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 		assertOffset(t, "OutStreams", unsafe.Offsetof(as.OutStreams), 6)
 	})
 
+	t.Run("PrInfo", func(t *testing.T) {
+		var p PrInfo
+		// struct sctp_prinfo, RFC 6458 §5.3.7. A __u16 followed by a __u32, so
+		// the value sits at 4 and the struct is 8 — not the 6 a naive reading
+		// gives. Unlike the pads in DefaultPrInfo and AuthKeyID, this one is
+		// load-bearing: Go would otherwise place Value at offset 2.
+		assertSize(t, "PrInfo", unsafe.Sizeof(p), 8)
+		assertOffset(t, "Policy", unsafe.Offsetof(p.Policy), 0)
+		assertOffset(t, "Value", unsafe.Offsetof(p.Value), 4)
+	})
+
+	t.Run("AuthInfo", func(t *testing.T) {
+		var a AuthInfo
+		// struct sctp_authinfo, RFC 6458 §5.3.8. A bare __u16, so 2 bytes with
+		// no padding — the kernel accepts it at that exact length.
+		assertSize(t, "AuthInfo", unsafe.Sizeof(a), 2)
+		assertOffset(t, "KeyNumber", unsafe.Offsetof(a.KeyNumber), 0)
+	})
+
 	t.Run("AuthKeyID", func(t *testing.T) {
 		var id AuthKeyID
 		// struct sctp_authkeyid, RFC 4895 §6.5. The C declaration is a
