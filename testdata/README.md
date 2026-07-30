@@ -857,10 +857,42 @@ reports no error. The harness believed it had twenty times the buffer it had.
 `raiseBuffers` now reads the ceiling from the sysctl and verifies what was
 granted — a caller cannot otherwise tell a clamp from a success.
 
+### The read path aliased its buffer
+
+Looking at the per-call `oob` allocation for pooling turned up a correctness bug
+rather than a performance one. `parseSndRcvInfo` returned a pointer *into* the
+control-message buffer and byte-swapped `PPID` in place:
+
+```go
+dst := (*SndRcvInfo)(unsafe.Pointer(&m.Data[0]))
+dst.PPID = ntohl(dst.PPID)
+return dst, nil
+```
+
+Parsing the same bytes twice therefore swapped twice:
+
+```
+first parse PPID=0x11223344, second parse PPID=0x44332211 (input was 0x11223344)
+both parses returned the SAME pointer: the result aliases the input buffer
+```
+
+Reachable by any caller driving `recvmsg` itself through `SyscallConn`. It also
+meant the returned struct outlived the buffer it pointed into, which held only
+because `SCTPReadFlags` allocates a fresh buffer every call — so pooling that
+buffer, the obvious optimisation, would have been a use-after-free.
+
+Fixed by copying. `TestParseSndRcvInfoDoesNotAliasInput` overwrites the source
+buffer after parsing and checks the result is unaffected;
+`TestSCTPReadInfoSurvivesLaterReads` holds the info from four messages and checks
+all four after the reads finish. Both fail against the old implementation.
+
+The lesson is the one this package keeps teaching: the bug was found by reading
+the code around a performance question, not by looking for bugs.
+
 ### Not measured
 
-Throughput and latency under concurrency, multi-homed paths, large messages
-crossing the fragmentation point, and the receive path's `oob` buffer, which is
-allocated per `SCTPReadFlags` call and is the obvious next candidate. The
+Throughput and latency under concurrency, multi-homed paths, and large messages
+crossing the fragmentation point. Pooling the `oob` buffer is now *possible*
+— the aliasing that blocked it is fixed — but has not been done or measured. The
 benchmarks here are single-association loopback on one host and one kernel; they
 compare revisions of this package rather than characterising the stack.
