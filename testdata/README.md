@@ -1315,3 +1315,79 @@ busy host.
 
 The two skipped AUTH-off tests are the deliberate inverses of the AUTH-on ones
 and skip precisely because the harness now enables the sysctl.
+
+## Backpressure: `EAGAIN` with no supported way to wait
+
+Reported by a library user building on the package. Three claims, all of which
+checked out at `5591211`: `SCTPWrite` passes `MSG_DONTWAIT` and so reports
+`EAGAIN` the moment the send buffer fills; `SCTPWriteInfo` does the same; and
+`SyscallConn` hands back a `rawConn` whose `Read` and `Write` **panic** with
+`"not implemented"`. `Control` works, so a caller can extract the descriptor and
+poll it — which is every caller reimplementing readiness handling, in
+platform-specific code, for a type `Accept` returns as a `net.Conn`.
+
+Two things the report got wrong, and they matter because they decide how much to
+change. `net.Conn.Write` has **no** documented blocking requirement — `net/net.go`
+says only "Write can be made to time out and return an error after a fixed time
+limit" — so returning `EAGAIN` is conformant, and this is a usability gap rather
+than a contract violation. And "implement `Read`/`Write` against the runtime
+poller" is not available here: reaching the poller means `O_NONBLOCK`, and the
+read path maps a `recvmsg` `EAGAIN` onto `os.ErrDeadlineExceeded`, so every read
+that found the socket empty would report a deadline that had not expired.
+
+The real problem was narrower and worse. `MSG_DONTWAIT` arrived in `2cd8759` to
+stop a send to a peer that has stopped reading parking for minutes with no way
+to interrupt it — that is worth keeping. But it also left `SetWriteDeadline`
+with **nothing to do**: `SO_SNDTIMEO` bounds a wait the socket never performs, so
+a deadline in the future changed no behaviour at all, and `TestWriteDeadlineInThePast`
+was the only coverage precisely because an elapsed deadline was the only
+observable case. A caller asking for "carry on until this is accepted or until
+the deadline" got neither half.
+
+So the wait now happens in `sendmsg`, bounded by the deadline the caller set.
+With no deadline the behaviour is byte-for-byte what it was. `SyscallConn` on a
+connected association returns a `connRawConn` that waits with `ppoll`;
+`SCTPListener` and the `SocketConfig` hook return `syscall.EINVAL`, which is
+exactly what `net/rawconn.go` does for a listener and what
+`TCPListener.SyscallConn` documents.
+
+The wire is what settles it. Same probe, same burst of 2000 messages of 512
+bytes against a peer draining at 2 ms per read, counting DATA chunks rather than
+frames — loopback bundles many chunks into one packet, and counting frames
+undercounts by an order of magnitude:
+
+| Code | Write deadline | DATA chunks on the wire |
+|---|---|---|
+| `5591211` | 120 s | **348** — the deadline is ignored |
+| fixed | 120 s | **2000** — sequences 0..1999, each once, in order |
+| fixed | none | **348** — `2cd8759`'s behaviour, deliberately unchanged |
+
+Two traps in building that harness, both of which read as success. `sctp port N`
+as a BPF capture filter matches nothing; `ip proto 132` works. And the sequence
+check was written with `strtonum`, a gawk extension — Debian ships mawk, so it
+silently did nothing and reported the payloads verified.
+
+The mutation harness caught a third, in the tests rather than the tooling.
+`TestSyscallConnCloseUnblocksWait` was written to prove that a parked wait comes
+up for air and notices a closed descriptor; stretching `rawWaitSlice` to ten
+minutes left it green. The wakeup was coming from the kernel: `closeSctpSocket`
+calls `shutdown(SHUT_RDWR)` first, which wakes anything parked on the descriptor.
+`Abort` does not — it sets `SO_LINGER` to zero and closes outright — so
+`TestSyscallConnAbortUnblocksWait` covers the path where the polling cadence is
+genuinely the only thing that ends the wait, and the two tests now pin opposite
+sides of that mutation.
+
+Two limitations that survive, both documented at the code:
+
+- `ppoll` is level-triggered where the runtime's poller is edge-triggered, and
+  `syscall.RawConn` explicitly permits `f` to report "not done" on a descriptor
+  that is ready. `POLLOUT` means the send buffer has room; `sendmsg` needs room
+  for the whole message and will not split one. After `rawSpinTolerance` such
+  rounds the wait stops polling and paces itself, because the kernel has no
+  readiness event for "enough room for a message of my size". Measured at 159
+  calls over 300 ms; unguarded it reaches six figures.
+- The descriptor lifetime race is narrowed, not removed. Reading `c.fd()` afresh
+  each round beats the old snapshot, but there is no equivalent of the reference
+  count `internal/poll` uses, so a `Close` landing between the read and the use
+  is still the caller's ordering problem — as it already is for `SCTPRead` and
+  `SCTPWrite`.

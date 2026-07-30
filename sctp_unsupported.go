@@ -41,8 +41,25 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 	return 0, ErrUnsupported
 }
 
+func (c *SCTPConn) SCTPWriteInfo(b []byte, info *SndInfo, pr *PrInfo, auth *AuthInfo) (int, error) {
+	return 0, ErrUnsupported
+}
+
 func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 	return 0, nil, ErrUnsupported
+}
+
+// SyscallConn is declared here so that code holding a *SCTPConn or
+// *SCTPListener still compiles when cross-compiled for a platform without SCTP.
+// Without it the linux build has a method the others do not, and a caller who
+// reaches for readiness handling — which is exactly what SyscallConn is for —
+// fails to build rather than failing at run time with the reason.
+func (c *SCTPConn) SyscallConn() (syscall.RawConn, error) {
+	return nil, ErrUnsupported
+}
+
+func (ln *SCTPListener) SyscallConn() (syscall.RawConn, error) {
+	return nil, ErrUnsupported
 }
 
 func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {

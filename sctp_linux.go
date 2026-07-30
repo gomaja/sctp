@@ -66,6 +66,168 @@ func getsockopt(fd int, optname, optval, optlen uintptr) (uintptr, uintptr, erro
 	return r0, r1, nil
 }
 
+// poll(2) event bits. The syscall package generates the EPOLL* constants from
+// the kernel headers but no POLL* ones, and this module has no dependencies to
+// borrow them from. The kernel defines both sets to the same bits for the
+// events that appear in both, which is what TestPollConstantsMatchKernel checks;
+// pollNval has no epoll counterpart, since epoll reports an invalid descriptor
+// at registration rather than in an event.
+//
+// These values are uniform across every Linux architecture: asm-generic/poll.h
+// defines them and the architectures that override anything override only the
+// write-band and message bits, none of which are used here.
+const (
+	pollIn   = 0x001
+	pollOut  = 0x004
+	pollErr  = 0x008
+	pollHup  = 0x010
+	pollNval = 0x020
+)
+
+// pollFd mirrors struct pollfd from <poll.h>. TestPollFdLayoutMatchesKernel
+// pins the layout.
+type pollFd struct {
+	Fd      int32
+	Events  int16
+	Revents int16
+}
+
+// pollWait blocks until fd reports one of events, timeout elapses, or a signal
+// arrives. It reports the events the kernel returned; zero means the timeout
+// expired first.
+//
+// ppoll rather than poll: arm64 and riscv64 have no SYS_POLL at all, only
+// SYS_PPOLL, so poll would not build for two of the architectures this file is
+// compiled for. The signal mask is left null, which makes the two equivalent
+// apart from the timeout's resolution.
+func pollWait(fd int, events int16, timeout time.Duration) (int16, error) {
+	fds := [1]pollFd{{Fd: int32(fd), Events: events}}
+	ts := syscall.NsecToTimespec(timeout.Nanoseconds())
+	n, _, errno := syscall.Syscall6(syscall.SYS_PPOLL,
+		uintptr(unsafe.Pointer(&fds[0])),
+		1,
+		uintptr(unsafe.Pointer(&ts)),
+		0, 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	if n == 0 {
+		return 0, nil
+	}
+	return fds[0].Revents, nil
+}
+
+const (
+	// rawWaitSlice bounds a single ppoll so a concurrent Close is noticed.
+	// Linux does not wake a task parked in poll when another thread closes the
+	// descriptor it is waiting on, and closeSctpSocket reaches its close about a
+	// millisecond after Close swaps _fd to -1 — the measurement is recorded at
+	// closeSctpSocket. Waking on this cadence lets a waiter re-read the
+	// descriptor, see -1, and return, instead of parking until its deadline on a
+	// descriptor that no longer belongs to this association.
+	rawWaitSlice = 50 * time.Millisecond
+
+	// rawSpinTolerance is how many consecutive ready-but-not-done rounds are
+	// allowed before the wait stops polling and starts pacing itself.
+	rawSpinTolerance = 8
+
+	// rawSpinBackoff is the pace it falls back to. It matches the interval the
+	// test helper writeAll already uses for the same condition.
+	rawSpinBackoff = time.Millisecond
+)
+
+// readyWaiter waits for a descriptor to become ready, bounded by a deadline,
+// and guards against the busy loop a level-triggered wait invites.
+//
+// ppoll is level-triggered where the runtime's own poller is edge-triggered, and
+// syscall.RawConn explicitly permits f to report "not done" for a descriptor
+// that is ready. The two combine badly. POLLOUT means the send buffer has room;
+// sendmsg needs room for the whole message and will not split one. So a message
+// large relative to the free space can see ready, then EAGAIN, then ready again
+// with nothing having changed, and a plain retry loop burns a core. That is not
+// hypothetical here — it is the retry spin the benchmarks measured at 2ms per
+// write before they stopped doing it, recorded in testdata/README.md.
+//
+// After rawSpinTolerance such rounds this stops polling and paces the retries
+// instead, which is the only thing that can be done: the kernel has no readiness
+// event for "enough room for a message of my size".
+type readyWaiter struct {
+	c       *SCTPConn
+	events  int16
+	stalled int
+	ready   bool
+}
+
+// wait blocks until the descriptor is ready, the deadline expires, or the
+// close-detection slice elapses. A zero deadline means no deadline, in which
+// case only a close or readiness ends the wait.
+func (w *readyWaiter) wait(deadline int64) error {
+	fd := w.c.fd()
+	if fd < 0 {
+		return syscall.EBADF
+	}
+
+	slice := rawWaitSlice
+	if deadline != 0 {
+		remaining := time.Until(time.Unix(0, deadline))
+		if remaining <= 0 {
+			return os.ErrDeadlineExceeded
+		}
+		if remaining < slice {
+			slice = remaining
+		}
+	}
+
+	// The descriptor was reported ready and the caller still is not done, so
+	// polling again would return immediately and achieve nothing. Pace instead.
+	if w.ready {
+		w.stalled++
+		if w.stalled >= rawSpinTolerance {
+			if slice > rawSpinBackoff {
+				slice = rawSpinBackoff
+			}
+			time.Sleep(slice)
+			return nil
+		}
+	}
+
+	revents, err := pollWait(fd, w.events, slice)
+	if err != nil {
+		// A signal interrupted the wait. The deadline is absolute and is
+		// re-derived on the next round, so retrying cannot extend the budget.
+		if errors.Is(err, syscall.EINTR) {
+			w.ready = false
+			return nil
+		}
+		return err
+	}
+	if revents&pollNval != 0 {
+		// The descriptor went away underneath the wait.
+		return syscall.EBADF
+	}
+	// POLLERR and POLLHUP are left to the caller's next attempt, which collects
+	// the real errno from the syscall itself rather than having one synthesised
+	// here from an event bit.
+	w.ready = revents != 0
+	if revents == 0 {
+		// A genuine wait elapsed rather than a spin.
+		w.stalled = 0
+	}
+	return nil
+}
+
+// rawConn is the Control-only syscall.RawConn. It backs the descriptor handed
+// to a SocketConfig hook, which runs before the socket is connected or
+// listening, and SCTPListener.SyscallConn.
+//
+// Read and Write report syscall.EINVAL rather than waiting, which is what the
+// standard library does for the same case: net/rawconn.go gives a listener's
+// RawConn exactly these two methods, and TCPListener.SyscallConn documents it —
+// "The returned RawConn only supports calling Control. Read and Write return an
+// error." Waiting for accept readiness through a RawConn is not a supported
+// idiom anywhere in net, so there is nothing here to implement. What these used
+// to do was panic, which is never a defensible answer to a caller using an
+// interface exactly as its contract describes.
 type rawConn struct {
 	sockfd int
 }
@@ -76,11 +238,80 @@ func (r rawConn) Control(f func(fd uintptr)) error {
 }
 
 func (r rawConn) Read(f func(fd uintptr) (done bool)) error {
-	panic("not implemented")
+	return syscall.EINVAL
 }
 
 func (r rawConn) Write(f func(fd uintptr) (done bool)) error {
-	panic("not implemented")
+	return syscall.EINVAL
+}
+
+// connRawConn is the syscall.RawConn a connected association hands out.
+//
+// It keeps the *SCTPConn rather than a descriptor number so every operation
+// reads the descriptor currently in force. rawConn cannot: it snapshots the
+// number at SyscallConn time, and Close swaps _fd to -1 and closes the
+// descriptor, so a snapshot taken beforehand can name a number the kernel has
+// since handed to an unrelated socket.
+//
+// The remaining race is the one the standard library solves with a reference
+// count in internal/poll and this package has no equivalent of: a Close landing
+// between reading the descriptor and using it. Reading it afresh each round
+// narrows that to the width of a single call and lets a parked wait notice the
+// close; it does not remove it. A caller closing a connection while another
+// goroutine is inside Read, Write or Control is responsible for that ordering,
+// exactly as it is today for SCTPRead and SCTPWrite.
+type connRawConn struct {
+	c *SCTPConn
+}
+
+func (r *connRawConn) Control(f func(fd uintptr)) error {
+	fd := r.c.fd()
+	if fd < 0 {
+		return syscall.EBADF
+	}
+	f(uintptr(fd))
+	return nil
+}
+
+func (r *connRawConn) Read(f func(fd uintptr) (done bool)) error {
+	return r.c.rawWait(f, pollIn, &r.c.readDeadline)
+}
+
+func (r *connRawConn) Write(f func(fd uintptr) (done bool)) error {
+	return r.c.rawWait(f, pollOut, &r.c.writeDeadline)
+}
+
+// rawWait implements the syscall.RawConn contract for Read and Write: call f,
+// and while it reports it is not done, wait for the descriptor to become ready
+// and call it again.
+//
+// The waiting is done here rather than by the runtime poller. Reaching the
+// poller would mean putting the descriptor in non-blocking mode, and the read
+// path depends on it being blocking: SCTPReadFlags realises its deadline with
+// SO_RCVTIMEO and maps the resulting EAGAIN onto os.ErrDeadlineExceeded, so on a
+// non-blocking descriptor every read that found the socket empty would report a
+// deadline that had not expired. That is a rewrite of the read path, not a
+// change to SyscallConn.
+//
+// Polling here instead is sound because the contract puts the I/O in the
+// caller's f and only the waiting in the implementation, so f decides for itself
+// whether to block — a caller passing MSG_DONTWAIT, which is what any caller of
+// a readiness API is doing, never does. A caller whose f blocks blocks, exactly
+// as it would have on the descriptor it got from Control.
+func (c *SCTPConn) rawWait(f func(fd uintptr) (done bool), events int16, deadline *int64) error {
+	w := readyWaiter{c: c, events: events}
+	for {
+		fd := c.fd()
+		if fd < 0 {
+			return syscall.EBADF
+		}
+		if f(uintptr(fd)) {
+			return nil
+		}
+		if err := w.wait(atomic.LoadInt64(deadline)); err != nil {
+			return err
+		}
+	}
 }
 
 func (c *SCTPConn) SyscallConn() (syscall.RawConn, error) {
@@ -88,7 +319,7 @@ func (c *SCTPConn) SyscallConn() (syscall.RawConn, error) {
 	if fd < 0 {
 		return nil, syscall.EINVAL
 	}
-	return &rawConn{sockfd: int(fd)}, nil
+	return &connRawConn{c: c}, nil
 }
 
 func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
@@ -96,15 +327,62 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 	if info != nil {
 		cbuf = buildSndRcvCmsg(info)
 	}
-	// Writes use MSG_DONTWAIT and so never block; SO_SNDTIMEO would have no
-	// effect on them. Enforce the write deadline directly instead, so a
-	// deadline already in the past fails rather than being ignored.
-	if deadline := atomic.LoadInt64(&c.writeDeadline); deadline != 0 {
+	return c.sendmsg(b, cbuf)
+}
+
+// sendmsg sends one message, waiting for send-buffer space when — and only
+// when — a write deadline is in force.
+//
+// Sends pass MSG_DONTWAIT, so a full send buffer reports EAGAIN rather than
+// blocking. That is deliberate and stays: a blocking sendmsg to a peer that has
+// stopped reading does not come back for many minutes — bounded in the limit by
+// the retransmission backoff and the shutdown-guard timer, not by anything the
+// caller can set — and there is no way to interrupt it. Reporting EAGAIN keeps
+// the descriptor under the caller's control.
+//
+// What it also did was leave SetWriteDeadline with nothing to do. SO_SNDTIMEO
+// only bounds a wait the socket never performs, so a deadline in the future
+// changed no behaviour whatsoever and only an already-elapsed one was
+// observable. A caller asking for what net.Conn.SetWriteDeadline offers — carry
+// on until this is accepted or until the deadline — got neither half of it, and
+// a burst larger than the send buffer surfaced as a write failure rather than as
+// backpressure.
+//
+// So the wait happens here, bounded by the deadline the caller set. Two
+// properties matter. With no deadline the behaviour is exactly what it was,
+// EAGAIN on the first refusal, so nothing changes for a caller that never sets
+// one. And the unbounded wait stays unreachable: every wait this performs ends
+// at a time the caller chose.
+//
+// The deadline is read once, at entry. Moving it from another goroutine takes
+// effect from the next write, which is what SetReadDeadline already documents
+// for reads.
+//
+// The whole buffer is retried, never b[n:]. sctp_sendmsg queues a message in
+// full or queues nothing, so a refused send leaves nothing behind to resume
+// from; resuming at an offset would split one application message into two on
+// the wire.
+func (c *SCTPConn) sendmsg(b, cbuf []byte) (int, error) {
+	deadline := atomic.LoadInt64(&c.writeDeadline)
+	if deadline == 0 {
+		return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+	}
+
+	w := readyWaiter{c: c, events: pollOut}
+	for {
+		// Checked before the first send as well as before each retry, so a
+		// deadline already in the past fails rather than being ignored.
 		if time.Until(time.Unix(0, deadline)) <= 0 {
 			return 0, os.ErrDeadlineExceeded
 		}
+		n, err := syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+		if !errors.Is(err, syscall.EAGAIN) {
+			return n, err
+		}
+		if err := w.wait(deadline); err != nil {
+			return 0, err
+		}
 	}
-	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
 }
 
 // buildSndRcvCmsg lays out the SCTP_SNDRCV control message for one send.
@@ -229,14 +507,9 @@ func (c *SCTPConn) SCTPWriteInfo(b []byte, info *SndInfo, pr *PrInfo, auth *Auth
 		appendCmsg(SCTP_CMSG_PRINFO, toBuf(pr))
 	}
 
-	// Same deadline handling as SCTPWrite: MSG_DONTWAIT means SO_SNDTIMEO
-	// would not apply, so an expired deadline has to be checked here.
-	if deadline := atomic.LoadInt64(&c.writeDeadline); deadline != 0 {
-		if time.Until(time.Unix(0, deadline)) <= 0 {
-			return 0, os.ErrDeadlineExceeded
-		}
-	}
-	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+	// Same deadline handling as SCTPWrite, and for the same reason: MSG_DONTWAIT
+	// means SO_SNDTIMEO does not apply, so the deadline is enforced here.
+	return c.sendmsg(b, cbuf)
 }
 
 // parseSndRcvInfo extracts the per-message information from a control message
