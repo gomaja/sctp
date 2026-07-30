@@ -19,6 +19,7 @@
 package sctp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -149,5 +150,13 @@ func DialSCTPExt(network string, laddr, raddr *SCTPAddr, options InitMsg) (*SCTP
 }
 
 func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network string, address string, c syscall.RawConn) error, handler NotificationHandler) (*SCTPConn, error) {
+	return nil, ErrUnsupported
+}
+
+func DialSCTPContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg) (*SCTPConn, error) {
+	return nil, ErrUnsupported
+}
+
+func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network string, address string, c syscall.RawConn) error, handler NotificationHandler) (*SCTPConn, error) {
 	return nil, ErrUnsupported
 }

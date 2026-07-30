@@ -17,6 +17,7 @@ package sctp
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -2712,4 +2713,10 @@ func (cfg *SocketConfig) Listen(net string, laddr *SCTPAddr) (*SCTPListener, err
 
 func (cfg *SocketConfig) Dial(net string, laddr, raddr *SCTPAddr) (*SCTPConn, error) {
 	return dialSCTPExtConfig(net, laddr, raddr, cfg.InitMsg, cfg.Control, cfg.NotificationHandler)
+}
+
+// DialContext is Dial with a context; see DialSCTPContext for what the context
+// bounds and why Dial cannot offer it.
+func (cfg *SocketConfig) DialContext(ctx context.Context, net string, laddr, raddr *SCTPAddr) (*SCTPConn, error) {
+	return dialSCTPExtConfigContext(ctx, net, laddr, raddr, cfg.InitMsg, cfg.Control, cfg.NotificationHandler)
 }

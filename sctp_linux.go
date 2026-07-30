@@ -19,6 +19,7 @@
 package sctp
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -1341,6 +1342,151 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 		return nil, err
 	}
 	return NewSCTPConn(sock, notificationHandler), nil
+}
+
+// dialSCTPExtConfigContext is dialSCTPExtConfig with the wait under this
+// function's control instead of the kernel's.
+//
+// The difference is SOCK_NONBLOCK. A blocking connect does not return until the
+// kernel either completes the handshake or exhausts its own retransmission
+// budget, so a caller that gives up at its own deadline can stop waiting but
+// cannot stop the attempt: the association stays in COOKIE-WAIT, the scheduled
+// INIT retransmission still goes out, and the descriptor is held until the
+// kernel abandons it. A dial abandoned after one second was measured still
+// emitting an INIT thirty seconds later.
+//
+// SCTP_INITMSG cannot express "send one INIT" either. MaxAttempts counts
+// retransmissions rather than attempts and zero selects the kernel default, so
+// the smallest usable value still puts a second INIT on the wire at
+// net.sctp.rto_initial; MaxInitTimeout caps each RTO without bounding the total.
+// So the bound has to come from here.
+func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network, address string, c syscall.RawConn) error, notificationHandler NotificationHandler) (*SCTPConn, error) {
+	// A context that is already done must not open a socket at all.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	af, ipv6only := favoriteAddrFamily(network, laddr, raddr, "dial")
+	sock, err := syscall.Socket(
+		af,
+		syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK,
+		syscall.IPPROTO_SCTP,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Abort rather than close on every failure path. Nothing is established, so
+	// there is no shutdown to negotiate, and an abort releases the association
+	// at once instead of leaving the kernel retransmitting an INIT on a socket
+	// the caller has already given up on. That is the whole point of this
+	// variant, so it is a defer rather than a branch: no early return may skip
+	// it.
+	established := false
+	defer func() {
+		if !established {
+			_ = abortSctpSocket(sock)
+		}
+	}()
+
+	if err = setDefaultSockopts(sock, af, ipv6only); err != nil {
+		return nil, err
+	}
+	if control != nil {
+		rc := rawConn{sockfd: sock}
+		var localAddressString string
+		if laddr != nil {
+			localAddressString = laddr.String()
+		}
+		if err = control(network, localAddressString, rc); err != nil {
+			return nil, err
+		}
+	}
+	if err = setInitOpts(sock, options); err != nil {
+		return nil, err
+	}
+	if laddr != nil {
+		if len(laddr.IPAddrs) == 0 {
+			switch af {
+			case syscall.AF_INET:
+				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
+			case syscall.AF_INET6:
+				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
+			}
+		}
+		if err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR); err != nil {
+			return nil, err
+		}
+	}
+
+	// On a non-blocking socket the handshake is started and EINPROGRESS comes
+	// straight back; EALREADY means one is already under way. Neither is a
+	// failure. The EALREADY settle the blocking path needs does not apply here,
+	// because the wait below confirms establishment in every case rather than
+	// trusting what connect returned.
+	if _, _, err = sctpConnect(sock, raddr); err != nil &&
+		!errors.Is(err, syscall.EINPROGRESS) && !errors.Is(err, syscall.EALREADY) {
+		return nil, err
+	}
+
+	if err = awaitEstablished(ctx, sock); err != nil {
+		return nil, err
+	}
+
+	// Back to blocking before the socket is handed over. SCTPRead, ReadMsg and
+	// the deadline handling all assume a blocking descriptor — SO_RCVTIMEO only
+	// bounds a call that waits — and on a non-blocking one an idle read returns
+	// EAGAIN, which this package maps onto os.ErrDeadlineExceeded and a caller
+	// reads as a timeout that never happened.
+	if err = syscall.SetNonblock(sock, false); err != nil {
+		return nil, err
+	}
+
+	established = true
+	return NewSCTPConn(sock, notificationHandler), nil
+}
+
+// awaitEstablished waits for the handshake to finish or for ctx to be done,
+// whichever comes first. It is waitEstablished with a context in place of a
+// fixed timeout, and polls at the same interval.
+func awaitEstablished(ctx context.Context, fd int) error {
+	const interval = 2 * time.Millisecond
+
+	tick := time.NewTicker(interval)
+	defer tick.Stop()
+
+	for {
+		// A refused or aborted association surfaces through SO_ERROR rather
+		// than through the connect, which returned before the peer answered.
+		if errno, err := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET,
+			syscall.SO_ERROR); err == nil && errno != 0 {
+			return syscall.Errno(errno)
+		}
+		// Checked before ctx so that a handshake which completed in the same
+		// instant the deadline expired is not thrown away.
+		if hasEstablishedAssoc(fd) {
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-tick.C:
+		}
+	}
+}
+
+// DialSCTPContext is DialSCTPExt with a context.
+//
+// The attempt is abandoned as soon as ctx is done: the association is aborted
+// and the socket released before this returns, so nothing further goes on the
+// wire and no descriptor is left behind. A caller expresses a bounded attempt
+// with context.WithTimeout and retries on its own schedule.
+//
+// DialSCTP, DialSCTPExt and SocketConfig.Dial are unchanged and still block for
+// as long as the kernel's own retransmission budget.
+func DialSCTPContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg) (*SCTPConn, error) {
+	return dialSCTPExtConfigContext(ctx, network, laddr, raddr, options, nil, nil)
 }
 
 // readSomaxconn reports the kernel's net.core.somaxconn, which bounds the

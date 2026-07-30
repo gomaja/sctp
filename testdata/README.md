@@ -1479,3 +1479,60 @@ signal. And the healthy-close mutation was caught by
 aimed at it: `completed := false` takes the ABORT path, which is fast, so
 promptness could never have detected it. 9 of 9 mutations are caught now, but
 only after both were re-pointed.
+
+## Cancelling a dial
+
+Second request from the same library user, and a fair one: there was no way to
+abandon an in-flight connect. `dialSCTPExtConfig` creates its socket blocking, so
+`sctpConnect` does not return until the kernel either completes the handshake or
+exhausts its own retransmission budget. A caller with its own deadline could stop
+*waiting*; it could not stop the *attempt*.
+
+The distinction is visible on the wire and nowhere else. Two containers, the
+receiver dropping all SCTP on its INPUT chain, the sender capturing, caller
+giving up after 2s:
+
+| | `DialSCTPExt` | `DialSCTPContext` |
+|---|---|---|
+| chunks out | INIT 0.00s, **INIT 3.04s, INIT 9.25s** | INIT 0.00s, **ABORT 2.00s** |
+| after the caller gave up | still retransmitting | nothing |
+| associations left | **1**, still 1 twelve seconds later | **0** |
+
+So an application that abandoned a dial after two seconds was still emitting an
+INIT seven seconds later, from a socket it believed it had finished with. For
+anything reconnecting in a loop that makes the retry cadence unpredictable and
+leaves a descriptor per abandoned attempt.
+
+`SCTP_INITMSG` cannot fix it from the outside, which is worth recording because
+it is the obvious thing to try. `MaxAttempts` counts retransmissions rather than
+attempts and zero selects the kernel default, so the smallest usable value still
+puts a second INIT on the wire at `net.sctp.rto_initial`; `MaxInitTimeout` caps
+each RTO without bounding the total. The bound has to come from the dial itself.
+
+`DialSCTPContext` and `SocketConfig.DialContext` create the socket with
+`SOCK_NONBLOCK`, which puts the wait under this package's control rather than the
+kernel's, then abort on every path that does not establish. `DialSCTP`,
+`DialSCTPExt` and `SocketConfig.Dial` are untouched.
+
+Two details that are easy to get wrong, both now pinned by tests. The descriptor
+has to go back to blocking before it is handed over — `SCTPRead` and the deadline
+handling assume it, and on a non-blocking one an idle read returns EAGAIN, which
+this package maps onto `os.ErrDeadlineExceeded`, so the caller sees a deadline
+expire that never did. And a refusal cannot arrive through the connect, which has
+already returned; it comes back through `SO_ERROR`, and without that check a dial
+to a closed port sits out its whole context and reports a timeout instead of the
+refusal.
+
+The mutation that mattered most was the one the tests initially missed. Removing
+the already-cancelled check at the top left `TestDialContextAlreadyCancelledOpensNoSocket`
+green, because without it the socket is opened *and* released by the same call —
+a descriptor count taken afterwards is back where it started. The witness had to
+be the `Control` hook, which runs between the socket being created and the
+connect: if it ran at all, a socket was created for a context that was already
+done. 8 of 8 mutations are caught with that change.
+
+The capture needed care in the way the report warned. An `iptables -j DROP` on
+the *sender's* OUTPUT chain discards the packet before the capture point, so
+tshark records nothing and the harness reads as a clean pass for correct and
+broken code alike. The drop belongs on the receiver's INPUT, which is why this
+needs two containers rather than loopback.
