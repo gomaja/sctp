@@ -28,17 +28,54 @@ import (
 	"testing"
 )
 
+// loopbackAddr returns a loopback address with no port, so the kernel assigns
+// one.
+//
+// These tests used to bind port 54321. That is inside the kernel's ephemeral
+// range — 32768 to 60999 on a stock configuration — so any of the many `:0` binds
+// elsewhere in the suite could be handed it first, and then these tests failed
+// with "address already in use". It reproduced deterministically once something
+// else held the port:
+//
+//	--- FAIL: TestNotificationHandlerAssignmentOnDialing
+//	    sctp_linux_test.go:39: address already in use
+//
+// Letting the kernel choose removes the collision rather than making it rarer.
+// Where a test needs to connect back, it must use the listener's reported address
+// rather than the one passed to ListenSCTP, since that one has no port yet.
+func loopbackAddr() *SCTPAddr {
+	return &SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}}
+}
+
+// listenerAddr extracts the address a listener actually bound, which is the only
+// way to reach a kernel-assigned port.
+//
+// The zero-port check cannot be reached while ListenSCTP works, so no test covers
+// it and removing it keeps the suite green. It is kept because both callers feed
+// the result straight into a dial: a zero port there fails as a connection error
+// somewhere else, and this turns that into a statement of what actually went
+// wrong.
+func listenerAddr(t *testing.T, ln *SCTPListener) *SCTPAddr {
+	t.Helper()
+	la, ok := ln.Addr().(*SCTPAddr)
+	if !ok || la.Port == 0 {
+		t.Fatalf("listener address = %v; want a bound address with a non-zero port",
+			la)
+	}
+	return la
+}
+
 func TestNotificationHandlerAssignmentOnDialing(t *testing.T) {
 	network := "sctp"
-	addr := &SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, Port: 54321}
 	testErr := errors.New("test error")
 	notificationHandler := func([]byte) error { return testErr }
 
-	listener, err := ListenSCTP(network, addr)
+	listener, err := ListenSCTP(network, loopbackAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := dialSCTPExtConfig(network, nil, addr, InitMsg{}, nil, notificationHandler)
+	conn, err := dialSCTPExtConfig(network, nil, listenerAddr(t, listener),
+		InitMsg{}, nil, notificationHandler)
 	if err != nil {
 		t.Fatalf("failed to establish connection due to: %v", err)
 	}
@@ -51,11 +88,11 @@ func TestNotificationHandlerAssignmentOnDialing(t *testing.T) {
 
 func TestNotificationHandlerAssignmentOnListening(t *testing.T) {
 	network := "sctp"
-	addr := &SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, Port: 54321}
 	testErr := errors.New("test error")
 	notificationHandler := func([]byte) error { return testErr }
 
-	listener, err := listenSCTPExtConfig(network, addr, InitMsg{}, nil, notificationHandler)
+	listener, err := listenSCTPExtConfig(network, loopbackAddr(), InitMsg{}, nil,
+		notificationHandler)
 	if err != nil {
 		t.Fatalf("failed to start listening due to: %v", err)
 	}
@@ -105,8 +142,7 @@ func validationControlFunc(t *testing.T, network string) func(networkFunc, addre
 
 func TestSyscallConn(t *testing.T) {
 	network := "sctp"
-	addr := &SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, Port: 54321}
-	listener, err := ListenSCTP(network, addr)
+	listener, err := ListenSCTP(network, loopbackAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +154,7 @@ func TestSyscallConn(t *testing.T) {
 	if raw == nil {
 		t.Fatalf("Expected non-nil RawConn, got nil")
 	}
-	conn, err := DialSCTP(network, nil, addr)
+	conn, err := DialSCTP(network, nil, listenerAddr(t, listener))
 	if err != nil {
 		t.Fatalf("Failed to create SCTP connection: %v", err)
 	}
@@ -156,13 +192,14 @@ func TestSyscallConn(t *testing.T) {
 }
 
 func TestSCTPListenerNameFromFd(t *testing.T) {
-	addr := &SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.IPv4(127, 0, 0, 1)}}, Port: 54321}
-	ln, err := ListenSCTP("sctp", addr)
+	ln, err := ListenSCTP("sctp", loopbackAddr())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = ln.Close() }()
 
+	// This assertion is why the test asks for port 0 rather than a fixed one and
+	// still means something: the kernel has to report back a real port.
 	la, ok := ln.Addr().(*SCTPAddr)
 	if !ok || la.Port == 0 {
 		t.Fatalf("got %v; expected a proper address with non-zero port number", la)
