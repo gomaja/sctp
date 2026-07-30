@@ -19,6 +19,7 @@
 package sctp
 
 import (
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -353,6 +354,20 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 
 		n, oobn, recvflags, _, err := syscall.Recvmsg(c.fd(), b, oob, 0)
 		if err != nil {
+			// A signal delivered while recvmsg was blocked interrupts it. The
+			// Go runtime signals its own threads to preempt goroutines, so
+			// this happens on a healthy association purely as a function of
+			// how busy the process is: it was first seen as a handful of
+			// failed reads per run with a thousand simultaneous peers, and
+			// never with a hundred.
+			//
+			// POSIX leaves the retry to the caller, so reporting EINTR here
+			// would make a server drop messages under load. Retrying re-enters
+			// the loop, which reprograms the timeout from the absolute
+			// deadline, so an interrupted read cannot extend its own budget.
+			if errors.Is(err, syscall.EINTR) {
+				continue
+			}
 			return n, nil, recvflags, toDeadlineErr(err)
 		}
 
@@ -500,8 +515,25 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		&tv); err != nil {
 		return abortSctpSocket(fd)
 	}
+	// This read is what distinguishes a completed shutdown from a peer that
+	// never answered, so an interrupted call must be retried rather than
+	// mistaken for the latter. Left unretried, a signal arriving here turns a
+	// graceful close into an ABORT via the linger=0 path below, and the peer
+	// sees ECONNRESET instead of the end of the stream — with no error
+	// reported on either side.
+	//
+	// SO_RCVTIMEO is already programmed above and is not restarted by the
+	// retry, so this cannot loop past the caller's timeout: once it expires
+	// the read returns EAGAIN and the association is treated as unfinished.
 	var buf [1]byte
-	n, rerr := syscall.Read(fd, buf[:])
+	var n int
+	var rerr error
+	for {
+		n, rerr = syscall.Read(fd, buf[:])
+		if !errors.Is(rerr, syscall.EINTR) {
+			break
+		}
+	}
 	completed := n == 0 && rerr == nil
 
 	if completed {
@@ -683,11 +715,27 @@ func (ln *SCTPListener) AcceptSCTP() (*SCTPConn, error) {
 	if lnfd < 0 {
 		return nil, syscall.EBADF
 	}
-	fd, _, err := syscall.Accept4(lnfd, 0)
-	if err != nil {
-		return nil, err
+	for {
+		fd, _, err := syscall.Accept4(lnfd, 0)
+		if err != nil {
+			// As in SCTPReadFlags: a signal arriving while accept4 is blocked
+			// interrupts it, and a server spends most of its life blocked
+			// here. Reporting EINTR would look like an accept failure and a
+			// caller that treats one as fatal would stop serving entirely.
+			//
+			// The listener descriptor is re-read each iteration so that a
+			// concurrent Close, which swaps it to -1, ends the loop with EBADF
+			// rather than retrying forever against a closed socket.
+			if errors.Is(err, syscall.EINTR) {
+				if lnfd = ln.fd(); lnfd < 0 {
+					return nil, syscall.EBADF
+				}
+				continue
+			}
+			return nil, err
+		}
+		return NewSCTPConn(fd, ln.notificationHandler), nil
 	}
-	return NewSCTPConn(fd, ln.notificationHandler), nil
 }
 
 // Accept waits for and returns the next connection connection to the listener.
@@ -781,8 +829,23 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 			return nil, err
 		}
 	}
-	_, err = SCTPConnect(sock, raddr)
+	var viaEALREADY bool
+	_, viaEALREADY, err = sctpConnect(sock, raddr)
 	if err != nil {
+		return nil, err
+	}
+	// A connect that completed normally needs nothing further: the kernel
+	// waited for the handshake before returning, so the association is there.
+	//
+	// EALREADY is the exception. It is an early return that skips the kernel's
+	// own wait, so it says the endpoint holds the association but not that the
+	// handshake finished — and measured under signal load, one such dial in two
+	// never established. This function owns the socket and returns a *SCTPConn,
+	// so handing back one with nothing behind it would surface as a dial that
+	// reported success and a first write that failed with EPIPE. Only this
+	// branch is confirmed, and only it can pay the wait.
+	if viaEALREADY && !waitEstablished(sock, connectSettleTimeout) {
+		err = syscall.ETIMEDOUT
 		return nil, err
 	}
 	return NewSCTPConn(sock, notificationHandler), nil
