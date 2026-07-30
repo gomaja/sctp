@@ -896,3 +896,186 @@ crossing the fragmentation point. Pooling the `oob` buffer is now *possible*
 — the aliasing that blocked it is fixed — but has not been done or measured. The
 benchmarks here are single-association loopback on one host and one kernel; they
 compare revisions of this package rather than characterising the stack.
+
+## One listener, many peers
+
+The suite could not previously show that a server *serves* several peers.
+`TestSCTPConcurrentAccept` dials a hundred times, but closes each connection the
+instant it is accepted and never sends a byte, so it proves accept does not
+crash under concurrency and nothing else. Data isolation between peers,
+per-connection state, and notification attribution were all unexercised.
+
+`sctp_multiclient_test.go` covers them, holding every association open for the
+duration and asserting what each peer actually receives:
+
+| Test | What would fail it |
+|---|---|
+| `TestManyClientsConcurrentEcho` | one peer's bytes reaching another (24 peers × 20 messages, each payload unique) |
+| `TestManyClientsHeldOpenSimultaneously` | a server that serialises peers instead of holding 16 associations at once |
+| `TestManyClientsDistinctAssociationIDs` | two peers reported under one association id |
+| `TestManyClientsPerConnectionDeadlineIsolation` | one peer's expired deadline expiring another peer's read |
+| `TestManyClientsStreamsStayPerAssociation` | a crossed stream across 8 peers × 4 streams |
+| `TestManyClientsCloseDoesNotDisturbPeers` | a close releasing a descriptor another peer is using |
+| `TestManyClientsNotificationsCarryAssociationID` | notifications a shared handler cannot attribute to a peer |
+
+**The shared `NotificationHandler` is the one real sharp edge in the API.** One
+func is handed to the listener and inherited by every connection accepted from
+it, and it is called with the raw bytes only — no `*SCTPConn`, no association
+handle — so a server receives every peer's notifications through one callback.
+The signature cannot change without breaking callers. What makes it workable is
+that the notification body carries the association id, and the test asserts that
+rather than assuming it: six aborting peers must produce six *distinct* ids.
+
+The ordering it depends on was established by probing the kernel, not guessed.
+The server has to consume the data message **before** the peer aborts and then
+read again; that second read is what dequeues `SCTP_COMM_LOST`. Aborting while
+the server has not yet read leaves the notification unobserved and the handler
+never fires — the first version of the test skipped for exactly that reason.
+
+### Verified on the wire
+
+In-process assertions only prove the struct was populated. A local tshark
+harness (six peers, four streams each, PPID encoding the sender) confirms the
+separation on the wire:
+
+```
+INIT count: 6   INIT_ACK count: 6   distinct initiate tags: 6
+DATA chunks per PPID:   8 each for 1000..1005
+DATA chunks per stream: 12 each for streams 0..3
+payloads: 24 distinct, each appearing exactly 2x (request + echo)
+```
+
+Six initiate tags is six genuinely separate associations rather than one
+multiplexed. Every payload appearing exactly twice is what rules out a peer's
+bytes being dropped, duplicated, or delivered to the wrong association — a count
+alone would not. The harness asserts the negative too: corrupting one byte of
+the echo makes it exit non-zero, so it detects the defect rather than always
+reporting success.
+
+Like the other tshark harnesses here it is **local only and not committed**. It
+is a Go program that dials N peers on M streams each, encoding the sender in the
+PPID and the peer and stream in the payload, plus a script that captures
+loopback SCTP around it and checks the capture:
+
+```sh
+# in a scratch directory outside the repo
+docker run --rm --privileged -v "$PWD":/src -v /path/to/harness:/wire \
+    -w /src sctp-test bash /wire/tshark-multiclient.sh
+```
+
+The checks that matter are `sctp.chunk_type == 1` for the INIT count and
+`sctp.init_initiate_tag | sort -u` for distinct associations, then `data.data`
+decoded from hex and counted per payload. `data.data` is the field that carries
+the DATA chunk payload; `sctp.chunk_payload` and `sctp.payload` are not fields
+in tshark 4.0 and silently yield nothing, which reads as a clean zero.
+
+### Scale
+
+1000 simultaneous peers, five messages each, repeated eight times: 8000 sessions,
+zero errors, zero mismatches. Beyond that the *harness* runs out of memory on a
+7.6 GiB Docker VM (exit 137, OOM) — a limit of the test host, not of the package.
+
+## `EINTR`: no blocking syscall was retried
+
+The scale probe is what turned this up. At 1000 peers a handful of reads failed
+per run with `interrupted system call`, on associations that were otherwise
+healthy; at 150 peers it never happened. Nothing in the package handled `EINTR`
+anywhere.
+
+A Go program receives signals it never asked for: the runtime uses `SIGURG` to
+preempt goroutines, and preemption becomes frequent exactly when many goroutines
+are runnable — which is what a busy server looks like. Three call sites were
+exposed, and they fail in increasing order of nastiness:
+
+| Call site | Consequence of the unretried `EINTR` |
+|---|---|
+| `recvmsg` in `SCTPReadFlags` | a healthy read reported as failed; measured at 0.1–0.3% of reads under load |
+| `accept4` in `AcceptSCTP` | a spurious accept failure; a caller treating it as fatal stops serving |
+| `read` in `closeSctpSocket` | **a graceful close turned into an ABORT** |
+
+The third is the one that corrupts a protocol outcome rather than returning an
+error. That read is what distinguishes "the peer's shutdown completed" from "the
+peer never answered": `EINTR` returns `(-1, EINTR)`, which is not the completed
+case, so the code fell through to the `linger=0` path and emitted an ABORT on an
+association that had shut down cleanly. The peer sees `ECONNRESET` instead of the
+end of the stream, and **no error is reported on either side** — the close
+"succeeds".
+
+All three now retry. The read retry re-enters the existing loop, which reprograms
+`SO_RCVTIMEO` from the absolute deadline, so an interrupted read cannot extend its
+own budget; the accept retry re-reads the listener descriptor so a concurrent
+`Close` ends it with `EBADF` rather than spinning on a closed socket.
+
+`sctp_eintr_test.go` drives real signals at a thread blocked in each call.
+Against the unfixed code `TestReadSurvivesSignals` fails on the first read with
+`EINTR`, and the 1000-peer probe produced nine failures across eight runs; after
+the fix, 8000 sessions produced none.
+
+### The connect path returned sockets with no association
+
+Chasing an `EPIPE` that survived the `EINTR` fix led to a second, worse defect —
+found only because the failure was pursued instead of dismissed as flakiness.
+
+`SCTPConnect` treated `EALREADY` on a blocking socket as success, on the
+reasoning recorded above: `EISCONN` and `EALREADY` are one kernel branch, so the
+endpoint holds the association and a blocking socket has already waited for the
+handshake. The first half is right. The second is not — the `EALREADY` branch is
+an **early return that skips `sctp_wait_for_connect`**, so when the connect is
+interrupted the handshake may never finish. Measured under signal load:
+
+```
+EALREADY seen=2 -> established_later=1 DEAD_FOREVER=1
+```
+
+One of two never established. `DialSCTP` then returned a `*SCTPConn` with no
+association behind it: `GetStatus` failed with `EINVAL`, and the caller's *first
+write* failed with `EPIPE` — having been told the dial succeeded. Silently
+handing back a dead connection is worse than a failed dial.
+
+**Where the fix goes matters, and the first attempt put it in the wrong place.**
+Verifying inside `SCTPConnect` also changed the exported behaviour that
+`TestSCTPConnectEALREADYOnBlockingSocketMidHandshake` pins, because
+`SCTP_STATUS` reports `EINVAL` identically for "still handshaking" and "no
+association" — it cannot tell them apart. Worse, verifying on *every* dial put a
+timeout on handshakes the kernel would have completed: three previously-passing
+tests started failing with `ETIMEDOUT` under suite load.
+
+So the confirmation lives in the dial path, and only on the branch that needs it.
+`sctpConnect` reports whether it returned through `EALREADY`; only then does
+`dialSCTPExtConfig` wait for the association. A normal connect costs nothing
+extra, a raw-fd caller driving `SCTPConnect` keeps the old semantics, and the
+blackholed mid-handshake test passes unchanged.
+
+`TestDialNeverReturnsAnUnestablishedAssociation` dials 2000 times under signals
+and requires every dial that reports success to carry a real association. The
+detection rate is honest rather than absolute: against the unfixed code it fires
+4 runs in 5 at 2000 dials, and only 1 in 8 at 200 — racing the kernel's connect
+path is inherently probabilistic. The fixed code passed 5 of 5.
+
+### What the harness now enables
+
+`run-tests.sh` turns on `net.sctp.auth_enable` and adds `127.0.0.2` to loopback.
+Both were previously missing, and nine tests skipped as a result — the whole AUTH
+group, the `SCTP_AUTHINFO` send path, the cmsg padding test (a 2-byte `AuthInfo`
+is the only cmsg whose padding bytes are non-zero, so nothing else can prove the
+padding is written correctly), and the multi-address decoding test. A skip reads
+as a clean run while leaving those paths entirely unexercised.
+
+One skip remains and is correct: Linux rejects a zero-length SCTP write with
+`EINVAL`, so `TestReadMsgZeroLengthMessage` documents unreachable behaviour
+rather than hiding a gap.
+
+### Suite state
+
+188 pass, 0 fail, 3 skip under `-race`, and six consecutive clean runs of the
+full suite.
+
+The measurement needs a caveat, because the first attempt at it produced 5 of 8
+and would have been wrong to report as flakiness: the failing runs were sharing
+an 8-core, 7.6 GiB Docker VM with a 1000-peer scale probe running concurrently.
+Re-run with nothing else competing, the same suite passed 6 of 6. **Timing tests
+against a real kernel need an otherwise idle host**; a failure measured under
+contention says nothing about the code.
+
+The two skipped AUTH-off tests are the deliberate inverses of the AUTH-on ones
+and skip precisely because the harness now enables the sysctl.
