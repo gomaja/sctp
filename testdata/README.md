@@ -486,3 +486,28 @@ theories here died that way, and two candidate fixes measured no better than
 baseline. Filter captures to the port that matters. When a symptom moves
 between tests depending on timing, suspect a shared resource being released by
 something other than its owner, and trace the resource rather than the test.
+
+### Residual rate, measured against a baseline
+
+`TestStreams` still fails occasionally as part of the full suite, and the rate is
+low enough that small samples mislead. A twenty-run batch showed 19/20 on a
+working tree against 20/20 on a clean baseline, which invites the conclusion that
+the working tree caused it. Sixty runs of each, in parallel, say otherwise:
+
+```
+working tree  60 pass  0 fail
+baseline      58 pass  2 fail   (TestStreams once,
+                                 TestNotificationHandlerAssignmentOnDialing once)
+```
+
+So the residual is pre-existing, and at this rate twenty runs cannot separate one
+tree from another — the earlier 19/20-versus-20/20 reading was sampling noise
+pointing the wrong way. `TestStreams` alone passes 30/30, so it needs the rest of
+the suite's concurrency to fail at all.
+
+The rule this reinforces: never call a flake pre-existing or introduced without a
+baseline measured at a sample size that could distinguish them. A single batch
+that happens to favour one side is not evidence.
+
+`TestNotificationHandlerAssignmentOnDialing` appearing here is new and has not
+been investigated; it is recorded rather than left in a terminal scrollback.
