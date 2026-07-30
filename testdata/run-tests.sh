@@ -10,6 +10,24 @@ if [ ! -e /proc/net/sctp/snmp ]; then
 fi
 echo "SCTP stack present."
 
+# Blackhole SCTP to TEST-NET-1 so an INIT sent there goes unanswered rather than
+# drawing an ICMP unreachable from the gateway. Without this the connect fails
+# immediately with ECONNREFUSED, no association is left in COOKIE_WAIT, and
+# TestSCTPConnectEALREADYOnBlockingSocketMidHandshake skips — which would hide
+# whether the EALREADY handling in SCTPConnect works at all.
+if command -v iptables >/dev/null 2>&1; then
+    if iptables -C OUTPUT -d 192.0.2.1 -j DROP 2>/dev/null; then
+        echo "TEST-NET-1 already blackholed."
+    elif iptables -A OUTPUT -d 192.0.2.1 -j DROP 2>/dev/null; then
+        echo "Blackholed TEST-NET-1 for the EALREADY tests."
+    else
+        echo "Could not add the iptables DROP rule; the blocking EALREADY test" \
+             "will skip. The container needs --privileged." >&2
+    fi
+else
+    echo "iptables not installed; the blocking EALREADY test will skip." >&2
+fi
+
 go build ./...
 go vet ./... 2>&1 | grep -v 'non-test goroutine' || true
 

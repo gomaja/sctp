@@ -193,8 +193,9 @@ struct. The short option length is safe, which was measured rather than assumed:
 bytes and leaves the caller's remaining buffer untouched.
 
 **`EALREADY`/`EISCONN` are not in either RFC.** Zero occurrences across RFC 9260
-and RFC 6458 — they are Linux behaviour, so the residual `SCTPConnect`
-`EALREADY` gap needs the kernel source, not the specification.
+and RFC 6458 — they are Linux behaviour, so the `SCTPConnect` `EALREADY` gap
+needed the kernel source rather than the specification. It is now closed; see
+below.
 
 **Three kernel behaviours differ from what RFC 6458 describes**, each measured
 with a C probe before the option was bound:
@@ -675,5 +676,92 @@ The rule this reinforces: never call a flake pre-existing or introduced without 
 baseline measured at a sample size that could distinguish them. A single batch
 that happens to favour one side is not evidence.
 
-`TestNotificationHandlerAssignmentOnDialing` appearing here is new and has not
-been investigated; it is recorded rather than left in a terminal scrollback.
+### `TestNotificationHandlerAssignmentOnDialing`: a fixed port inside the ephemeral range
+
+Four tests in `sctp_linux_test.go` bound port **54321**. The kernel's ephemeral
+range here is:
+
+```
+$ cat /proc/sys/net/ipv4/ip_local_port_range
+32768	60999
+```
+
+54321 is inside it. Every `:0` bind elsewhere in the suite — and there are dozens
+— could be handed that port first, after which all four tests failed with
+`address already in use`. That is why it only ever failed as part of the full
+suite: in isolation the group passed 60/60.
+
+Holding the port from a separate process reproduces it every time:
+
+```
+=== with 54321 already held ===
+--- FAIL: TestNotificationHandlerAssignmentOnDialing
+    sctp_linux_test.go:39: address already in use
+```
+
+Fixed by letting the kernel assign the port and reading it back from
+`ln.Addr()`. Verified against the same reproduction, and by mutation: restoring
+the fixed port, or dialing the unbound address instead of the listener's, both
+fail.
+
+The general shape is the one `TestGetStatus` hit earlier — a hardcoded port is a
+collision waiting for a busy enough suite. There is no port outside the ephemeral
+range that is safe either, since the range is configurable; asking for 0 is the
+only correct answer.
+
+### `SCTPConnect` and `EALREADY`: settled from the kernel source
+
+This was the long-standing residual, about two failures in ninety-five suite
+runs. It resisted 1024 concurrent Go dials, a C `sctp_connectx` loop, and forty
+instrumented runs, and the errno appears nowhere in RFC 9260 or RFC 6458 — so
+neither measurement nor the specification could settle it.
+
+`net/sctp/socket.c` did. `__sctp_connect` and `sctp_connect_add_peer` both have:
+
+```c
+asoc = sctp_endpoint_lookup_assoc(ep, daddr, &transport);
+if (asoc)
+        return asoc->state >= SCTP_STATE_ESTABLISHED ? -EISCONN
+                                                     : -EALREADY;
+```
+
+**`EISCONN` and `EALREADY` are one branch at two association states.** Both mean
+the endpoint already holds the association the caller asked for; `EISCONN` says
+the handshake finished, `EALREADY` says it is still in `CLOSED`, `COOKIE_WAIT` or
+`COOKIE_ECHOED`. The early return also skips the `sctp_wait_for_connect` that ends
+the function on the normal path.
+
+So on a **blocking** socket — which is what this package's dial path creates —
+`EALREADY` is a transient race and the association goes on to establish;
+reporting failure discards a working connection, exactly as the earlier `EISCONN`
+fix established. On a **non-blocking** socket the kernel has not waited, so
+`EALREADY` genuinely means not yet connected and must keep reaching the caller.
+`SCTPConnect` now makes that distinction on `O_NONBLOCK`, failing safe to "error"
+for a descriptor it cannot query.
+
+Reproducing it needs a peer that neither answers nor refuses. TEST-NET-1
+(192.0.2.1, RFC 5737) is routed in the test container, so the gateway returns an
+ICMP unreachable and the connect fails immediately with `ECONNREFUSED`. Dropping
+the packet instead is what holds the association in `COOKIE_WAIT`:
+
+```sh
+iptables -A OUTPUT -d 192.0.2.1 -j DROP
+```
+
+With that in place, a blocking socket reproduces it on demand — one thread blocked
+in `connectx`, another finding the association it created:
+
+```
+blocking socket, two threads:
+  thread B attempt 0 -> Operation already in progress   <-- EALREADY on a BLOCKING socket
+  thread B attempt 1 -> Operation already in progress
+  thread B attempt 2 -> Operation already in progress
+```
+
+`run-tests.sh` installs the rule, so the test runs rather than skips.
+
+**The first version of the blocking test was worthless and mutation caught it.**
+On loopback the handshake completes inside the first call, so the second connect
+finds an `ESTABLISHED` association and gets `EISCONN` — never `EALREADY`.
+Reverting the entire fix still passed it. Only the two-goroutine blackholed
+version reaches the branch, and it kills that mutation.
