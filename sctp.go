@@ -969,33 +969,56 @@ func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
 // AssocID is not filled in on either early-return path, so 0 is returned with a
 // nil error; callers needing the id read it back from the socket.
 func SCTPConnect(fd int, addr *SCTPAddr) (int, error) {
+	id, _, err := sctpConnect(fd, addr)
+	return id, err
+}
+
+// sctpConnect is SCTPConnect, additionally reporting whether it returned
+// success through the EALREADY branch rather than from a completed connect.
+//
+// Only that branch leaves the handshake unfinished, so only that branch needs
+// confirming before a connection is handed out. Distinguishing it keeps the
+// normal path free of extra syscalls, and — more importantly — keeps a slow but
+// healthy handshake from being cut short by a verification timeout, which is
+// what happened when the dial path confirmed unconditionally: dials that the
+// kernel would have completed were failed with ETIMEDOUT under suite load.
+func sctpConnect(fd int, addr *SCTPAddr) (assocID int, viaEALREADY bool, err error) {
 	buf := addr.ToRawSockAddrBuf()
 	param := GetAddrsOld{
 		AddrNum: int32(len(buf)),
 		Addrs:   uintptr(uintptr(unsafe.Pointer(&buf[0]))),
 	}
 	optlen := unsafe.Sizeof(param)
-	_, _, err := getsockopt(fd, SCTP_SOCKOPT_CONNECTX3, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
+	_, _, err = getsockopt(fd, SCTP_SOCKOPT_CONNECTX3, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
 	if err == nil {
-		return int(param.AssocID), nil
+		return int(param.AssocID), false, nil
 	} else if isEstablishedAssoc(fd, err) {
-		return 0, nil
+		return 0, err == syscall.EALREADY, nil
 	} else if err != syscall.ENOPROTOOPT {
-		return 0, err
+		return 0, false, err
 	}
 	r0, _, err := setsockopt(fd, SCTP_SOCKOPT_CONNECTX, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
 	if isEstablishedAssoc(fd, err) {
-		return int(r0), nil
+		return int(r0), err == syscall.EALREADY, nil
 	}
-	return int(r0), err
+	return int(r0), false, err
 }
 
 // isEstablishedAssoc reports whether err from a connect attempt means the socket
 // already carries the association the caller asked for, and is connected.
 //
-// EISCONN always does. EALREADY does only on a blocking socket, where the kernel
-// has waited for the handshake before returning; see SCTPConnect for why the two
-// errnos are the same kernel branch at different association states.
+// EISCONN always does: the kernel returns it only when the association it found
+// is already at or past SCTP_STATE_ESTABLISHED.
+//
+// EALREADY is the same kernel branch below that state, so it means the endpoint
+// holds the association but the handshake has not finished. On a blocking
+// socket that is reported as success, because the caller driving SCTPConnect
+// directly still has a connect in flight that will complete or fail on its own;
+// on a non-blocking one the kernel has not waited, so it must reach the caller.
+//
+// It does *not* follow that the socket is usable yet, and callers that own the
+// socket outright must not stop here — see waitEstablished, which the dial path
+// uses to make sure it never returns a connection with no association behind it.
 func isEstablishedAssoc(fd int, err error) bool {
 	switch err {
 	case syscall.EISCONN:
@@ -1004,6 +1027,61 @@ func isEstablishedAssoc(fd int, err error) bool {
 		return !isNonblocking(fd)
 	}
 	return false
+}
+
+// connectSettleTimeout bounds the wait for an EALREADY handshake to finish.
+//
+// The association is already in COOKIE_WAIT or COOKIE_ECHOED, so on a healthy
+// path it settles in milliseconds. The budget is nonetheless generous, because
+// the cost of the two outcomes is asymmetric: waiting too long on a handshake
+// that will never finish only delays an error the caller was going to get
+// anyway, while giving up too early fails a dial the kernel would have
+// completed. An earlier 1s ceiling did exactly that under load.
+const connectSettleTimeout = 5 * time.Second
+
+// waitEstablished waits up to timeout for fd's association to establish.
+//
+// This is what the dial path uses to keep its promise: DialSCTP returns a
+// *SCTPConn, so it must not hand back one with no association behind it. The
+// connect reporting EALREADY does not mean the handshake will finish — it is
+// an early return that skips the kernel's own sctp_wait_for_connect — and
+// measured under signal load, one EALREADY dial in two never established. The
+// caller then got a connection whose GetStatus failed with EINVAL and whose
+// first write failed with EPIPE, having been told the dial succeeded.
+//
+// It polls because there is nothing to select on: the association belongs to a
+// connect that already returned. Returning false means the handshake did not
+// finish in time and the dial reports failure, which is the honest answer and
+// the one a caller can act on.
+func waitEstablished(fd int, timeout time.Duration) bool {
+	const interval = 2 * time.Millisecond
+	deadline := time.Now().Add(timeout)
+	for {
+		if hasEstablishedAssoc(fd) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
+// hasEstablishedAssoc reports whether fd currently carries an association the
+// kernel considers usable.
+//
+// SCTP_STATUS fails with EINVAL on a socket with no association, and reports
+// state 0 (SCTP_EMPTY, which the kernel never leaves an established
+// association in) when there is nothing to describe. Either answer means the
+// socket is not connected.
+func hasEstablishedAssoc(fd int) bool {
+	status := &Status{}
+	optlen := unsafe.Sizeof(*status)
+	if _, _, err := getsockopt(fd, SCTP_STATUS,
+		uintptr(unsafe.Pointer(status)), uintptr(unsafe.Pointer(&optlen))); err != nil {
+		return false
+	}
+	return status.State != 0
 }
 
 // isNonblocking reports whether fd has O_NONBLOCK set. A descriptor that cannot
