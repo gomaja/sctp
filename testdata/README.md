@@ -891,14 +891,14 @@ the code around a performance question, not by looking for bugs.
 
 ### Not measured
 
-Large messages crossing the fragmentation point. Pooling the `oob` buffer is now
-*possible* — the aliasing that blocked it is fixed — but has not been done or
-measured. The benchmarks here are loopback on one host and one kernel; they
-compare revisions of this package rather than characterising the stack.
+Pooling the `oob` buffer is now *possible* — the aliasing that blocked it is
+fixed — but has not been done or measured. The benchmarks here are loopback on
+one host and one kernel; they compare revisions of this package rather than
+characterising the stack.
 
-Throughput under concurrency and multi-homed paths were on this list and are no
-longer: see *Throughput under concurrency* and *Multi-homing* below. Path
-failover remains uncovered, and is noted there with the reason.
+Throughput under concurrency, multi-homed paths, path failover and large
+messages crossing the fragmentation point were all on this list and are no
+longer; each is covered below.
 
 ## One listener, many peers
 
@@ -1061,9 +1061,51 @@ Both sets are on the wire, each advertised by the side that bound it.
 
 `run-tests.sh` adds 127.0.0.2 through 127.0.0.4. The tests skip rather than pass
 vacuously below three usable addresses, since a single-address host exercises
-none of this. **Not covered:** failover between paths. That needs a path to be
-taken down mid-association, which loopback aliases cannot simulate — the kernel
-never marks a loopback path unreachable.
+none of this.
+
+### Path failover
+
+The Go tests prove the addresses are negotiated. They cannot prove failover,
+because a loopback path cannot be taken down: traffic between two of a host's
+own addresses is routed through `lo`, so an iptables DROP on one of them is not
+a path failure and the kernel never marks the path unreachable.
+
+Real failover needs two hosts on two networks with a firewall between them, so
+it runs outside the container the rest of the suite uses. `failover.sh` builds
+two containers, attaches each to two docker networks — giving every end a real
+`eth0` and `eth1` on different subnets — establishes an association across both,
+and cuts one path underneath it:
+
+```sh
+bash testdata/failover.sh
+```
+
+```
+=== Multi-homed: two paths, primary cut ===
+PEER-PATHS=[{172.30.0.10 } {172.31.0.10 }]
+RESULT sent=115 ok=115 failed=0
+packets dropped by the cut: 10
+PASS: every round trip succeeded across the cut.
+
+=== Single-homed control: one path, cut ===
+PEER-PATHS=[{172.30.0.10 }]
+RESULT sent=18 ok=15 failed=3
+packets dropped by the cut: 16
+PASS: traffic failed as expected with no second path.
+```
+
+Every round trip survived the cut on two paths; on one path the same cut broke
+the association. **The control run is what gives the first its meaning** — a cut
+that silently did nothing would look identical to successful failover — and the
+script also refuses to pass a case where the DROP rules matched no packets,
+which is the other way a cut can quietly do nothing.
+
+Verified by mutation: binding the multi-homed case to a single address makes it
+exit 1 with `the association did not fail over`.
+
+`failoverprobe/` is the driver. It cannot be a Go test for the routing reason
+above, so it is a script; it is committed rather than kept local because it
+needs no capture and no tooling beyond docker.
 
 ## Throughput under concurrency
 
