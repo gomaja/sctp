@@ -11,6 +11,11 @@ import (
 	"github.com/ishidawataru/sctp"
 )
 
+// payloadRand fills the example's send buffer. It is seeded from the clock only
+// so successive runs differ; the bytes carry no meaning and are never checked,
+// so a weak source is the right one here.
+var payloadRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 func serveClient(conn net.Conn, bufsize int) error {
 	for {
 		buf := make([]byte, bufsize+128) // add overhead of SCTPSndRcvInfoWrappedConn
@@ -148,14 +153,12 @@ func main() {
 				log.Fatalf("failed to subscribe to data io events: %v", err)
 			}
 			buf := make([]byte, *bufsize)
-			n, err := rand.Read(buf)
-			if err != nil {
-				log.Fatalf("failed to generate random string: %v", err)
-			}
-			if n != *bufsize {
-				log.Fatalf("failed to generate random string len: %d", *bufsize)
-			}
-			n, err = conn.SCTPWrite(buf, info)
+			// Filler bytes for the payload, not a secret: an explicit source
+			// rather than the deprecated package-level rand.Read, which draws
+			// from the global source. crypto/rand would be the wrong answer
+			// here — nothing about this payload needs to be unpredictable.
+			payloadRand.Read(buf)
+			n, err := conn.SCTPWrite(buf, info)
 			if err != nil {
 				log.Fatalf("failed to write: %v", err)
 			}
