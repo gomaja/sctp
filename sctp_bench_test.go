@@ -5,6 +5,7 @@ package sctp
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -570,5 +571,175 @@ func BenchmarkToRawSockAddrBuf(b *testing.B) {
 		if buf := addr.ToRawSockAddrBuf(); len(buf) == 0 {
 			b.Fatal("empty buffer")
 		}
+	}
+}
+
+// The benchmarks above are all single-association micro-benchmarks: they
+// characterise one code path with one peer. The ones below cover what the
+// multi-client work is actually about — cost that only appears with many
+// associations at once, and the dial path, which now confirms the association
+// before returning.
+
+// BenchmarkDial measures a full dial and close.
+//
+// This is the path the EALREADY fix touched. The confirmation it added runs only
+// on the EALREADY branch, so the common case should cost nothing extra; this is
+// what would show it if that were ever wrong. Compare against a revision before
+// the fix rather than reading the absolute number.
+func BenchmarkDial(b *testing.B) {
+	addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("resolve: %v", err)
+	}
+	ln, err := ListenSCTP("sctp", addr)
+	if err != nil {
+		b.Fatalf("listen: %v", err)
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, aerr := ln.AcceptSCTP()
+			if aerr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	b.Cleanup(func() {
+		_ = ln.Close()
+		wg.Wait()
+	})
+	la, ok := ln.Addr().(*SCTPAddr)
+	if !ok {
+		b.Fatal("listener has no address")
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		c, derr := DialSCTP("sctp", nil, la)
+		if derr != nil {
+			b.Fatalf("dial: %v", derr)
+		}
+		_ = c.Close()
+	}
+}
+
+// BenchmarkConcurrentEcho measures request/response throughput with several
+// associations driving traffic at once.
+//
+// Reported as ns/op per round trip across all peers, so raising the peer count
+// shows whether added concurrency costs per-message throughput. The single-peer
+// case is the baseline the others are read against; it is not comparable to
+// BenchmarkSCTPWrite, which never waits for a reply.
+func BenchmarkConcurrentEcho(b *testing.B) {
+	for _, peers := range []int{1, 4, 16, 64} {
+		b.Run(fmt.Sprintf("peers=%d", peers), func(b *testing.B) {
+			addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
+			if err != nil {
+				b.Fatalf("resolve: %v", err)
+			}
+			ln, err := ListenSCTP("sctp", addr)
+			if err != nil {
+				b.Fatalf("listen: %v", err)
+			}
+			var srvWG sync.WaitGroup
+			srvWG.Add(1)
+			go func() {
+				defer srvWG.Done()
+				for {
+					c, aerr := ln.AcceptSCTP()
+					if aerr != nil {
+						return
+					}
+					srvWG.Add(1)
+					go func(c *SCTPConn) {
+						defer srvWG.Done()
+						defer func() { _ = c.Close() }()
+						buf := make([]byte, 4096)
+						for {
+							n, _, rerr := c.SCTPRead(buf)
+							if rerr != nil {
+								return
+							}
+							if werr := benchWriteAll(c, buf[:n]); werr != nil {
+								return
+							}
+						}
+					}(c)
+				}
+			}()
+			la, ok := ln.Addr().(*SCTPAddr)
+			if !ok {
+				b.Fatal("listener has no address")
+			}
+
+			conns := make([]*SCTPConn, 0, peers)
+			for i := 0; i < peers; i++ {
+				c, derr := DialSCTP("sctp", nil, la)
+				if derr != nil {
+					b.Fatalf("dial %d: %v", i, derr)
+				}
+				if err := c.SetDeadline(time.Now().Add(5 * time.Minute)); err != nil {
+					b.Fatalf("deadline: %v", err)
+				}
+				conns = append(conns, c)
+			}
+			b.Cleanup(func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+				_ = ln.Close()
+				srvWG.Wait()
+			})
+
+			// Spread b.N round trips over the peers, so ns/op stays "per round
+			// trip" however many are running.
+			each := b.N / peers
+			if each == 0 {
+				each = 1
+			}
+			payload := make([]byte, 512)
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			var wg sync.WaitGroup
+			for _, c := range conns {
+				wg.Add(1)
+				go func(c *SCTPConn) {
+					defer wg.Done()
+					buf := make([]byte, 4096)
+					for j := 0; j < each; j++ {
+						if err := benchWriteAll(c, payload); err != nil {
+							return
+						}
+						if _, _, err := c.SCTPRead(buf); err != nil {
+							return
+						}
+					}
+				}(c)
+			}
+			wg.Wait()
+			b.StopTimer()
+		})
+	}
+}
+
+// benchWriteAll retries a send whose buffer is momentarily full. Writes use
+// MSG_DONTWAIT, so under the concurrency these benchmarks create EAGAIN is a
+// flow-control condition rather than a failure; treating it as one would make
+// the numbers depend on buffer luck.
+func benchWriteAll(c *SCTPConn, b []byte) error {
+	for {
+		_, err := c.SCTPWrite(b, nil)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, syscall.EAGAIN) {
+			return err
+		}
+		runtime.Gosched()
 	}
 }
