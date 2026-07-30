@@ -1187,15 +1187,17 @@ rather than hiding a gap.
 
 ### Suite state
 
-189 pass, 0 fail, 3 skip under `-race`.
+194 pass, 0 fail, 3 skip under `-race`, and ten consecutive clean runs of the
+full suite on an idle host.
 
-Getting a trustworthy number took three attempts, and the first two were wrong
-in the same way. Eight runs gave 5 pass / 3 fail, and a re-run failed
+Getting a trustworthy number took several attempts, and every wrong one failed
+the same way. Eight runs gave 5 pass / 3 fail; a re-run failed
 `TestSCTPConnectEALREADYOnBlockingSocketMidHandshake` after 340s against its
-usual 0.00s. Both measurements shared an 8-core, 7.6 GiB Docker VM with a
-1000-peer scale probe left running from earlier work — `docker ps` showed a
-27-minute-old container. The failing runs produced no `--- FAIL` line at all,
-which is the signature of host contention rather than a defect.
+usual 0.00s; later, `TestDialNeverReturnsAnUnestablishedAssociation` failed
+after 352s against its usual 17s. Each time `docker ps` showed a container left
+running from earlier work. Each time the failing run produced no `--- FAIL` line
+or an implausible duration — both signatures of host contention rather than a
+defect.
 
 Measured properly, on a host with no other containers, against the baseline this
 branch started from:
@@ -1203,15 +1205,22 @@ branch started from:
 ```
 baseline (3bf7b9c)   full suite  12 pass  0 fail
 fixed tree           full suite  12 pass  0 fail
+fixed tree           full suite  10 pass  0 fail   (after the item-3 work)
 baseline   EALREADY test alone   40 pass  0 fail
 fixed tree EALREADY test alone   40 pass  0 fail
 ```
 
-So nothing was introduced, and the 340s failure belongs to the contention, not
-to the tree. This is the rule the `TestStreams` work already recorded above,
-re-learned the hard way: **never call a failure pre-existing or introduced
-without a baseline measured at a sample size that could distinguish them** — and
-never measure timing against a real kernel on a busy host.
+The one lasting change this forced is in the suite rather than the code:
+`TestDialNeverReturnsAnUnestablishedAssociation` dials two thousand times under
+continuous signals, which is the most load-sensitive thing here, so it now has a
+`-short` sample of two hundred. That detects less — against the mutation that
+skips the association confirmation the full count fires 4 runs in 5 and the
+short one 3 in 5 — so the full count stays the default.
+
+The rule, re-learned the hard way more than once: **never call a failure
+pre-existing or introduced without a baseline measured at a sample size that
+could distinguish them**, and never measure timing against a real kernel on a
+busy host.
 
 The two skipped AUTH-off tests are the deliberate inverses of the AUTH-on ones
 and skip precisely because the harness now enables the sysctl.
