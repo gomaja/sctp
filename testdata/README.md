@@ -778,3 +778,89 @@ On loopback the handshake completes inside the first call, so the second connect
 finds an `ESTABLISHED` association and gets `EISCONN` — never `EALREADY`.
 Reverting the entire fix still passed it. Only the two-goroutine blackholed
 version reaches the branch, and it kills that mutation.
+
+## Performance
+
+The package had no benchmarks, so there was no baseline against which to judge a
+change. `sctp_bench_test.go` adds them for the per-message paths:
+
+```sh
+go test -run '^$' -bench . -benchmem
+```
+
+Watch `allocs/op` rather than `ns/op`. The syscall dominates wall time on the
+socket benchmarks and loopback flow control moves their `ns/op` by hundreds of
+nanoseconds between runs for reasons unrelated to this package. Allocation is what
+the package controls, and per-message garbage is what a caller pushing throughput
+feels as GC pressure.
+
+### The send path allocated eight times per message
+
+`SCTPWrite` built its control message with two `toBuf` calls and an `append`.
+`toBuf` goes through `binary.Write`, which reflects over the struct and writes
+into a `bytes.Buffer`. `buildSndRcvCmsg` writes the bytes directly instead, using
+the layout `TestStructLayoutsMatchKernel` already pins:
+
+```
+BenchmarkBuildSndRcvCmsg/legacy-8     286 ns/op   296 B/op   8 allocs/op
+BenchmarkBuildSndRcvCmsg/current-8     32 ns/op    48 B/op   1 allocs/op
+```
+
+Roughly nine times faster with an eighth of the allocations. End to end that
+takes `SCTPWrite` from 9 allocations per message to 2.
+
+The risk in hand-writing a wire layout is a silently different control message, so
+`TestBuildSndRcvCmsgMatchesLegacy` keeps a copy of the old construction and
+compares the bytes for every field at distinct values, at zero, and at maximum.
+`TestBuildSndRcvCmsgOffsetsMatchStruct` pins the offset literals against the Go
+struct, because the byte comparison alone cannot catch a wrong payload length —
+both implementations derive it from the same struct, and a mutation setting it to
+28 survived that comparison.
+
+### The old construction was a data race
+
+The previous version byte-swapped the caller's `PPID` in place and swapped it
+back:
+
+```go
+oldPPID := info.PPID
+info.PPID = htonl(info.PPID)
+cmsgBuf := toBuf(info)
+info.PPID = oldPPID
+```
+
+An `*SndRcvInfo` is otherwise read-only, so sharing one across senders is natural —
+and two goroutines doing it could observe the swapped value or lose the restore.
+`TestSCTPWriteConcurrentSharedInfo` reports `WARNING: DATA RACE` against the old
+implementation under `-race` and passes against the new one, which does not touch
+its argument.
+
+### Three benchmark harnesses that measured the wrong thing
+
+Worth recording, because each produced numbers that looked plausible:
+
+1. **Treating `EAGAIN` as failure.** `SCTPWrite` passes `MSG_DONTWAIT`, so a full
+   send buffer is reported rather than waited on. The first harness failed at the
+   first full buffer with "resource temporarily unavailable".
+2. **Busy-retrying inside the timed loop.** The second reported **34500 allocs
+   and 2 ms per write** — the cost of the retry spin, not of a send. `sender` now
+   counts retries, reports them as a metric, excludes the waits from the clock,
+   and fails outright if flow control dominated.
+3. **A draining reader that died silently.** `BenchmarkSCTPWriteInfo` measured 241
+   retries per send as the third of three benchmarks in one process, and zero when
+   run alone. The send paths were identical; the reader had exited and nothing
+   noticed. `benchDrain` now reports whether its reader failed.
+
+A fourth mistake was in the setup rather than the loop: `SetWriteBuffer(4 << 20)`
+against `net.core.wmem_max` of 212992 is **silently clamped**, and `setsockopt`
+reports no error. The harness believed it had twenty times the buffer it had.
+`raiseBuffers` now reads the ceiling from the sysctl and verifies what was
+granted — a caller cannot otherwise tell a clamp from a success.
+
+### Not measured
+
+Throughput and latency under concurrency, multi-homed paths, large messages
+crossing the fragmentation point, and the receive path's `oob` buffer, which is
+allocated per `SCTPReadFlags` call and is the obvious next candidate. The
+benchmarks here are single-association loopback on one host and one kernel; they
+compare revisions of this package rather than characterising the stack.
