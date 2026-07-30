@@ -952,16 +952,20 @@ alone would not. The harness asserts the negative too: corrupting one byte of
 the echo makes it exit non-zero, so it detects the defect rather than always
 reporting success.
 
-Like the other tshark harnesses here it is **local only and not committed**. It
-is a Go program that dials N peers on M streams each, encoding the sender in the
-PPID and the peer and stream in the payload, plus a script that captures
-loopback SCTP around it and checks the capture:
+This harness is **kept outside the repository**, unlike the older tshark scripts
+in this directory. It is a Go program that dials N peers on M streams each,
+encoding the sender in the PPID and the peer and stream in the payload, plus a
+script that captures loopback SCTP around it and checks the capture. The same
+place holds the scale probe that found the `EINTR` and connect-path defects
+below, with its own notes on running both:
 
 ```sh
-# in a scratch directory outside the repo
-docker run --rm --privileged -v "$PWD":/src -v /path/to/harness:/wire \
+docker run --rm --privileged -v "$PWD":/src -v <harness-dir>/wire:/wire \
     -w /src sctp-test bash /wire/tshark-multiclient.sh
 ```
+
+The `/wire` mount name is load-bearing: the script writes its capture there.
+Exit status is the result — 0 if every payload was sent once and echoed once.
 
 The checks that matter are `sctp.chunk_type == 1` for the INIT count and
 `sctp.init_initiate_tag | sort -u` for distinct associations, then `data.data`
