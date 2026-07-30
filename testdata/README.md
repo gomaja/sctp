@@ -676,6 +676,19 @@ The rule this reinforces: never call a flake pre-existing or introduced without 
 baseline measured at a sample size that could distinguish them. A single batch
 that happens to favour one side is not evidence.
 
+Both residuals are now fixed — the ephemeral-port collision and the `EALREADY`
+conversion, each documented below. Sixty runs of the fixed tree, alternating
+`net.sctp.auth_enable` between runs so both configurations are covered:
+
+```
+FIXED-TREE PASS=60 FAIL=0     (baseline at the time: 58 pass, 2 fail)
+```
+
+Sixty runs cannot prove a rare flake is gone, only that it is rarer than roughly
+one in sixty. What makes the claim stronger than the count is that each cause was
+reproduced deterministically first and the fix verified against that
+reproduction, rather than inferred from a batch coming back green.
+
 ### `TestNotificationHandlerAssignmentOnDialing`: a fixed port inside the ephemeral range
 
 Four tests in `sctp_linux_test.go` bound port **54321**. The kernel's ephemeral
