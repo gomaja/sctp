@@ -296,13 +296,25 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 	// EALREADY is rare — one to three dials in two thousand even under
 	// signals — so the dial count has to be high enough to reach the branch.
 	// Measured against the unfixed code: at 200 dials it was caught 1 run in
-	// 8, at 2000 it is caught 4 runs in 5. That residual is inherent to
-	// racing the kernel's connect path and is recorded rather than hidden;
-	// the fixed code passed 5 of 5.
-	const (
-		rounds        = 4
-		dialsPerRound = 500
-	)
+	// 8, at 2000 it is caught 4 runs in 5, and with the write-based check
+	// 5 of 5. That residual is inherent to racing the kernel's connect path
+	// and is recorded rather than hidden.
+	//
+	// Two thousand dials under continuous signals is a stress test, and it is
+	// the most load-sensitive thing in the suite: on a host that is also doing
+	// something else it can take twenty times as long — 352s against a usual
+	// 17s was measured, with a competing container on the same VM — and start
+	// reporting associations that were torn down under it.
+	//
+	// -short runs a smaller sample, which keeps the path exercised at lower
+	// cost and lower exposure but does detect less: against the mutation that
+	// skips the confirmation, the full count fires 4 runs in 5 and the short
+	// one 3 in 5. The full count is the default and is what the fix was
+	// verified against.
+	rounds, dialsPerRound := 4, 500
+	if testing.Short() {
+		rounds, dialsPerRound = 1, 200
+	}
 	var dead, failed, torndown int64
 	for r := 0; r < rounds; r++ {
 		var wg sync.WaitGroup
@@ -344,7 +356,7 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 		}
 		wg.Wait()
 	}
-	const dials = rounds * dialsPerRound
+	dials := rounds * dialsPerRound
 	stop()
 	_ = ln.Close()
 	srvWG.Wait()
