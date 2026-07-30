@@ -874,6 +874,12 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		return abortSctpSocket(fd)
 	}
 
+	// Take a control reading before the shutdown, while the association is
+	// certainly still there. If the query already reports it gone, it is not
+	// answering usefully on this platform and its verdict afterwards would be
+	// meaningless — see waitAssocGone for what would go wrong silently.
+	queryWorks := !assocGone(fd)
+
 	// Send SHUTDOWN to initiate graceful shutdown. A failure here means no
 	// graceful shutdown is possible, so skip the wait and abort instead of
 	// blocking for a SHUTDOWN-ACK that cannot arrive.
@@ -913,7 +919,17 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 	// costs about a round trip instead of returning immediately with the wrong
 	// answer. It is bounded by the caller's timeout, which now means what it
 	// says.
-	completed := waitAssocGone(fd, timeout)
+	//
+	// If the control reading above showed the query does not work here, fall
+	// back to the previous behaviour rather than trusting it. That is the safe
+	// direction: assuming the handshake completed is wrong only for a peer that
+	// never answered, whereas assuming it did not would abort every healthy
+	// association and give each peer ECONNRESET in place of the end of the
+	// stream.
+	completed := true
+	if queryWorks {
+		completed = waitAssocGone(fd, timeout)
+	}
 
 	if completed {
 		// The association is already shut down, so there is nothing for
@@ -952,6 +968,20 @@ const (
 //
 // The zero AssocID is correct for a one-to-one socket: sctp_id2assoc resolves
 // the socket's single association and ignores the identifier.
+//
+// It cannot distinguish "the association is gone" from "this getsockopt did not
+// work", because both surface as EINVAL. That is why closeSctpSocket takes a
+// control reading before the shutdown instead of trusting this on its own: an
+// option that always fails would report the association gone on the first call,
+// which is exactly the always-completed answer the read this replaced used to
+// give. A fix whose failure mode is the bug it fixes has to be able to tell.
+//
+// The concrete way that could happen is not hypothetical. Every getsockopt here
+// passes the option length as a uintptr, and the kernel reads it as a 4-byte
+// socklen_t; on a little-endian target those four bytes are the value, and on a
+// big-endian 64-bit target they are the zero half, which the kernel rejects.
+// That would break far more of this package than the close path, so it is not
+// worked around here — but this one caller cannot afford to fail open.
 func assocGone(fd int) bool {
 	status := &Status{}
 	optlen := unsafe.Sizeof(*status)

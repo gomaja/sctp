@@ -27,6 +27,28 @@ func stalledPair(t *testing.T) (client, server *SCTPConn) {
 	return client, server
 }
 
+// TestAssocQueryAnswersForALiveAssociation pins the control reading
+// closeSctpSocket takes before it shuts anything down.
+//
+// That reading exists so a getsockopt which does not work on some platform
+// cannot be mistaken for "the association is gone" — both are EINVAL. The cost
+// of it is that a broken query is no longer a test failure anywhere: Close falls
+// back to its old behaviour and every close test stays green while the fix is
+// silently inert.
+//
+// So the query is asserted directly. If this fails, the shutdown wait is not
+// running at all and the timeout means nothing again, however green the rest of
+// the close tests look.
+func TestAssocQueryAnswersForALiveAssociation(t *testing.T) {
+	client, _ := eorPair(t)
+
+	if assocGone(client.fd()) {
+		t.Fatal("assocGone reports an established association as gone; the " +
+			"shutdown wait would fall back and Close would stop waiting for " +
+			"the handshake, with no other test noticing")
+	}
+}
+
 // TestCloseTimeoutBoundsTheShutdownWait is the regression test for a timeout
 // that did nothing.
 //
