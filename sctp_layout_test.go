@@ -118,6 +118,95 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 		var e Event
 		assertSize(t, "Event", unsafe.Sizeof(e), 8)
 	})
+
+	t.Run("SndInfo", func(t *testing.T) {
+		var s SndInfo
+		// struct sctp_sndinfo, RFC 6458 §5.3.4. The kernel rejects a short
+		// SCTP_DEFAULT_SNDINFO with EINVAL rather than accepting it the way it
+		// does SCTP_EVENTS, so this size has to be exact or every
+		// SetDefaultSndInfo call fails.
+		assertSize(t, "SndInfo", unsafe.Sizeof(s), 16)
+		assertOffset(t, "SID", unsafe.Offsetof(s.SID), 0)
+		assertOffset(t, "Flags", unsafe.Offsetof(s.Flags), 2)
+		assertOffset(t, "PPID", unsafe.Offsetof(s.PPID), 4)
+		assertOffset(t, "Context", unsafe.Offsetof(s.Context), 8)
+		assertOffset(t, "AssocID", unsafe.Offsetof(s.AssocID), 12)
+	})
+
+	t.Run("DefaultPrInfo", func(t *testing.T) {
+		var p DefaultPrInfo
+		// struct sctp_default_prinfo, RFC 7496 §4.1. The C struct ends with a
+		// __u16 and is padded to 12. Go's own alignment rules produce 12 with
+		// or without the explicit trailing pad in the Go struct, so this
+		// assertion pins the size but cannot detect the pad's removal.
+		assertSize(t, "DefaultPrInfo", unsafe.Sizeof(p), 12)
+		assertOffset(t, "AssocID", unsafe.Offsetof(p.AssocID), 0)
+		assertOffset(t, "Value", unsafe.Offsetof(p.Value), 4)
+		assertOffset(t, "Policy", unsafe.Offsetof(p.Policy), 8)
+	})
+
+	t.Run("PrStatus", func(t *testing.T) {
+		var p PrStatus
+		// struct sctp_prstatus, RFC 7496 §4.4. The two __u64 counters force
+		// 8-byte alignment, so there are 2 pad bytes after Policy that Go
+		// inserts on its own.
+		assertSize(t, "PrStatus", unsafe.Sizeof(p), 24)
+		assertOffset(t, "AssocID", unsafe.Offsetof(p.AssocID), 0)
+		assertOffset(t, "SID", unsafe.Offsetof(p.SID), 4)
+		assertOffset(t, "Policy", unsafe.Offsetof(p.Policy), 6)
+		assertOffset(t, "AbandonedUnsent", unsafe.Offsetof(p.AbandonedUnsent), 8)
+		assertOffset(t, "AbandonedSent", unsafe.Offsetof(p.AbandonedSent), 16)
+	})
+
+	t.Run("PeerAddrThlds", func(t *testing.T) {
+		var th PeerAddrThlds
+		// struct sctp_paddrthlds, RFC 7829 §7.2. 144 because spt_address is a
+		// sockaddr_storage (128 bytes) at offset 8 — not 4. The storage type
+		// contains a long, so C pads to 8-byte alignment after the assoc id,
+		// and the Go struct needs an explicit pad to match. Reading it at 4
+		// would shift every subsequent field and return garbage without any
+		// error.
+		assertSize(t, "PeerAddrThlds", unsafe.Sizeof(th), 144)
+		assertOffset(t, "AssocID", unsafe.Offsetof(th.AssocID), 0)
+		assertOffset(t, "Address", unsafe.Offsetof(th.Address), 8)
+		assertOffset(t, "PathMaxRxt", unsafe.Offsetof(th.PathMaxRxt), 136)
+		assertOffset(t, "PathPfThld", unsafe.Offsetof(th.PathPfThld), 138)
+	})
+
+	t.Run("AssocStats", func(t *testing.T) {
+		var s AssocStats
+		// struct sctp_assoc_stats. Linux-specific, no RFC counterpart. Same
+		// 8-byte alignment of the sockaddr_storage as PeerAddrThlds, so
+		// sas_obs_rto_ipaddr sits at 8 and the counters begin at 136.
+		assertSize(t, "AssocStats", unsafe.Sizeof(s), 256)
+		assertOffset(t, "AssocID", unsafe.Offsetof(s.AssocID), 0)
+		assertOffset(t, "ObsRtoIPAddr", unsafe.Offsetof(s.ObsRtoIPAddr), 8)
+		assertOffset(t, "MaxRto", unsafe.Offsetof(s.MaxRto), 136)
+		assertOffset(t, "ISacks", unsafe.Offsetof(s.ISacks), 144)
+		assertOffset(t, "OPackets", unsafe.Offsetof(s.OPackets), 160)
+		assertOffset(t, "ICtrlChunks", unsafe.Offsetof(s.ICtrlChunks), 248)
+	})
+
+	t.Run("AddStreamsReq", func(t *testing.T) {
+		var as AddStreamsReq
+		// struct sctp_add_streams, RFC 6525 §6.5.
+		assertSize(t, "AddStreamsReq", unsafe.Sizeof(as), 8)
+		assertOffset(t, "AssocID", unsafe.Offsetof(as.AssocID), 0)
+		assertOffset(t, "InStreams", unsafe.Offsetof(as.InStreams), 4)
+		assertOffset(t, "OutStreams", unsafe.Offsetof(as.OutStreams), 6)
+	})
+
+	t.Run("AuthKeyID", func(t *testing.T) {
+		var id AuthKeyID
+		// struct sctp_authkeyid, RFC 4895 §6.5. The C declaration is a
+		// sctp_assoc_t plus a __u16, which is 6 bytes, but the kernel returns
+		// and expects 8 — measured with testdata/optprobe. Go's alignment gives
+		// 8 with or without the struct's explicit pad, so this pins the size
+		// the kernel needs but does not police the pad itself.
+		assertSize(t, "AuthKeyID", unsafe.Sizeof(id), 8)
+		assertOffset(t, "AssocID", unsafe.Offsetof(id.AssocID), 0)
+		assertOffset(t, "KeyNumber", unsafe.Offsetof(id.KeyNumber), 4)
+	})
 }
 
 func assertSize(t *testing.T, name string, got, want uintptr) {
