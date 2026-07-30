@@ -891,10 +891,8 @@ the code around a performance question, not by looking for bugs.
 
 ### Not measured
 
-Pooling the `oob` buffer is now *possible* — the aliasing that blocked it is
-fixed — but has not been done or measured. The benchmarks here are loopback on
-one host and one kernel; they compare revisions of this package rather than
-characterising the stack.
+The benchmarks here are loopback on one host and one kernel; they compare
+revisions of this package rather than characterising the stack.
 
 Throughput under concurrency, multi-homed paths, path failover and large
 messages crossing the fragmentation point were all on this list and are no
@@ -1007,6 +1005,57 @@ in the Docker Desktop VM and `sysctl -w` returns EINVAL even privileged.
 commitment is made at association setup. A host that allows the sysctl, or one
 with more memory, would push the number up; nothing was found that this package
 does per association to bound it.
+
+## The read path's allocations
+
+A memory profile settled where they actually were, which was not where the
+earlier note assumed:
+
+```
+16384 66.66%  syscall.anyToSockaddr
+ 8194 33.34%  sctp.(*SCTPConn).SCTPReadFlags
+```
+
+Two thirds came from `syscall.Recvmsg` building a peer address that
+`SCTPReadFlags` discards — it fills a `RawSockaddrAny`, which escapes, then
+converts it with `anyToSockaddr`, which allocates. Only the remaining third was
+the `oob` buffer that the earlier note singled out as "the obvious next
+candidate".
+
+Both are gone. A local `recvmsg` passes a nil `msg.Name`, which asks the kernel
+not to report the source address at all — correct here, since the socket is
+connected and the value was never read — and keeps the `Msghdr` and `Iovec` on
+the stack. The `oob` buffer now comes from a `sync.Pool`, which is only safe
+because `parseSndRcvInfo` copies: it used to return a pointer *into* that buffer
+and byte-swap `PPID` in place, so pooling would have been a use-after-free. The
+aliasing fix is what unlocked this.
+
+Measured on the same host, 3000 iterations, three runs each:
+
+```
+                          before                    after
+SCTPRead                  417 B/op  5 allocs/op     129 B/op  3 allocs/op
+ConcurrentEcho peers=64   657 B/op  3 allocs/op      96 B/op  0 allocs/op
+```
+
+The echo round trip is allocation-free. **Time is unchanged** — ~680ns and
+~13µs before and after — so this is a garbage-collection win under sustained
+load, not a latency one, and it should not be read as a speedup.
+
+`TestPooledOobDoesNotCrossAssociations` drives 24 peers through the pool at once
+and checks the *ancillary data* rather than only the payload, since a pooling
+defect surfaces as one association's stream and PPID appearing on another's
+message while the bytes stay correct. `TestPooledOobSurvivesReuse` holds the
+info from sixteen reads and checks all sixteen afterwards.
+
+Both mutations were run. Restoring the aliasing `parseSndRcvInfo` fails both new
+tests plus the two that already covered it; returning the buffer to the pool
+before it is parsed fails the concurrency test 3 runs of 3, reporting the exact
+cross-association leak:
+
+```
+peer 16 msg 1: got stream=4 ppid=0x100c, want stream=0 ppid=0x1010
+```
 
 ## Multi-homing
 

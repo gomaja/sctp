@@ -26,6 +26,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -330,7 +331,14 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 // checking it, an oversized message is silently split and the remainder is
 // delivered as what looks like a fresh message.
 func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
-	oob := make([]byte, 254)
+	// The control buffer is pooled rather than allocated per call. This is only
+	// safe because parseSndRcvInfo copies: it used to return a pointer into
+	// this buffer and byte-swap PPID in place, so reusing the buffer would have
+	// been a use-after-free. See TestParseSndRcvInfoDoesNotAliasInput.
+	oobp := oobPool.Get().(*[]byte)
+	oob := *oobp
+	defer oobPool.Put(oobp)
+
 	for {
 		// Reprogram the timeout each iteration: the deadline is absolute, so
 		// a notification consuming part of the budget must shorten the next
@@ -352,7 +360,7 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 			}
 		}
 
-		n, oobn, recvflags, _, err := syscall.Recvmsg(c.fd(), b, oob, 0)
+		n, oobn, recvflags, err := recvmsg(c.fd(), b, oob, 0)
 		if err != nil {
 			// A signal delivered while recvmsg was blocked interrupts it. The
 			// Go runtime signals its own threads to preempt goroutines, so
@@ -387,6 +395,65 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 			return n, info, recvflags, err
 		}
 	}
+}
+
+// oobPool holds the per-read control-message buffers.
+//
+// 254 bytes is what the read path has always asked for, and it is comfortably
+// more than the cmsgs SCTP delivers: SCTP_SNDRCV is 32 bytes of payload plus a
+// 16-byte header, and SCTP_RCVINFO and SCTP_NXTINFO are smaller again.
+//
+// Pointers to slices are pooled rather than slices, so putting one back does
+// not allocate a header on the heap to hold it.
+var oobPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 254)
+		return &b
+	},
+}
+
+// recvmsg receives one message into b with its control data into oob.
+//
+// It exists because syscall.Recvmsg allocates twice per call for a peer address
+// this package discards: it fills a RawSockaddrAny, which escapes to the heap,
+// and then converts it with anyToSockaddr, which allocates the Sockaddr. A
+// memory profile of the read path attributed two thirds of its allocations to
+// that conversion alone.
+//
+// Passing a nil msg.Name asks the kernel not to report the source address at
+// all, which is what SCTP wants: the socket is connected, so the peer is not in
+// question, and SCTPReadFlags never looked at the value.
+//
+// The Msghdr and Iovec stay on the stack.
+func recvmsg(fd int, b, oob []byte, flags int) (n, oobn, recvflags int, err error) {
+	var msg syscall.Msghdr
+	var iov syscall.Iovec
+
+	if len(b) > 0 {
+		iov.Base = &b[0]
+		iov.SetLen(len(b))
+	}
+	// A control-only receive still needs somewhere for the kernel to put the
+	// single byte a SOCK_STREAM read must return, mirroring what
+	// syscall.recvmsgRaw does for the same case.
+	var dummy byte
+	if len(oob) > 0 {
+		if len(b) == 0 {
+			iov.Base = &dummy
+			iov.SetLen(1)
+		}
+		msg.Control = &oob[0]
+		msg.SetControllen(len(oob))
+	}
+	msg.Iov = &iov
+	msg.Iovlen = 1
+
+	r0, _, errno := syscall.Syscall(syscall.SYS_RECVMSG, uintptr(fd),
+		uintptr(unsafe.Pointer(&msg)), uintptr(flags))
+	if errno != 0 {
+		return 0, 0, 0, errno
+	}
+	return int(r0), int(msg.Controllen), int(msg.Flags), nil
 }
 
 // ReadMsg reads one whole message, reassembling it across as many reads as
