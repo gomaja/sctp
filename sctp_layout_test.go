@@ -173,6 +173,19 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 		assertOffset(t, "PathPfThld", unsafe.Offsetof(th.PathPfThld), 138)
 	})
 
+	t.Run("PeerAddrThldsV2", func(t *testing.T) {
+		var th PeerAddrThldsV2
+		// struct sctp_paddrthlds_v2, a Linux extension with a third threshold.
+		// Same sockaddr_storage alignment as PeerAddrThlds — address at 8 — and
+		// 144 bytes, rounded up from the 142 the fields occupy.
+		assertSize(t, "PeerAddrThldsV2", unsafe.Sizeof(th), 144)
+		assertOffset(t, "AssocID", unsafe.Offsetof(th.AssocID), 0)
+		assertOffset(t, "Address", unsafe.Offsetof(th.Address), 8)
+		assertOffset(t, "PathMaxRxt", unsafe.Offsetof(th.PathMaxRxt), 136)
+		assertOffset(t, "PathPfThld", unsafe.Offsetof(th.PathPfThld), 138)
+		assertOffset(t, "PathCpThld", unsafe.Offsetof(th.PathCpThld), 140)
+	})
+
 	t.Run("AssocStats", func(t *testing.T) {
 		var s AssocStats
 		// struct sctp_assoc_stats. Linux-specific, no RFC counterpart. Same

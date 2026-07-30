@@ -476,8 +476,58 @@ through the public API. The kernel does not care about the order.
 `TestCmsgPaddingIsObservable` fails loudly if a platform ever made every size
 self-aligning, so the padding test cannot quietly become vacuous.
 
-Not bound, with reasons: `SCTP_GET_ASSOC_NUMBER` and `SCTP_GET_ASSOC_ID_LIST`
-return EOPNOTSUPP on the one-to-one sockets this package creates.
+### The final sweep, and a fourth near-miss
+
+Re-running the header diff after all the above left six options unreferenced. Two
+of them were about to be dismissed as one-to-many-only, by analogy with
+`SCTP_GET_ASSOC_NUMBER`. Probing them first — for the fourth time in this package
+— showed the analogy was wrong:
+
+```
+PR_ASSOC_STATUS:     ok (unsent=0 sent=0 len=24)
+PEER_ADDR_THLDS_V2:  ok maxrxt=5 pf=0 ps=65535 len=144
+GET_ASSOC_NUMBER:    Operation not supported
+GET_ASSOC_ID_LIST:   Operation not supported
+```
+
+`SCTP_PR_ASSOC_STATUS` (RFC 7496 §4.3) and `SCTP_PEER_ADDR_THLDS_V2` both work on
+a one-to-one socket and are now bound. The v2 thresholds add `spt_pathcpthld`,
+which bounds how long a Potentially Failed path keeps being probed; its default of
+`0xffff` means indefinitely, and asserting that default is what proves the field
+is read at the right offset. Its layout matches v1 — address at 8, 144 bytes.
+
+`SCTP_GET_ASSOC_NUMBER` and `SCTP_GET_ASSOC_ID_LIST` genuinely return EOPNOTSUPP
+here. `SCTP_SOCKOPT_CONNECTX_OLD` and `SCTP_SOCKOPT_PEELOFF_FLAGS` are internal
+options the library reaches by other means.
+
+### Two options that behaviour cannot distinguish
+
+`SCTP_PR_ASSOC_STATUS` and `SCTP_PR_STREAM_STATUS` return the same
+`struct sctp_prstatus`, and both read zero on an association where nothing has
+been abandoned. **Swapping their option numbers survives every round-trip test.**
+
+Telling them apart needs a message genuinely abandoned under a partial reliability
+policy. That was attempted — a 1 ms TTL as the socket default, then 200 × 64 KB
+sends on one stream without a reader — and it does not work over loopback: the
+send drains before the TTL expires, so both counters stay at zero.
+
+```
+after abandoning on stream 4:
+  STREAM_STATUS sid=4 -> unsent=0 sent=0
+  ASSOC_STATUS  sid=4 -> unsent=0 sent=0
+```
+
+So `TestOptionNumbersMatchHeader` asserts the numbers against `linux/sctp.h`
+instead, covering all 22 option constants and the 9 positional `sctp_cmsg_type`
+values. That is weaker than a behavioural test and is recorded as weaker rather
+than presented as equivalent — it is the same technique that closed the
+`SCTPPrPolicyRtx`/`Prio` transposition, which the kernel also echoes back without
+complaint.
+
+The cmsg values matter because the C enum is positional: an insertion shifts
+every later one. A wrong `SCTP_CMSG_PRINFO` makes the kernel reject the send and
+is caught behaviourally, but `SCTP_CMSG_DSTADDRV4`/`V6` are unreachable from
+one-to-one sockets and would otherwise go unnoticed.
 
 ## Address decoding
 

@@ -382,6 +382,79 @@ func TestPrPolicyConstantValues(t *testing.T) {
 	}
 }
 
+// TestOptionNumbersMatchHeader pins the option numbers of the pairs that cannot
+// be told apart by behaviour.
+//
+// SCTP_PR_ASSOC_STATUS and SCTP_PR_STREAM_STATUS return the same struct
+// sctp_prstatus and both read zero on an association where nothing has been
+// abandoned, so swapping them survives every round-trip test. Distinguishing them
+// would need a message actually abandoned under a partial reliability policy, and
+// forcing that reliably needs a stalled receiver — measured as unreproducible over
+// loopback, where a 1 ms TTL never expires because the send drains first.
+//
+// So the numbers are asserted against linux/sctp.h instead. That is weaker than a
+// behavioural test and is recorded as such rather than presented as equivalent.
+func TestOptionNumbersMatchHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  uintptr
+		want uintptr
+	}{
+		{"SCTP_PR_ASSOC_STATUS", SCTP_PR_ASSOC_STATUS, 115},
+		{"SCTP_PR_STREAM_STATUS", SCTP_PR_STREAM_STATUS, 116},
+		{"SCTP_PR_SUPPORTED", SCTP_PR_SUPPORTED, 113},
+		{"SCTP_DEFAULT_PRINFO", SCTP_DEFAULT_PRINFO, 114},
+		{"SCTP_RECONFIG_SUPPORTED", SCTP_RECONFIG_SUPPORTED, 117},
+		{"SCTP_ENABLE_STREAM_RESET", SCTP_ENABLE_STREAM_RESET, 118},
+		{"SCTP_RESET_STREAMS", SCTP_RESET_STREAMS, 119},
+		{"SCTP_RESET_ASSOC", SCTP_RESET_ASSOC, 120},
+		{"SCTP_ADD_STREAMS", SCTP_ADD_STREAMS, 121},
+		{"SCTP_PEER_ADDR_THLDS", SCTP_PEER_ADDR_THLDS, 31},
+		{"SCTP_PEER_ADDR_THLDS_V2", SCTP_PEER_ADDR_THLDS_V2, 37},
+		{"SCTP_GET_ASSOC_STATS", SCTP_GET_ASSOC_STATS, 112},
+		{"SCTP_DEFAULT_SNDINFO", SCTP_DEFAULT_SNDINFO, 34},
+		{"SCTP_AUTO_ASCONF", SCTP_AUTO_ASCONF, 30},
+		{"SCTP_AUTH_CHUNK", SCTP_AUTH_CHUNK, 21},
+		{"SCTP_HMAC_IDENT", SCTP_HMAC_IDENT, 22},
+		{"SCTP_AUTH_KEY", SCTP_AUTH_KEY, 23},
+		{"SCTP_AUTH_ACTIVE_KEY", SCTP_AUTH_ACTIVE_KEY, 24},
+		{"SCTP_AUTH_DELETE_KEY", SCTP_AUTH_DELETE_KEY, 25},
+		{"SCTP_PEER_AUTH_CHUNKS", SCTP_PEER_AUTH_CHUNKS, 26},
+		{"SCTP_LOCAL_AUTH_CHUNKS", SCTP_LOCAL_AUTH_CHUNKS, 27},
+		{"SCTP_AUTH_DEACTIVATE_KEY", SCTP_AUTH_DEACTIVATE_KEY, 35},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d per linux/sctp.h",
+				tc.name, tc.got, tc.want)
+		}
+	}
+
+	// The ancillary data types are positional in enum sctp_cmsg_type, so an
+	// insertion shifts every later one. A wrong SCTP_CMSG_PRINFO makes the
+	// kernel reject the send, but SCTP_CMSG_DSTADDRV4/V6 are unreachable from
+	// this package's one-to-one sockets and would go unnoticed.
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"SCTP_CMSG_INIT", SCTP_CMSG_INIT, 0},
+		{"SCTP_CMSG_SNDRCV", SCTP_CMSG_SNDRCV, 1},
+		{"SCTP_CMSG_SNDINFO", SCTP_CMSG_SNDINFO, 2},
+		{"SCTP_CMSG_RCVINFO", SCTP_CMSG_RCVINFO, 3},
+		{"SCTP_CMSG_NXTINFO", SCTP_CMSG_NXTINFO, 4},
+		{"SCTP_CMSG_PRINFO", SCTP_CMSG_PRINFO, 5},
+		{"SCTP_CMSG_AUTHINFO", SCTP_CMSG_AUTHINFO, 6},
+		{"SCTP_CMSG_DSTADDRV4", SCTP_CMSG_DSTADDRV4, 7},
+		{"SCTP_CMSG_DSTADDRV6", SCTP_CMSG_DSTADDRV6, 8},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d per enum sctp_cmsg_type",
+				tc.name, tc.got, tc.want)
+		}
+	}
+}
+
 // TestDefaultPrInfoRejectsUnknownPolicy records that the kernel does validate
 // this option, in contrast to SCTP_FRAGMENT_INTERLEAVE which accepts an
 // undefined level. That contrast is the reason SetDefaultPrInfo has no
@@ -424,6 +497,80 @@ func TestPrStreamStatusNeedsAssociation(t *testing.T) {
 	if _, err := fresh.GetPrStreamStatus(0, SCTPPrPolicyTTL); !errors.Is(err, syscall.EINVAL) {
 		t.Errorf("GetPrStreamStatus without an association gave %v, want EINVAL",
 			err)
+	}
+}
+
+// TestPrAssocStatus covers RFC 7496 §4.3, the association-wide abandonment
+// counters.
+//
+// This option was nearly left unbound on the assumption that it applied to
+// one-to-many sockets like SCTP_GET_ASSOC_NUMBER does. It does not — it works
+// here, which a probe established before the binding was written. Assuming would
+// have been the fourth such mistake in this package.
+func TestPrAssocStatus(t *testing.T) {
+	conn := sockoptConn(t)
+
+	st, err := conn.GetPrAssocStatus(SCTPPrPolicyTTL)
+	if err != nil {
+		t.Fatalf("GetPrAssocStatus: %v", err)
+	}
+	// Nothing has been abandoned, so both counters must read zero. A non-zero
+	// value would mean the struct is misaligned and picking up other fields.
+	if st.AbandonedUnsent != 0 || st.AbandonedSent != 0 {
+		t.Errorf("fresh association reports abandoned unsent=%d sent=%d, want "+
+			"0/0 — a non-zero count suggests a layout mismatch",
+			st.AbandonedUnsent, st.AbandonedSent)
+	}
+
+	// Without an association there is nothing to total.
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM,
+		syscall.IPPROTO_SCTP)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+	fresh := NewSCTPConn(fd, nil)
+	defer func() { _ = fresh.Close() }()
+	if _, err := fresh.GetPrAssocStatus(SCTPPrPolicyTTL); !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("GetPrAssocStatus without an association gave %v, want EINVAL",
+			err)
+	}
+}
+
+// TestPeerAddrThldsV2RoundTrip covers the Linux extension with the third
+// threshold.
+//
+// The probe cutoff is what v2 adds over the RFC 7829 option, so that is the field
+// the round trip has to prove — reading back only the two v1 fields would pass
+// with the v2 struct one field short and the option length wrong.
+func TestPeerAddrThldsV2RoundTrip(t *testing.T) {
+	conn := sockoptConn(t)
+
+	got, err := conn.GetPeerAddrThldsV2()
+	if err != nil {
+		t.Fatalf("GetPeerAddrThldsV2: %v", err)
+	}
+	// The kernel default for the probe cutoff is 0xffff, meaning a Potentially
+	// Failed path is probed indefinitely. Anything else here means the field is
+	// being read at the wrong offset.
+	if got.PathCpThld != 0xffff {
+		t.Errorf("default PathCpThld = %#x, want 0xffff — a different value "+
+			"suggests the field is at the wrong offset", got.PathCpThld)
+	}
+
+	got.PathMaxRxt = 8
+	got.PathPfThld = 3
+	got.PathCpThld = 5
+	if err := conn.SetPeerAddrThldsV2(got); err != nil {
+		t.Fatalf("SetPeerAddrThldsV2: %v", err)
+	}
+
+	back, err := conn.GetPeerAddrThldsV2()
+	if err != nil {
+		t.Fatalf("GetPeerAddrThldsV2 after set: %v", err)
+	}
+	if back.PathMaxRxt != 8 || back.PathPfThld != 3 || back.PathCpThld != 5 {
+		t.Errorf("thresholds read back as maxrxt=%d pf=%d cp=%d, want 8/3/5",
+			back.PathMaxRxt, back.PathPfThld, back.PathCpThld)
 	}
 }
 

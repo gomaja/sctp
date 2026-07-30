@@ -120,6 +120,10 @@ const (
 	// SCTP_PEER_ADDR_THLDS carries struct sctp_paddrthlds and sets the
 	// per-path failure and Potentially Failed thresholds (RFC 7829 §7.2).
 	SCTP_PEER_ADDR_THLDS = 31
+	// SCTP_PEER_ADDR_THLDS_V2 is the same option with a third threshold added,
+	// governing when a path stops being probed while in the Potentially Failed
+	// state. Linux-specific; RFC 7829 describes only the first two.
+	SCTP_PEER_ADDR_THLDS_V2 = 37
 
 	// SCTP_GET_ASSOC_STATS reads struct sctp_assoc_stats, the per-association
 	// counters. Linux-specific; it has no RFC 6458 equivalent.
@@ -135,6 +139,9 @@ const (
 	// abandoned on one stream under the partial reliability policy
 	// (RFC 7496 §4.4).
 	SCTP_PR_STREAM_STATUS = 116
+	// SCTP_PR_ASSOC_STATUS reads the same struct sctp_prstatus totalled across
+	// every stream of the association (RFC 7496 §4.3).
+	SCTP_PR_ASSOC_STATUS = 115
 
 	// SCTP_RECONFIG_SUPPORTED negotiates stream reconfiguration
 	// (RFC 6525 §6.1).
@@ -482,6 +489,30 @@ type PeerAddrThlds struct {
 	// The struct's 8-byte alignment rounds its size up from 140 to 144. Go
 	// would stop at 140, and the four-byte-short option length is rejected.
 	_ uint32
+}
+
+// PeerAddrThldsV2 mirrors struct sctp_paddrthlds_v2, the Linux extension of
+// PeerAddrThlds with a third threshold. RFC 7829 defines only the first two.
+type PeerAddrThldsV2 struct {
+	AssocID SCTPAssocID
+	// Four pad bytes before the sockaddr_storage, as in PeerAddrThlds.
+	_ uint32
+	// Address selects the path; a zeroed address applies to the association.
+	Address [128]byte
+	// PathMaxRxt is the retransmission count at which a path is declared
+	// failed.
+	PathMaxRxt uint16
+	// PathPfThld is the count at which a path enters the Potentially Failed
+	// state.
+	PathPfThld uint16
+	// PathCpThld is the count at which the stack stops probing a path that is
+	// in the Potentially Failed state. The kernel default is 0xffff, meaning
+	// probing continues indefinitely.
+	PathCpThld uint16
+	// The struct's 8-byte alignment rounds its size up from 142 to 144. Go
+	// produces that with or without this pad, so as in DefaultPrInfo it records
+	// the C layout rather than causing the size; verified both ways.
+	_ uint16
 }
 
 // AssocStats mirrors struct sctp_assoc_stats, the per-association counters
@@ -1540,6 +1571,24 @@ func (c *SCTPConn) GetPrStreamStatus(sid uint16, policy uint16) (*PrStatus, erro
 	return st, nil
 }
 
+// GetPrAssocStatus reports how many messages were abandoned across the whole
+// association under the given partial reliability policy (RFC 7496 §4.3).
+//
+// This is the association-wide total; GetPrStreamStatus reports one stream. Both
+// need an established association.
+//
+// The returned PrStatus.SID is not meaningful here — the option ignores it.
+func (c *SCTPConn) GetPrAssocStatus(policy uint16) (*PrStatus, error) {
+	st := &PrStatus{Policy: policy}
+	optlen := unsafe.Sizeof(*st)
+	_, _, err := getsockopt(c.fd(), SCTP_PR_ASSOC_STATUS,
+		uintptr(unsafe.Pointer(st)), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return nil, err
+	}
+	return st, nil
+}
+
 // SetReconfigSupported enables or disables the stream reconfiguration extension
 // (RFC 6525 §6.1).
 //
@@ -1826,6 +1875,31 @@ func (c *SCTPConn) GetPeerAddrThlds() (*PeerAddrThlds, error) {
 	th := &PeerAddrThlds{}
 	optlen := unsafe.Sizeof(*th)
 	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_THLDS,
+		uintptr(unsafe.Pointer(th)), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return nil, err
+	}
+	return th, nil
+}
+
+// SetPeerAddrThldsV2 sets the per-path thresholds including the probe cutoff that
+// SetPeerAddrThlds cannot reach.
+//
+// This is a Linux extension of the RFC 7829 option: PathCpThld bounds how long a
+// path in the Potentially Failed state keeps being probed. The kernel default is
+// 0xffff, which means indefinitely.
+func (c *SCTPConn) SetPeerAddrThldsV2(th *PeerAddrThldsV2) error {
+	optlen := unsafe.Sizeof(*th)
+	_, _, err := setsockopt(c.fd(), SCTP_PEER_ADDR_THLDS_V2,
+		uintptr(unsafe.Pointer(th)), optlen)
+	return err
+}
+
+// GetPeerAddrThldsV2 reports the per-path thresholds including the probe cutoff.
+func (c *SCTPConn) GetPeerAddrThldsV2() (*PeerAddrThldsV2, error) {
+	th := &PeerAddrThldsV2{}
+	optlen := unsafe.Sizeof(*th)
+	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_THLDS_V2,
 		uintptr(unsafe.Pointer(th)), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
 		return nil, err
