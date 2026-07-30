@@ -2538,8 +2538,42 @@ type SCTPListener struct {
 	// _fd is accessed atomically and set to -1 by Close, so a second Close
 	// cannot release a descriptor number the kernel has since handed to
 	// another socket. Use fd() to read it.
-	_fd                 int32
+	_fd int32
+
+	// pad keeps acceptDeadline 8-byte aligned on 32-bit targets, where Go only
+	// guarantees 64-bit alignment for the first word of an allocated struct and
+	// atomic.LoadInt64 panics on a misaligned address. Placing it after
+	// notificationHandler, which is one word, would put it at offset 12 there.
+	_ int32
+
+	// acceptDeadline is absolute, in UnixNano; 0 means none. Accessed
+	// atomically so it may be set while an Accept is in flight.
+	acceptDeadline int64
+
+	// rcvTimeoSet tracks whether a non-zero SO_RCVTIMEO is programmed, so the
+	// no-deadline path does not issue a setsockopt on every accept.
+	rcvTimeoSet int32
+
 	notificationHandler NotificationHandler
+}
+
+// SetDeadline sets the absolute time after which Accept fails.
+//
+// An Accept that exceeds the deadline returns an error satisfying
+// errors.Is(err, os.ErrDeadlineExceeded). A zero time.Time clears it, as with
+// net.Conn. This mirrors net.TCPListener.SetDeadline, which net.Listener itself
+// does not require.
+//
+// The same caveat as SetReadDeadline applies: the deadline is realised with
+// SO_RCVTIMEO, which the kernel consults when a call begins, so setting one does
+// not interrupt an Accept that is already blocked. It takes effect from the next
+// Accept. To unblock one already in flight, close the listener.
+func (ln *SCTPListener) SetDeadline(t time.Time) error {
+	if ln.fd() < 0 {
+		return syscall.EBADF
+	}
+	atomic.StoreInt64(&ln.acceptDeadline, timeToUnixNano(t))
+	return nil
 }
 
 func (ln *SCTPListener) fd() int {

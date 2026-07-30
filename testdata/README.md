@@ -1391,3 +1391,91 @@ Two limitations that survive, both documented at the code:
   count `internal/poll` uses, so a `Close` landing between the read and the use
   is still the caller's ordering problem — as it already is for `SCTPRead` and
   `SCTPWrite`.
+
+## Closing out the rest of the backpressure review
+
+Ten things were flagged during the review above and left unfixed. Six were real,
+two were not, and two of the "fixes" proposed for them were wrong in ways only a
+probe caught. What follows is what each turned out to be, because several of the
+plausible-sounding answers were false.
+
+**`Close` never waited for anything.** `closeSctpSocket` decided whether the
+shutdown handshake had completed by reading from the socket.
+`shutdown(SHUT_RDWR)` sets `RCV_SHUTDOWN` before the SCTP layer sees it, and
+`sctp_skb_recv_datagram` tests that — returning end of stream — *before* both the
+`EAGAIN` path and the `SO_RCVTIMEO` wait. So the read returned `(0, nil)` the
+instant the receive queue was empty, whatever the peer had done. Three things
+followed: "the peer completed the handshake" was true for every peer that had
+gone silent, which is the one case the wait exists for; the `EAGAIN` outcome the
+comment documented was unreachable; and `timeout` was inert —
+`CloseWithTimeout(1ms)` and `CloseWithTimeout(1h)` were the same call. The cost
+was silent: against a vanished peer, `Close` skipped the ABORT and left the
+association and its port in the kernel for up to 5 × RTO.max, which is exactly
+the `EADDRINUSE` window its own doc claims to prevent.
+
+The fix polls `SCTP_STATUS` instead. Getting there took two rounds: the first
+analysis rejected it, quoting `sctp_id2assoc` as `if (!sctp_sstate(sk,
+ESTABLISHED)) return NULL;` and concluding the query dies at shutdown. The real
+line is `if (!sctp_sstate(sk, ESTABLISHED) && !sctp_sstate(sk, CLOSING))`, and
+`sctp_shutdown` sets exactly `SCTP_SS_CLOSING`. Measured: still answering
+`SHUTDOWN_PENDING` 3 s after the shutdown for a stalled peer, `EINVAL` 1.9 µs
+after it for one that answers. A truncated quote had nearly bought a
+`getpeername` plus a 152-byte `sockaddr_storage` round-trip through
+`SCTP_GET_PEER_ADDR_INFO` to solve a problem that did not exist.
+
+**The listener `Shutdown` comment was wrong, and so was its replacement.** The
+existing text said shutdown fails on a listening socket with `ENOTCONN`. The
+proposed correction said it fails with `EOPNOTSUPP` and does not unblock a
+parked `Accept`. Both are wrong: `sctp_disconnect` returns `EOPNOTSUPP` only for
+UDP-style sockets, and this package creates `SOCK_STREAM` exclusively, so it sets
+`RCV_SHUTDOWN` and returns 0 — and `RCV_SHUTDOWN` is one of the conditions
+`sctp_wait_for_accept` breaks on. Probed directly: shutdown returns success, and
+shutdown *alone*, with no close and no signal, ends a parked accept in 135 µs
+with `EINVAL`. Only the errno clause needed correcting, and
+`TestListenerCloseUnblocksAccept` is deterministic rather than the latent flake
+it was nearly re-graded as.
+
+**Two flags were not defects at all.** A send on an association still in
+`COOKIE_WAIT` returns `EPROTO` or `EPIPE`, never `EAGAIN`, so the retry loop
+cannot spin against a handshake in progress — no liveness guard needed. And the
+level-triggered `POLLERR` concern does not reproduce: the state is transient, and
+the wait terminates after exactly one call to `f` with the real errno. The guard
+proposed for it was worse than unnecessary — it was dead code, since the pacing
+branch returns before the poll the counter lived next to, so it could never
+reach its own threshold.
+
+**Concurrency was measured rather than argued.** `internal/poll` takes the same
+locks for `RawRead`/`RawWrite` that `FD.Read`/`FD.Write` take; `connRawConn`
+takes none. What that costs, over 300 messages of 8000 bytes read through a
+2000-byte buffer: one reader splits 0 messages, two `SCTPRead` readers split 61,
+`SCTPRead` plus a RawConn reader splits 64. No run lost, duplicated or corrupted
+anything — the kernel holds `lock_sock` across the dequeue and the requeue. So a
+RawConn reader is indistinguishable from a second `SCTPRead`, and a lock here
+would not fix the case that actually bites. It is documented, not locked.
+
+**Smaller ones.** `MSG_NOSIGNAL` is now set on both send paths: SCTP does raise
+`SIGPIPE`, and the flag suppresses it leaving the errno unchanged — both halves
+measured. `ErrUnsupported` now wraps `errors.ErrUnsupported`, so the portable
+check works; the shared name had made the failure easy to miss.
+`SCTPListener.SetDeadline` gives `Accept` a bound that does not require
+destroying the listener, via `SO_RCVTIMEO`, which `sctp_accept` honours.
+
+**Two things the tools were hiding.** `GOOS=linux GOARCH=arm go vet` had never
+passed: `sctp_maxseg_test.go` passed the constant `1<<33` to a function taking
+`int`, which does not compile where `int` is 32 bits — so the whole test package
+was uncompilable on every 32-bit target. The bound being tested is `uint32`'s
+ceiling, which cannot be represented there at all, so the case is now guarded and
+the value built at run time. And `go test ./...` had never passed on macOS:
+`sctp_test.go` and `sctp_streams_test.go` lacked the `linux && !386` tag every
+other behavioural test file carries, so they ran on a platform with no SCTP stack
+and failed. Both now pass.
+
+Two test defects turned up in mutation, both mine. `TestSendDoesNotRaiseSIGPIPE`
+stopped at the first failed write, which reports `ECONNRESET` — and `ECONNRESET`
+does not raise `SIGPIPE`. It passed with and without the flag until it was made
+to write on past the first error to the `EPIPE` state that actually raises the
+signal. And the healthy-close mutation was caught by
+`TestCloseAfterCompletedHandshakeGivesPeerEOF` rather than by the promptness test
+aimed at it: `completed := false` takes the ABORT path, which is fast, so
+promptness could never have detected it. 9 of 9 mutations are caught now, but
+only after both were re-pointed.

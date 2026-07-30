@@ -86,6 +86,7 @@ var ipStackCaps ipStackCapabilities
 // supportsIPv4 reports whether the platform supports IPv4 networking
 // functionality.
 func supportsIPv4() bool {
+	//nolint:staticcheck // QF1008: kept byte-identical to net/ipsock.go upstream.
 	ipStackCaps.Once.Do(ipStackCaps.probe)
 	return ipStackCaps.ipv4Enabled
 }
@@ -95,6 +96,7 @@ func supportsIPv4() bool {
 // IPv4 address inside an IPv6 address at transport layer
 // protocols. See RFC 4291, RFC 4038 and RFC 3493.
 func supportsIPv4map() bool {
+	//nolint:staticcheck // QF1008: kept byte-identical to net/ipsock.go upstream.
 	ipStackCaps.Once.Do(ipStackCaps.probe)
 	return ipStackCaps.ipv4MappedIPv6Enabled
 }

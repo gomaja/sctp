@@ -20,6 +20,7 @@ package sctp
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"runtime"
@@ -27,7 +28,20 @@ import (
 	"time"
 )
 
-var ErrUnsupported = errors.New("SCTP is unsupported on " + runtime.GOOS + "/" + runtime.GOARCH)
+// ErrUnsupported is returned by every entry point on a platform without SCTP.
+//
+// It wraps errors.ErrUnsupported, so the generic check works as well as the
+// specific one:
+//
+//	errors.Is(err, sctp.ErrUnsupported)   // this package
+//	errors.Is(err, errors.ErrUnsupported) // any package
+//
+// It did not always do so, and the shared name made that easy to miss: a caller
+// writing the portable check got false and concluded the failure was something
+// other than "this platform has no SCTP". Comparing with == still works, since
+// this is the same sentinel value; only its Is behaviour changed.
+var ErrUnsupported = fmt.Errorf("SCTP is unsupported on %s/%s: %w",
+	runtime.GOOS, runtime.GOARCH, errors.ErrUnsupported)
 
 func setsockopt(fd int, optname, optval, optlen uintptr) (uintptr, uintptr, error) {
 	return 0, 0, ErrUnsupported

@@ -120,11 +120,17 @@ func pollWait(fd int, events int16, timeout time.Duration) (int16, error) {
 const (
 	// rawWaitSlice bounds a single ppoll so a concurrent Close is noticed.
 	// Linux does not wake a task parked in poll when another thread closes the
-	// descriptor it is waiting on, and closeSctpSocket reaches its close about a
-	// millisecond after Close swaps _fd to -1 — the measurement is recorded at
-	// closeSctpSocket. Waking on this cadence lets a waiter re-read the
-	// descriptor, see -1, and return, instead of parking until its deadline on a
+	// descriptor it is waiting on, and closeSctpSocket holds the descriptor from
+	// the moment Close swaps _fd to -1 until its shutdown wait finishes — a round
+	// trip against a peer that answers, up to the caller's timeout against one
+	// that does not. Waking on this cadence lets a waiter re-read the descriptor,
+	// see -1, and return, instead of parking until its own deadline on a
 	// descriptor that no longer belongs to this association.
+	//
+	// The graceful path has a second wakeup that does not depend on this at all:
+	// closeSctpSocket calls shutdown(SHUT_RDWR) first, which wakes anything
+	// parked on the descriptor. Abort does not, which is why the cadence is what
+	// TestSyscallConnAbortUnblocksWait pins and the graceful close does not.
 	rawWaitSlice = 50 * time.Millisecond
 
 	// rawSpinTolerance is how many consecutive ready-but-not-done rounds are
@@ -260,6 +266,23 @@ func (r rawConn) Write(f func(fd uintptr) (done bool)) error {
 // close; it does not remove it. A caller closing a connection while another
 // goroutine is inside Read, Write or Control is responsible for that ordering,
 // exactly as it is today for SCTPRead and SCTPWrite.
+//
+// Nor is there any mutual exclusion against the package's own IO, where
+// internal/poll's RawRead and RawWrite take the same locks FD.Read and FD.Write
+// take. What that costs was measured rather than assumed: 300 messages of 8000
+// bytes read through a 2000-byte buffer, with two readers racing.
+//
+//	one reader                        0 messages split
+//	two SCTPRead readers             61 messages split
+//	SCTPRead + a RawConn reader      64 messages split
+//
+// No run lost, duplicated or corrupted anything — the kernel holds lock_sock
+// across the dequeue and the requeue of the remainder, so each recvmsg is atomic
+// against the other. What concurrent readers do is divide one message's
+// fragments between them, and a RawConn-driven reader is not distinguishable
+// from a second SCTPRead. So this adds no hazard that reading concurrently did
+// not already have, and a lock here would not fix the case that actually bites:
+// two goroutines calling SCTPRead. One reader per association, as before.
 type connRawConn struct {
 	c *SCTPConn
 }
@@ -362,10 +385,24 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 // full or queues nothing, so a refused send leaves nothing behind to resume
 // from; resuming at an offset would split one application message into two on
 // the wire.
+// sendFlags is what both send paths pass to sendmsg.
+//
+// MSG_NOSIGNAL suppresses the SIGPIPE the kernel otherwise raises when a send
+// finds the association gone; the errno is EPIPE either way, which is what a
+// caller can actually act on. Both halves were measured: without the flag the
+// signal is delivered and the send returns EPIPE, with it the signal is not
+// delivered and the send still returns EPIPE.
+//
+// It matters more since sends grew a retry loop. Go's runtime ignores SIGPIPE
+// for descriptors other than 1 and 2, so the default behaviour was survivable,
+// but a caller that had asked for it with signal.Notify would see one spurious
+// signal per refused send rather than one per write.
+const sendFlags = syscall.MSG_DONTWAIT | syscall.MSG_NOSIGNAL
+
 func (c *SCTPConn) sendmsg(b, cbuf []byte) (int, error) {
 	deadline := atomic.LoadInt64(&c.writeDeadline)
 	if deadline == 0 {
-		return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+		return syscall.SendmsgN(c.fd(), b, cbuf, nil, sendFlags)
 	}
 
 	w := readyWaiter{c: c, events: pollOut}
@@ -375,8 +412,12 @@ func (c *SCTPConn) sendmsg(b, cbuf []byte) (int, error) {
 		if time.Until(time.Unix(0, deadline)) <= 0 {
 			return 0, os.ErrDeadlineExceeded
 		}
-		n, err := syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+		n, err := syscall.SendmsgN(c.fd(), b, cbuf, nil, sendFlags)
 		if !errors.Is(err, syscall.EAGAIN) {
+			// EAGAIN is the only condition worth retrying, and it is the only
+			// one a full send buffer produces. A send on an association that is
+			// still connecting reports EPROTO or EPIPE, not EAGAIN, so this
+			// loop cannot spin against a handshake in progress — measured.
 			return n, err
 		}
 		if err := w.wait(deadline); err != nil {
@@ -840,53 +881,39 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		return abortSctpSocket(fd)
 	}
 
-	// Wait for the shutdown handshake to finish. The outcome says which of the
-	// two closes below is correct, so it is not discarded:
+	// Wait for the shutdown handshake to finish, by watching the association
+	// itself rather than by reading from the socket.
 	//
-	//	n == 0, err == nil  the peer completed the handshake and the read hit
-	//	                    end of stream
-	//	ECONNRESET          the peer aborted rather than answering
-	//	EAGAIN              the timeout expired with no answer at all
+	// A read cannot answer this question. shutdown(SHUT_RDWR) sets RCV_SHUTDOWN
+	// on the socket before the SCTP layer sees it, and sctp_skb_recv_datagram
+	// tests RCV_SHUTDOWN — returning end of stream — before both the EAGAIN path
+	// and the SO_RCVTIMEO wait. So the read that used to be here returned
+	// (0, nil) the instant the receive queue was empty, whatever the peer had
+	// done. Three consequences, all measured:
 	//
-	// The timeout is what bounds this read, so if it cannot be programmed the
-	// read would block indefinitely. Abort rather than risk that.
-	tv := syscall.NsecToTimeval(timeout.Nanoseconds())
-	if err := syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO,
-		&tv); err != nil {
-		return abortSctpSocket(fd)
-	}
-	// This read is what distinguishes a completed shutdown from a peer that
-	// never answered, so an interrupted call must be retried rather than
-	// mistaken for the latter. Left unretried, a signal arriving here turns a
-	// graceful close into an ABORT via the linger=0 path below, and the peer
-	// sees ECONNRESET instead of the end of the stream — with no error
-	// reported on either side.
+	//   - "the peer completed the handshake" was true for every peer that had
+	//     simply gone silent, which is the one case the wait exists for.
+	//   - the EAGAIN outcome the old comment documented was unreachable.
+	//   - SO_RCVTIMEO never bound anything, so timeout was inert:
+	//     CloseWithTimeout(1ms) and CloseWithTimeout(1h) were the same call.
 	//
-	// The loop is bounded by SO_RCVTIMEO, programmed above — the early return
-	// on a failed setsockopt is what guarantees one is in force.
+	// The visible cost was a silent one. Against a peer that had vanished, Close
+	// decided the handshake had completed, skipped the ABORT, and left the
+	// association and its bound port in the kernel until the retransmissions
+	// gave up — up to 5 x RTO.max, 300s at defaults. That is precisely the
+	// EADDRINUSE window this function's own doc claims to prevent.
 	//
-	// The bound is loose in principle: on a socket that simply has no data,
-	// the kernel restarts much of the remaining timeout after each
-	// interruption, and a direct probe measured 7351 retries over 15.9s
-	// against a 1s timeout. It does not bite here, because this read follows
-	// the shutdown above — the association is no longer able to receive, so
-	// the read returns ENOTCONN or end-of-stream on its first call rather than
-	// blocking. Measured through Close: one iteration, about a millisecond.
+	// SCTP_STATUS is the query that survives the shutdown: sctp_id2assoc admits
+	// SCTP_SS_CLOSING as well as SCTP_SS_ESTABLISHED, so it keeps resolving the
+	// association across the handshake and only fails once the association is
+	// freed. Measured: still answering SHUTDOWN_PENDING 3s after the shutdown
+	// for a stalled peer; EINVAL 1.9us after it for one that answers.
 	//
-	// Recorded because the reasoning matters if this read ever moves ahead of
-	// the shutdown: it would then be genuinely unbounded from the caller's
-	// point of view, and would need the deadline tracked across retries the
-	// way SCTPReadFlags does it.
-	var buf [1]byte
-	var n int
-	var rerr error
-	for {
-		n, rerr = syscall.Read(fd, buf[:])
-		if !errors.Is(rerr, syscall.EINTR) {
-			break
-		}
-	}
-	completed := n == 0 && rerr == nil
+	// This is a real wait where the old one was not, so a graceful close now
+	// costs about a round trip instead of returning immediately with the wrong
+	// answer. It is bounded by the caller's timeout, which now means what it
+	// says.
+	completed := waitAssocGone(fd, timeout)
 
 	if completed {
 		// The association is already shut down, so there is nothing for
@@ -909,6 +936,53 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 		return err
 	}
 	return syscall.Close(fd)
+}
+
+const (
+	// shutdownPollMin and shutdownPollMax bound the backoff waitAssocGone uses.
+	// It starts short because the common case — a peer on the same host that
+	// answers at once — completes in microseconds, and grows so that waiting out
+	// a peer that never answers costs a handful of syscalls rather than
+	// thousands.
+	shutdownPollMin = 200 * time.Microsecond
+	shutdownPollMax = 20 * time.Millisecond
+)
+
+// assocGone reports whether the association behind fd has been freed.
+//
+// The zero AssocID is correct for a one-to-one socket: sctp_id2assoc resolves
+// the socket's single association and ignores the identifier.
+func assocGone(fd int) bool {
+	status := &Status{}
+	optlen := unsafe.Sizeof(*status)
+	_, _, err := getsockopt(fd, SCTP_STATUS,
+		uintptr(unsafe.Pointer(status)), uintptr(unsafe.Pointer(&optlen)))
+	return err != nil
+}
+
+// waitAssocGone waits up to timeout for the shutdown handshake to finish,
+// reporting whether it did.
+//
+// False means the association was still there when the budget ran out, which is
+// what tells closeSctpSocket to abort rather than leave it lingering.
+func waitAssocGone(fd int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for delay := shutdownPollMin; ; {
+		if assocGone(fd) {
+			return true
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return false
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+		time.Sleep(delay)
+		if delay < shutdownPollMax {
+			delay *= 2
+		}
+	}
 }
 
 // abortSctpSocket terminates the association immediately and releases fd.
@@ -1004,9 +1078,10 @@ func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, contr
 	if laddr != nil {
 		// If IP address and/or port was not provided so far, let's use the unspecified IPv4 or IPv6 address
 		if len(laddr.IPAddrs) == 0 {
-			if af == syscall.AF_INET {
+			switch af {
+			case syscall.AF_INET:
 				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
-			} else if af == syscall.AF_INET6 {
+			case syscall.AF_INET6:
 				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
 			}
 		}
@@ -1068,8 +1143,31 @@ func (ln *SCTPListener) AcceptSCTP() (*SCTPConn, error) {
 		return nil, syscall.EBADF
 	}
 	for {
+		// accept4 honours SO_RCVTIMEO — sctp_accept takes its wait budget from
+		// sock_rcvtimeo — so the deadline is programmed the same way the read
+		// path programs its own, from the absolute time, immediately before the
+		// call. Reprogramming on each iteration means an interrupted accept
+		// cannot extend its own budget.
+		deadline := atomic.LoadInt64(&ln.acceptDeadline)
+		if deadline != 0 || atomic.LoadInt32(&ln.rcvTimeoSet) != 0 {
+			if err := applyTimeout(lnfd, syscall.SO_RCVTIMEO, deadline); err == os.ErrDeadlineExceeded {
+				return nil, err
+			}
+			if deadline != 0 {
+				atomic.StoreInt32(&ln.rcvTimeoSet, 1)
+			} else {
+				atomic.StoreInt32(&ln.rcvTimeoSet, 0)
+			}
+		}
 		fd, _, err := syscall.Accept4(lnfd, 0)
 		if err != nil {
+			// A timed-out accept surfaces as EAGAIN, which is the same errno a
+			// non-blocking accept would give. Only a programmed deadline can
+			// produce it here, since this descriptor is blocking.
+			if deadline != 0 && (errors.Is(err, syscall.EAGAIN) ||
+				errors.Is(err, syscall.EWOULDBLOCK)) {
+				return nil, os.ErrDeadlineExceeded
+			}
 			// As in SCTPReadFlags: a signal arriving while accept4 is blocked
 			// interrupts it, and a server spends most of its life blocked
 			// here. Reporting EINTR would look like an accept failure and a
@@ -1107,9 +1205,20 @@ func (ln *SCTPListener) Close() error {
 	if fd < 0 {
 		return syscall.EBADF
 	}
-	// Shutdown unblocks any Accept parked on this socket. It is expected to
-	// fail on a listening socket that never connected (ENOTCONN), so its
-	// result is not treated as a close failure.
+	// Shutdown unblocks any Accept parked on this socket, and on a listening
+	// SCTP socket it succeeds rather than failing: inet_shutdown routes a
+	// listening socket through its TCP_LISTEN branch to sk_prot->disconnect,
+	// and sctp_disconnect sets RCV_SHUTDOWN and returns 0 for a one-to-one
+	// socket — every socket this package creates is SOCK_STREAM. RCV_SHUTDOWN
+	// is one of the conditions sctp_wait_for_accept breaks on, and
+	// inet_shutdown's trailing sk_state_change wakes the waiter to re-check it,
+	// so the parked accept returns EINVAL. Measured at 135us.
+	//
+	// The result is still ignored, because a descriptor that was never
+	// listening reports ENOTCONN or EOPNOTSUPP here and neither is a close
+	// failure. The previous version of this comment gave ENOTCONN as the
+	// expected outcome, which is the errno for a socket that is not listening
+	// at all rather than for this path.
 	_ = syscall.Shutdown(int(fd), syscall.SHUT_RDWR)
 	return syscall.Close(int(fd))
 }
@@ -1170,9 +1279,10 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 	if laddr != nil {
 		// If IP address and/or port was not provided so far, let's use the unspecified IPv4 or IPv6 address
 		if len(laddr.IPAddrs) == 0 {
-			if af == syscall.AF_INET {
+			switch af {
+			case syscall.AF_INET:
 				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
-			} else if af == syscall.AF_INET6 {
+			case syscall.AF_INET6:
 				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
 			}
 		}

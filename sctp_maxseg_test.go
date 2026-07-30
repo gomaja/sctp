@@ -19,6 +19,7 @@
 package sctp
 
 import (
+	"strconv"
 	"testing"
 	"unsafe"
 )
@@ -77,8 +78,19 @@ func TestMaxSegSizeRejectsOutOfRange(t *testing.T) {
 	if err := client.SetMaxSegSize(-1); err == nil {
 		t.Error("SetMaxSegSize(-1) returned nil error")
 	}
-	if err := client.SetMaxSegSize(1 << 33); err == nil {
-		t.Error("SetMaxSegSize(1<<33) returned nil error")
+	// The upper bound SetMaxSegSize enforces is uint32's ceiling, which cannot
+	// be represented in an int where int is 32 bits — the constant 1<<33 does
+	// not compile there, which is what used to break `GOOS=linux GOARCH=arm go
+	// vet`. The conversion is done at run time and guarded, so the case is
+	// exercised wherever it is expressible and skipped where it is not.
+	if strconv.IntSize == 64 {
+		// Held in a variable so the conversion happens at run time. As a
+		// constant expression int(int64(1)<<33) still overflows at compile
+		// time on a 32-bit target, guard or no guard.
+		var big int64 = 1 << 33
+		if err := client.SetMaxSegSize(int(big)); err == nil {
+			t.Error("SetMaxSegSize(1<<33) returned nil error")
+		}
 	}
 	// Zero is legal: it restores the default.
 	if err := client.SetMaxSegSize(0); err != nil {

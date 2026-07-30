@@ -26,11 +26,11 @@ import (
 )
 
 type outcome struct {
-	name          string
-	wantNotify    bool
-	gotNotify     bool
-	notifyType    uint16
-	err           error
+	name       string
+	wantNotify bool
+	gotNotify  bool
+	notifyType uint16
+	err        error
 }
 
 // pair brings up one association and returns both ends.
