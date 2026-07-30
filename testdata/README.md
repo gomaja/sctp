@@ -355,13 +355,129 @@ loopback — so `TestAddStreams` asserts the new stream count rather than only t
 absence of an error, and covers the `ENOPROTOOPT` path too so the two cannot be
 confused again.
 
+## The variable-length options, and a third precondition mistake
+
+`SCTP_RESET_STREAMS` and the `SCTP_AUTH_*` key setters were both recorded as
+blocked. Both were usable. `optprobe/varlen.c` is what settled it, and in both
+cases the earlier attempt had got a precondition wrong rather than found a
+limitation — the third time in this package that a missing precondition was
+mistaken for a missing feature.
+
+`SCTP_RESET_STREAMS` had **two** things wrong with the earlier attempt:
+
+```
+=== extension NOT negotiated ===
+  all streams, bare struct                len= 8 -> Protocol not available
+=== extension negotiated on both ends ===
+  all streams, bare struct                len= 8 -> ok
+  one stream, struct + its list entry     len=10 -> ok
+  one stream, length excludes the list    len= 8 -> Invalid argument   <--
+  flags INCOMING only                            -> ok
+  flags OUTGOING only                            -> ok
+  flags no flags                                 -> Invalid argument
+```
+
+The option length has to **cover the stream list**, not just the fixed header —
+that is the EINVAL that looked like a refusal. And at least one direction flag is
+required. `ResetStreams` takes a slice and computes the length from it, which is
+why it does not expose the raw struct.
+
+The AUTH family is fully usable once `net.sctp.auth_enable` is 1:
+
+```
+  key 1, 8 bytes, exact length            len= 16 -> ok
+  keylength 200 but only 8 bytes present  len= 16 -> Invalid argument
+  zero-length key (deactivates?)          len=  8 -> Invalid argument
+  largest accepted key length = 8192
+  DEACTIVATE_KEY(1) -> ok
+  DELETE_KEY(1) after deactivate -> ok
+  HMAC_IDENT set [SHA1] -> ok
+  HMAC_IDENT set [2, unassigned] -> Operation not supported
+```
+
+The kernel validates `sca_keylength` against the option size, so a mismatch
+cannot make it read past the buffer — worth knowing, because that check is what
+the Go binding relies on. A zero-length key is refused rather than treated as a
+deletion, which is a plausible thing for a caller to assume, so `SetAuthKey`
+rejects it with a message naming `DeleteAuthKey`. Unassigned HMAC identifier 2 is
+refused by the kernel, so `SetHmacIdent` needs no Go-side guard.
+
+The active key cannot be deleted, which forces the rollover order: select a new
+active key, deactivate the old one, then delete it. `TestAuthKeyManagement` walks
+that sequence rather than testing each call in isolation.
+
+### Byte-level tests for the hand-built buffers
+
+Three of these accessors assemble their option as bytes, because the C structs end
+in flexible arrays and a Go struct with a slice field would not be contiguous.
+That puts them outside what `TestStructLayoutsMatchKernel` can pin, and one
+mutation showed why a behavioural test is not enough:
+
+**Writing the `sctp_hmacalgo` count as a `uint16` instead of a `uint32` survives
+every socket-level test on amd64.** The buffer is zeroed by `make`, so the two
+following bytes are already 0 and the `uint32` reads back correctly on a
+little-endian host. On big-endian the count lands in the wrong half. No test
+running on this kernel can catch it through behaviour.
+
+So `buildResetStreams`, `buildAuthKey` and `buildHmacAlgo` are separate functions
+asserted byte by byte against the offsets `offsetof()` reports:
+
+```
+sctp_reset_streams  size=8  assoc@0 flags@4 nstreams@6 list@8
+sctp_authkey        size=8  assoc@0 keynum@4 keylen@6   key@8
+sctp_hmacalgo       size=4  num@0 (u32)     idents@4
+```
+
+The flags/count pair in `sctp_reset_streams` and the keynumber/keylength pair in
+`sctp_authkey` are adjacent `uint16`s in both cases, so a transposition produces a
+buffer the kernel may still accept while doing the wrong thing.
+
+## The send path: SCTP_SNDINFO
+
+`SCTPWriteInfo` is the send-side counterpart to the `SCTP_RCVINFO` support on the
+read path, emitting the `SCTP_SNDINFO` that RFC 6458 §5.3.2 directs callers to
+instead of the "DEPRECATED" `SCTP_SNDRCV`. It optionally attaches `SCTP_PRINFO`
+(per-message partial reliability) and `SCTP_AUTHINFO` (per-message key).
+
+`SCTPWrite` is deliberately **unchanged** and still emits `SCTP_SNDRCV`, because
+switching it would change the bytes on every existing caller's socket. The two
+interoperate freely — the kernel accepts either, and even both in one `sendmsg`:
+
+```
+  sendmsg with SCTP_SNDINFO    -> ok
+  sendmsg with SNDINFO+PRINFO  -> ok
+  sendmsg with SNDRCV+SNDINFO  -> ACCEPTED
+```
+
+`TestSCTPWriteInfoInteropWithSCTPWrite` sends both ways on one association so a
+caller can migrate one call site at a time.
+
+Two details that are easy to get wrong:
+
+**`struct sctp_prinfo` is 8 bytes, not 6.** A `__u16` followed by a `__u32` puts
+the value at offset 4. Unlike the pads in `DefaultPrInfo` and `AuthKeyID` — which
+Go's alignment would produce anyway — this one is load-bearing: without it Go
+places `Value` at offset 2 and the policy value is read from the wrong place.
+
+**The inter-cmsg alignment padding is observable in exactly one case.**
+`CmsgSpace` equals `CmsgLen` for a 16-byte `SndInfo` and an 8-byte `PrInfo`, so a
+send using only those passes whether or not the padding is emitted:
+
+```
+SndInfo  data=16 CmsgLen=32 CmsgSpace=32 pad=0
+PrInfo   data= 8 CmsgLen=24 CmsgSpace=24 pad=0
+AuthInfo data= 2 CmsgLen=18 CmsgSpace=24 pad=6
+```
+
+Only `AuthInfo` needs padding, and padding is only ever read when another control
+message follows. That is why `SCTPWriteInfo` emits `AUTHINFO` **first** rather
+than last: ordering it last would leave the padding logic permanently untestable
+through the public API. The kernel does not care about the order.
+`TestCmsgPaddingIsObservable` fails loudly if a platform ever made every size
+self-aligning, so the padding test cannot quietly become vacuous.
+
 Not bound, with reasons: `SCTP_GET_ASSOC_NUMBER` and `SCTP_GET_ASSOC_ID_LIST`
-return EOPNOTSUPP on the one-to-one sockets this package creates;
-`SCTP_RESET_STREAMS` takes a variable-length stream list and returned EINVAL for
-every fixed-size form tried, so it needs its own investigation;
-`SCTP_AUTH_KEY`/`SCTP_AUTH_CHUNK`/`SCTP_AUTH_DELETE_KEY`/
-`SCTP_AUTH_DEACTIVATE_KEY` take variable-length keys and are set-only, so they
-want an API design rather than an accessor pair.
+return EOPNOTSUPP on the one-to-one sockets this package creates.
 
 ## Address decoding
 
