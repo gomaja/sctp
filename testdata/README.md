@@ -229,10 +229,139 @@ following it — so the conversion copies fields rather than reinterpreting memo
 and `TestRcvInfoAndSndRcvBothParsed` anchors `Context` against a known
 `SetContext` value to catch a mapping slip that `Stream`/`PPID` alone would miss.
 
-Options present in RFC 6458 §8 but still not bound: `SCTP_DEFAULT_SNDINFO`,
-`SCTP_AUTO_ASCONF`, `SCTP_DEFAULT_PRINFO`, and the RFC 4895 `SCTP_AUTH_*`
-family. The `SCTP_GET_ASSOC_*` options apply to one-to-many sockets, which this
-package does not create.
+## Extension options: PR-SCTP, stream reconfiguration, SCTP-PF, AUTH
+
+The sweep that closed out the RFC 6458 §8 list was done by diffing every
+`#define SCTP_*` in `linux/sctp.h` against the constants referenced in the
+package, rather than working from the RFC's own table — which is how the
+RFC 7496, RFC 6525 and RFC 7829 families turned up at all. They are not in
+RFC 6458.
+
+`optprobe/` is the C program that measured each option before any Go was
+written, and it earned its keep: **five of the results contradict what the
+relevant RFC or the kernel header implies.**
+
+```sh
+docker run --rm --privileged -v "$PWD":/src -w /src sctp-test bash -c '
+  modprobe sctp; gcc -O0 -o /tmp/optprobe testdata/optprobe/main.c && /tmp/optprobe
+  gcc -O0 -o /tmp/shapes   testdata/optprobe/shapes.c   && /tmp/shapes
+  gcc -O0 -o /tmp/reconfig testdata/optprobe/reconfig.c && /tmp/reconfig'
+```
+
+| Option | Expected from the spec/header | Linux does |
+|---|---|---|
+| `SCTP_PR_SUPPORTED` | on/off int (RFC 7496 §4.5) | **rejects a plain int with EINVAL**; needs `struct sctp_assoc_value`, which the header does not declare for it |
+| `SCTP_RECONFIG_SUPPORTED` | on/off int (RFC 6525 §6.1) | same — `sctp_assoc_value` only |
+| `SCTP_ENABLE_STREAM_RESET` | on/off mask (RFC 6525 §6.3) | same — `sctp_assoc_value` only |
+| `SCTP_AUTO_ASCONF` | endpoint-level flag | **requires a bound socket**; EINVAL on a fresh one, the opposite of `SCTP_REUSE_PORT` |
+| `SCTP_AUTH_*` | absent ⇒ unsupported | **EACCES**, not EOPNOTSUPP — the family is gated by `net.sctp.auth_enable`, which is `0` on a stock kernel |
+
+**The two "supported" flags behave differently, and the reason is a sysctl.**
+Both are negotiated in the INIT, but `net.sctp.prsctp_enable` defaults to `1`
+while `net.sctp.reconf_enable` defaults to `0`. So:
+
+```
+=== SCTP_PR_SUPPORTED ===          === SCTP_RECONFIG_SUPPORTED ===
+listener=0 client=0 : cli=1 srv=1  listener=0 client=0 : cli=0 srv=0
+listener=0 client=1 : cli=1 srv=1  listener=0 client=1 : cli=0 srv=0
+listener=1 client=0 : cli=1 srv=1  listener=1 client=0 : cli=0 srv=0
+listener=1 client=1 : cli=1 srv=1  listener=1 client=1 : cli=1 srv=1
+```
+
+`PrSupported` therefore reports `true` on an association where *neither* end
+touched the option — a caller must not read it as "the peer asked for partial
+reliability". The one direction that does have an effect is the opt-out:
+disabling on either end suppresses the extension for both, which is what
+`TestPrSupportedFollowsSysctl` pins, and is the only observable difference
+between a working `SetPrSupported` and one that ignores its argument.
+
+`SCTP_RECONFIG_SUPPORTED` has the trap: a post-connect `set` **returns success
+and changes nothing**, because the extension can only be negotiated in the INIT.
+`reconfig.c` separates that from the alternative explanations by running all
+three enable combinations; `ReconfigSupported`'s doc comment says so, and
+`TestReconfigSupportedNegotiates` covers all three.
+
+**`SCTP_PEER_AUTH_CHUNKS` reports EINVAL regardless of `auth_enable`**, while
+every sibling option tracks the sysctl. The association check runs first:
+
+```
+--- auth_enable=0 ---                --- auth_enable=1 ---
+PEER_AUTH_CHUNKS:  Invalid argument  PEER_AUTH_CHUNKS:  Invalid argument
+LOCAL_AUTH_CHUNKS: Permission denied LOCAL_AUTH_CHUNKS: ok
+HMAC_IDENT:        Permission denied HMAC_IDENT:        ok
+```
+
+So the errno from that one option cannot be used to tell whether AUTH is
+available. `TestAuthEnabledRoundTrip` skips unless the sysctl is on rather than
+setting it — a global change is not a test's business:
+
+```sh
+echo 1 > /proc/sys/net/sctp/auth_enable
+```
+
+**Two structs need explicit padding that C gets from alignment.**
+`sctp_paddrthlds` and `sctp_assoc_stats` embed a `sockaddr_storage`, which
+contains a `long` and so aligns to 8 — putting the address at offset **8, not
+4**, and rounding `sctp_paddrthlds` up from 140 to 144. A Go struct declared
+field-for-field is silently wrong on both counts: every field after the
+association id shifts by four and the option length comes up short.
+
+`sctp_paddrinfo` is the counterexample that makes this easy to get wrong — it is
+declared `__attribute__((packed, aligned(4)))`, so *its* address really is at
+offset 4. Same shape, different answer; the offsets have to be measured per
+struct:
+
+```
+sctp_paddrthlds  size=144 assoc@0 address@8  pathmaxrxt@136 pathpfthld@138
+sctp_assoc_stats size=256 assoc@0 obs_rto@8  maxrto@136     isacks@144
+sctp_paddrinfo   size=152 assoc@0 address@4  state@132      cwnd@136
+sctp_sndinfo     size=16  sid@0 flags@2 ppid@4 context@8 assoc@12
+sctp_default_prinfo size=12  sctp_prstatus size=24  sctp_authkeyid size=8
+```
+
+`sctp_authkeyid` is 6 bytes as declared but the kernel wants 8; Go's own
+alignment already produces 8, so the explicit pad there documents the C layout
+rather than causing the size. Same for `sctp_default_prinfo`. That is why
+mutations removing those two pads survive — verified by measuring `unsafe.Sizeof`
+both ways, not assumed.
+
+**Where the kernel validates and where it does not** is inconsistent enough that
+each option had to be checked, since it decides whether a Go-side guard is
+needed:
+
+| Option | Bad input | Result |
+|---|---|---|
+| `SCTP_DEFAULT_PRINFO` | policy `0x40` | EINVAL — kernel validates, so no Go guard |
+| `SCTP_DEFAULT_SNDINFO` | 12-byte option | EINVAL — so `SndInfo`'s size must be exact |
+| `SCTP_ENABLE_STREAM_RESET` | undefined mask bit | silently masked away — **Go guard added** |
+| `SCTP_FRAGMENT_INTERLEAVE` | level 3 | silently accepted — Go guard (above) |
+| `SCTP_AUTH_KEY` | `keylength` past the buffer | EINVAL — no over-read |
+
+**`SCTP_ADD_STREAMS` was nearly written off on a probe artefact.** The first run
+reported `ENOPROTOOPT`, which reads as "option not supported", and the option was
+about to be documented as unusable. The probe had set `SCTP_RECONFIG_SUPPORTED`
+*after* connect, so the extension was never negotiated. Setting it on both ends
+before connect, with `SCTPEnableChangeAssocReq` in the mask:
+
+```
+reconfig negotiated cli=1
+stream reset mask cli=0x7
+ADD_STREAMS: ok
+streams in/out before 10/10, after 12/12
+```
+
+It works, and the widened count is readable straight after the call over
+loopback — so `TestAddStreams` asserts the new stream count rather than only the
+absence of an error, and covers the `ENOPROTOOPT` path too so the two cannot be
+confused again.
+
+Not bound, with reasons: `SCTP_GET_ASSOC_NUMBER` and `SCTP_GET_ASSOC_ID_LIST`
+return EOPNOTSUPP on the one-to-one sockets this package creates;
+`SCTP_RESET_STREAMS` takes a variable-length stream list and returned EINVAL for
+every fixed-size form tried, so it needs its own investigation;
+`SCTP_AUTH_KEY`/`SCTP_AUTH_CHUNK`/`SCTP_AUTH_DELETE_KEY`/
+`SCTP_AUTH_DEACTIVATE_KEY` take variable-length keys and are set-only, so they
+want an API design rather than an accessor pair.
 
 ## Address decoding
 
