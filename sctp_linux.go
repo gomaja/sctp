@@ -92,20 +92,7 @@ func (c *SCTPConn) SyscallConn() (syscall.RawConn, error) {
 func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 	var cbuf []byte
 	if info != nil {
-		// Fix PPID to network byte order
-		oldPPID := info.PPID
-		info.PPID = htonl(info.PPID)
-		cmsgBuf := toBuf(info)
-		info.PPID = oldPPID
-		hdr := &syscall.Cmsghdr{
-			Level: syscall.IPPROTO_SCTP,
-			Type:  SCTP_CMSG_SNDRCV,
-		}
-
-		// bitwidth of hdr.Len is platform-specific,
-		// so we use hdr.SetLen() rather than directly setting hdr.Len
-		hdr.SetLen(syscall.CmsgSpace(len(cmsgBuf)))
-		cbuf = append(toBuf(hdr), cmsgBuf...)
+		cbuf = buildSndRcvCmsg(info)
 	}
 	// Writes use MSG_DONTWAIT and so never block; SO_SNDTIMEO would have no
 	// effect on them. Enforce the write deadline directly instead, so a
@@ -116,6 +103,66 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 		}
 	}
 	return syscall.SendmsgN(c.fd(), b, cbuf, nil, syscall.MSG_DONTWAIT)
+}
+
+// buildSndRcvCmsg lays out the SCTP_SNDRCV control message for one send.
+//
+// This replaces two toBuf calls and an append. toBuf goes through
+// binary.Write, which reflects over the struct and writes into a bytes.Buffer —
+// four allocations per call, so eight per message plus the append's copy. The
+// layout is fixed and TestStructLayoutsMatchKernel pins it, so writing the bytes
+// directly is equivalent and needs one allocation.
+//
+// It also fixes a latent data race. The previous version byte-swapped
+// info.PPID in place, wrote the struct, then swapped it back:
+//
+//	oldPPID := info.PPID
+//	info.PPID = htonl(info.PPID)
+//	cmsgBuf := toBuf(info)
+//	info.PPID = oldPPID
+//
+// Two goroutines sharing one *SndRcvInfo — which callers do, since it is
+// otherwise read-only — could observe the swapped value or lose the restore.
+// Nothing here mutates the caller's struct.
+func buildSndRcvCmsg(info *SndRcvInfo) []byte {
+	// Derived from the struct rather than written as a literal, so a field added
+	// to SndRcvInfo cannot leave this sending a short message.
+	//
+	// No test distinguishes this from a hardcoded 32 today, and that was
+	// measured rather than assumed: CmsgSpace rounds to a 16-byte boundary, so
+	// CmsgSpace(28) and CmsgSpace(32) are both 48 and every plausible wrong
+	// constant produces an identical buffer. The derivation is defence against a
+	// future change, not a fix for a present bug.
+	dataLen := int(unsafe.Sizeof(SndRcvInfo{}))
+	// CmsgLen(0) is the header size. CmsgSpace(0) is the same 16 bytes here, so
+	// the two are interchangeable on this platform; CmsgLen is used because it is
+	// the one that means "header only" rather than "header plus alignment".
+	hdrLen := syscall.CmsgLen(0)
+	buf := make([]byte, syscall.CmsgSpace(dataLen))
+
+	hdr := (*syscall.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	hdr.Level = syscall.IPPROTO_SCTP
+	hdr.Type = SCTP_CMSG_SNDRCV
+	// The bit width of Len is platform-specific, so SetLen is used rather than
+	// assigning it. Note this keeps the original code's CmsgSpace rather than
+	// CmsgLen: on this platform the two agree for a 32-byte payload, and
+	// changing it would alter the bytes on the wire for every existing caller.
+	hdr.SetLen(syscall.CmsgSpace(dataLen))
+
+	// Field offsets from struct sctp_sndrcvinfo. PPID goes to the wire in
+	// network byte order; every other field is host order.
+	d := buf[hdrLen:]
+	nativeEndian.PutUint16(d[0:2], info.Stream)
+	nativeEndian.PutUint16(d[2:4], info.SSN)
+	nativeEndian.PutUint16(d[4:6], info.Flags)
+	// d[6:8] is the pad after Flags.
+	nativeEndian.PutUint32(d[8:12], htonl(info.PPID))
+	nativeEndian.PutUint32(d[12:16], info.Context)
+	nativeEndian.PutUint32(d[16:20], info.TTL)
+	nativeEndian.PutUint32(d[20:24], info.TSN)
+	nativeEndian.PutUint32(d[24:28], info.CumTSN)
+	nativeEndian.PutUint32(d[28:32], uint32(info.AssocID))
+	return buf
 }
 
 // SCTPWriteInfo sends one message using the non-deprecated ancillary data types,
