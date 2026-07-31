@@ -505,3 +505,71 @@ func TestSendFlagsMatchTheKernel(t *testing.T) {
 		}
 	}
 }
+
+// TestUDPEncapsAndProbeIntervalLayout pins the last two option structs.
+//
+// Both put a sockaddr_storage after a 32-bit association id, which C aligns to
+// 8 — so there are four pad bytes Go would not insert, and the struct's own
+// 8-byte alignment rounds its size from 138 and 140 up to 144. Getting either
+// wrong means an undersized option length, which the kernel rejects outright.
+func TestUDPEncapsAndProbeIntervalLayout(t *testing.T) {
+	var e UDPEncaps
+	if got := unsafe.Sizeof(e); got != 144 {
+		t.Errorf("sizeof(UDPEncaps) = %d, kernel's sctp_udpencaps is 144", got)
+	}
+	if got := unsafe.Offsetof(e.Address); got != 8 {
+		t.Errorf("UDPEncaps.Address at %d, kernel has sue_address at 8", got)
+	}
+	if got := unsafe.Offsetof(e.Port); got != 136 {
+		t.Errorf("UDPEncaps.Port at %d, kernel has sue_port at 136", got)
+	}
+
+	var p ProbeInterval
+	if got := unsafe.Sizeof(p); got != 144 {
+		t.Errorf("sizeof(ProbeInterval) = %d, kernel's sctp_probeinterval is 144", got)
+	}
+	if got := unsafe.Offsetof(p.Address); got != 8 {
+		t.Errorf("ProbeInterval.Address at %d, kernel has spi_address at 8", got)
+	}
+	if got := unsafe.Offsetof(p.Interval); got != 136 {
+		t.Errorf("ProbeInterval.Interval at %d, kernel has spi_interval at 136", got)
+	}
+}
+
+// TestUDPEncapsAndProbeIntervalRoundTrip exercises both against a live socket.
+//
+// These are the last two kernel options that apply to the one-to-one sockets
+// this package creates and had no wrapper. RFC 6951 encapsulation is what lets
+// an association cross a middlebox that drops IP protocol 132, which is most
+// consumer NAT; RFC 8899 PLPMTUD is how a path finds its MTU without ICMP.
+func TestUDPEncapsAndProbeIntervalRoundTrip(t *testing.T) {
+	client, _ := eorPair(t)
+
+	t.Run("udp encapsulation port", func(t *testing.T) {
+		set := UDPEncaps{Port: 9899}
+		if err := client.SetRemoteUDPEncapsPort(&set); err != nil {
+			t.Skipf("SCTP_REMOTE_UDP_ENCAPS_PORT not usable here: %v", err)
+		}
+		got := UDPEncaps{}
+		if err := client.GetRemoteUDPEncapsPort(&got); err != nil {
+			t.Fatalf("GetRemoteUDPEncapsPort: %v", err)
+		}
+		if got.Port != set.Port {
+			t.Errorf("encapsulation port = %d, want %d", got.Port, set.Port)
+		}
+	})
+
+	t.Run("plpmtud probe interval", func(t *testing.T) {
+		set := ProbeInterval{Interval: 5000}
+		if err := client.SetProbeInterval(&set); err != nil {
+			t.Skipf("SCTP_PLPMTUD_PROBE_INTERVAL not usable here: %v", err)
+		}
+		got := ProbeInterval{}
+		if err := client.GetProbeInterval(&got); err != nil {
+			t.Fatalf("GetProbeInterval: %v", err)
+		}
+		if got.Interval != set.Interval {
+			t.Errorf("probe interval = %d, want %d", got.Interval, set.Interval)
+		}
+	})
+}

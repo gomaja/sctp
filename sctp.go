@@ -255,7 +255,83 @@ const (
 	SCTP_EXPOSE_POTENTIALLY_FAILED_STATE = 131
 	// SCTP_EXPOSE_PF_STATE is the kernel's shorter spelling of the same option.
 	SCTP_EXPOSE_PF_STATE = SCTP_EXPOSE_POTENTIALLY_FAILED_STATE
+	// SCTP_REMOTE_UDP_ENCAPS_PORT sets the peer's UDP encapsulation port
+	// (RFC 6951, updated by RFC 9899).
+	SCTP_REMOTE_UDP_ENCAPS_PORT = 132
+	// SCTP_PLPMTUD_PROBE_INTERVAL sets the packetization-layer path MTU
+	// discovery probe interval (RFC 8899).
+	SCTP_PLPMTUD_PROBE_INTERVAL = 133
 )
+
+// UDPEncaps mirrors struct sctp_udpencaps (RFC 6951), naming the UDP port to
+// encapsulate SCTP in when talking to one peer address.
+//
+// This is what lets an association traverse a middlebox that drops IP protocol
+// 132 outright, which is most consumer NAT. It needs net.sctp.udp_port set for
+// the local side to receive; this option is the remote half.
+type UDPEncaps struct {
+	AssocID SCTPAssocID
+	// struct sockaddr_storage contains a long, so C aligns it to 8 and leaves
+	// four pad bytes here — the same trap as PeerAddrThlds.
+	_ uint32
+	// Address selects the peer address. A zeroed address applies to the
+	// association as a whole.
+	Address [128]byte
+	// Port is the peer's UDP port. Zero disables encapsulation.
+	Port uint16
+	// The struct's 8-byte alignment rounds its size from 138 up to 144. Go
+	// would stop short, and the kernel rejects an undersized option.
+	_ [6]byte
+}
+
+// SetRemoteUDPEncapsPort sets the UDP port SCTP is encapsulated in for a peer
+// address (SCTP_REMOTE_UDP_ENCAPS_PORT).
+func (c *SCTPConn) SetRemoteUDPEncapsPort(e *UDPEncaps) error {
+	_, _, err := setsockopt(c.fd(), SCTP_REMOTE_UDP_ENCAPS_PORT,
+		uintptr(unsafe.Pointer(e)), unsafe.Sizeof(*e))
+	return err
+}
+
+// GetRemoteUDPEncapsPort reads the peer's UDP encapsulation port. Set Address
+// on the value passed in to name a path.
+func (c *SCTPConn) GetRemoteUDPEncapsPort(e *UDPEncaps) error {
+	optlen := unsafe.Sizeof(*e)
+	_, _, err := getsockopt(c.fd(), SCTP_REMOTE_UDP_ENCAPS_PORT,
+		uintptr(unsafe.Pointer(e)), uintptr(unsafe.Pointer(&optlen)))
+	return err
+}
+
+// ProbeInterval mirrors struct sctp_probeinterval (RFC 8899), the
+// packetization-layer path MTU discovery probe period.
+//
+// PLPMTUD is how a path finds its MTU without relying on ICMP, which is widely
+// filtered. Zero disables it, which is the default.
+type ProbeInterval struct {
+	AssocID SCTPAssocID
+	_       uint32
+	// Address selects the path; a zeroed address applies to the association.
+	Address [128]byte
+	// Interval is the probe period in milliseconds. Zero turns PLPMTUD off.
+	Interval uint32
+	// Trailing padding, as in UDPEncaps.
+	_ uint32
+}
+
+// SetProbeInterval sets the PLPMTUD probe interval
+// (SCTP_PLPMTUD_PROBE_INTERVAL).
+func (c *SCTPConn) SetProbeInterval(p *ProbeInterval) error {
+	_, _, err := setsockopt(c.fd(), SCTP_PLPMTUD_PROBE_INTERVAL,
+		uintptr(unsafe.Pointer(p)), unsafe.Sizeof(*p))
+	return err
+}
+
+// GetProbeInterval reads the PLPMTUD probe interval.
+func (c *SCTPConn) GetProbeInterval(p *ProbeInterval) error {
+	optlen := unsafe.Sizeof(*p)
+	_, _, err := getsockopt(c.fd(), SCTP_PLPMTUD_PROBE_INTERVAL,
+		uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&optlen)))
+	return err
+}
 
 // Stream schedulers for SetStreamScheduler, from the kernel's
 // enum sctp_sched_type (RFC 8260 §4 describes the idea; the set Linux
