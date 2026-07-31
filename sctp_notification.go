@@ -243,10 +243,17 @@ const remoteErrorMinSize = 16
 // SendFailed is SCTP_SEND_FAILED (RFC 6458 6.1.4), reporting a message that
 // could not be delivered. The undelivered message is returned in Data.
 type SendFailed struct {
-	typ     uint16
-	flags   uint16
-	length  uint32
-	Error   uint32
+	typ    uint16
+	flags  uint16
+	length uint32
+	Error  uint32
+	// Info is the send parameters the failed message carried.
+	//
+	// Info.PPID is in network byte order, as the kernel delivered it. That is
+	// what SndRcvInfo.PPID documents, but it differs from what SCTPRead hands
+	// back for the same type: SCTPRead converts, and this does not. A caller
+	// comparing it against a locally held identifier needs ntohl, or the
+	// comparison silently never matches.
 	Info    SndRcvInfo
 	AssocID SCTPAssocID
 	// Data is the message that was not delivered.
@@ -428,7 +435,11 @@ type SendFailedEvent struct {
 	flags  uint16
 	length uint32
 	// Error is an RFC 9260 section 3.3.10 error cause; see ErrorCauseString.
-	Error   uint32
+	Error uint32
+	// Info is the send parameters the failed message carried. As with
+	// SendFailed.Info, Info.PPID is in network byte order — the kernel passes
+	// the identifier through untouched in both directions, and only SCTPRead
+	// converts. Compare it with ntohl.
 	Info    SndInfo
 	AssocID SCTPAssocID
 	// Data is the message that was not delivered.

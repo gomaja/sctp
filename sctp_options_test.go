@@ -226,7 +226,19 @@ func TestAuthSupportedDoesNotNeedTheSysctl(t *testing.T) {
 func TestExposePotentiallyFailedRoundTrips(t *testing.T) {
 	conn := unboundConn(t)
 
-	for _, level := range []uint32{SCTPPFStateExposed, SCTPPFStateHidden} {
+	// Pin the numbers, not just the round trip. The kernel enum is
+	// UNSET/DISABLE/ENABLE, so a constant block written as the more usual
+	// off/on/locked shape puts "exposed" on the value that disables it — and a
+	// round-trip test cannot tell, because the number written is the number
+	// read back. These are checked against
+	// include/net/sctp/constants.h SCTP_PF_EXPOSE_*.
+	if SCTPPFStateUnset != 0 || SCTPPFStateDisabled != 1 || SCTPPFStateEnabled != 2 {
+		t.Fatalf("PF exposure levels are unset=%d disabled=%d enabled=%d; the "+
+			"kernel enum is 0, 1, 2 in that order",
+			SCTPPFStateUnset, SCTPPFStateDisabled, SCTPPFStateEnabled)
+	}
+
+	for _, level := range []uint32{SCTPPFStateEnabled, SCTPPFStateDisabled} {
 		if err := conn.SetExposePotentiallyFailed(level); err != nil {
 			t.Fatalf("SetExposePotentiallyFailed(%d): %v", level, err)
 		}
@@ -442,4 +454,54 @@ func unboundConn(t *testing.T) *SCTPConn {
 	}
 	t.Cleanup(func() { _ = syscall.Close(fd) })
 	return NewSCTPConn(fd, nil)
+}
+
+// TestSendFlagsMatchTheKernel pins the per-message send flags.
+//
+// They were written as a contiguous iota block, which the kernel's are not:
+// bits 4 and 5 belong to SCTP_PR_SCTP_MASK, and SCTP_EOF is MSG_FIN rather
+// than a bit of its own. As the fifth iota, SCTP_EOF came out as 1<<4 — exactly
+// SCTP_PR_SCTP_TTL. A caller asking for a graceful shutdown on their last
+// message selected a partial reliability policy instead, and got neither the
+// shutdown nor an error.
+func TestSendFlagsMatchTheKernel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"SCTP_UNORDERED", SCTP_UNORDERED, 0x0001},
+		{"SCTP_ADDR_OVER", SCTP_ADDR_OVER, 0x0002},
+		{"SCTP_ABORT", SCTP_ABORT, 0x0004},
+		{"SCTP_SACK_IMMEDIATELY", SCTP_SACK_IMMEDIATELY, 0x0008},
+		{"SCTP_SENDALL", SCTP_SENDALL, 0x0040},
+		{"SCTP_PR_SCTP_ALL", SCTP_PR_SCTP_ALL, 0x0080},
+		{"SCTP_EOF (MSG_FIN)", SCTP_EOF, 0x0200},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %#x, kernel has %#x", tc.name, tc.got, tc.want)
+		}
+	}
+
+	// The specific collision that was there: bits 4 and 5 are the partial
+	// reliability policy, so nothing in this block may occupy them.
+	const prPolicyMask = 0x0030
+	for _, tc := range []struct {
+		name string
+		flag int
+	}{
+		{"SCTP_UNORDERED", SCTP_UNORDERED},
+		{"SCTP_ADDR_OVER", SCTP_ADDR_OVER},
+		{"SCTP_ABORT", SCTP_ABORT},
+		{"SCTP_SACK_IMMEDIATELY", SCTP_SACK_IMMEDIATELY},
+		{"SCTP_SENDALL", SCTP_SENDALL},
+		{"SCTP_PR_SCTP_ALL", SCTP_PR_SCTP_ALL},
+		{"SCTP_EOF", SCTP_EOF},
+	} {
+		if tc.flag&prPolicyMask != 0 {
+			t.Errorf("%s (%#x) overlaps SCTP_PR_SCTP_MASK (%#x); setting it "+
+				"selects a partial reliability policy instead",
+				tc.name, tc.flag, prPolicyMask)
+		}
+	}
 }

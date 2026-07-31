@@ -116,10 +116,13 @@ const (
 	SCTP_SOCKOPT_BINDX_ADD = 100
 	SCTP_SOCKOPT_BINDX_REM = 101
 	SCTP_SOCKOPT_PEELOFF   = 102
-	SCTP_GET_PEER_ADDRS    = 108
-	SCTP_GET_LOCAL_ADDRS   = 109
-	SCTP_SOCKOPT_CONNECTX  = 110
-	SCTP_SOCKOPT_CONNECTX3 = 111
+	// SCTP_SOCKOPT_PEELOFF_FLAGS is SCTP_SOCKOPT_PEELOFF with a flags word
+	// appended, so the peeled descriptor can be asked for close-on-exec.
+	SCTP_SOCKOPT_PEELOFF_FLAGS = 122
+	SCTP_GET_PEER_ADDRS        = 108
+	SCTP_GET_LOCAL_ADDRS       = 109
+	SCTP_SOCKOPT_CONNECTX      = 110
+	SCTP_SOCKOPT_CONNECTX3     = 111
 
 	// SCTP_EVENT is the per-event subscription option RFC 6458 §6.2.2
 	// introduced to replace SCTP_EVENTS. Its value is not part of the
@@ -268,21 +271,25 @@ const (
 	SCTPSchedRR = 2
 )
 
-// PF state exposure levels for SetExposePotentiallyFailed (RFC 7829).
+// PF state exposure levels for SetExposePotentiallyFailed (RFC 7829), from the
+// kernel's SCTP_PF_EXPOSE_* enum in include/net/sctp/constants.h.
 //
-// The default is SCTPPFStateHidden, which is why a caller correctly subscribed
-// to SCTP_PEER_ADDR_CHANGE never sees SCTP_ADDR_POTENTIALLY_FAILED and
-// concludes the state is not implemented. It is: it is just not shown.
+// The values are not a boolean with an extra mode: zero means "no answer
+// given", and the two explicit answers are 1 for off and 2 for on. Reading them
+// as off/on/locked, which is the shape most of these options have, puts
+// "exposed" on the value that disables it — a round-trip test still passes,
+// because the number written is the number read back.
 const (
-	// SCTPPFStateHidden suppresses the PF state entirely. GetPeerAddrInfo
-	// reports a PF path as SCTP_ACTIVE and no notification is delivered.
-	SCTPPFStateHidden = 0
-	// SCTPPFStateExposed reports the PF state through both the notification
-	// and GetPeerAddrInfo.
-	SCTPPFStateExposed = 1
-	// SCTPPFStateHiddenNoOverride is SCTPPFStateHidden with the socket option
-	// locked, so a later change is refused with EACCES.
-	SCTPPFStateHiddenNoOverride = 2
+	// SCTPPFStateUnset leaves the decision to net.sctp.pf_expose, which
+	// defaults to disabled. This is the state of a socket nobody has asked.
+	SCTPPFStateUnset = 0
+	// SCTPPFStateDisabled suppresses the PF state. GetPeerAddrInfo reports a
+	// potentially-failed path as SCTP_ACTIVE and no notification is delivered.
+	SCTPPFStateDisabled = 1
+	// SCTPPFStateEnabled reports the PF state through both
+	// SCTP_PEER_ADDR_CHANGE and GetPeerAddrInfo. This is what a caller wants
+	// if they are asking at all.
+	SCTPPFStateEnabled = 2
 )
 
 // Flags for PeerAddrParams.Flags, from the kernel's spp_flags (RFC 6458
@@ -531,12 +538,43 @@ const (
 	SCTPStreamResetOutgoing = 0x02
 )
 
+// Per-message send flags, for SndRcvInfo.Flags and SndInfo.Flags. These are the
+// kernel's enum sctp_sinfo_flags (RFC 6458 §5.3.2).
+//
+// The sequence is not contiguous, which is what makes it worth writing out
+// rather than generating with iota. Bits 4 and 5 belong to SCTP_PR_SCTP_MASK —
+// the partial reliability policy travels in the same word — and SCTP_EOF is not
+// an SCTP-specific bit at all but MSG_FIN, which is 0x200.
+//
+// SCTP_EOF used to be the fifth iota here, so 1<<4, which is exactly
+// SCTP_PR_SCTP_TTL. A caller asking for a graceful shutdown on their last
+// message instead selected a partial reliability policy, and got neither the
+// shutdown nor an error.
 const (
-	SCTP_UNORDERED = 1 << iota
-	SCTP_ADDR_OVER
-	SCTP_ABORT
-	SCTP_SACK_IMMEDIATELY
-	SCTP_EOF
+	// SCTP_UNORDERED sends the message without sequencing.
+	SCTP_UNORDERED = 1 << 0
+	// SCTP_ADDR_OVER overrides the primary destination, using the address in
+	// SndRcvInfo. It applies to one-to-many sockets.
+	SCTP_ADDR_OVER = 1 << 1
+	// SCTP_ABORT tears the association down with an ABORT instead of sending.
+	SCTP_ABORT = 1 << 2
+	// SCTP_SACK_IMMEDIATELY asks the peer to acknowledge without waiting for
+	// its delayed-ack timer.
+	SCTP_SACK_IMMEDIATELY = 1 << 3
+
+	// Bits 4 and 5 are SCTP_PR_SCTP_MASK, carrying the partial reliability
+	// policy. Use the SCTPPrPolicy constants with SCTPWriteInfo rather than
+	// setting them here.
+
+	// SCTP_SENDALL sends the message on every association of a one-to-many
+	// socket.
+	SCTP_SENDALL = 1 << 6
+	// SCTP_PR_SCTP_ALL applies the partial reliability policy to every stream.
+	SCTP_PR_SCTP_ALL = 1 << 7
+
+	// SCTP_EOF starts a graceful shutdown once the message is delivered. It is
+	// MSG_FIN, not a bit of its own.
+	SCTP_EOF = 0x200
 )
 
 const (
@@ -2505,7 +2543,13 @@ func (c *SCTPConn) SetPeerAddrParams(p *PeerAddrParams) error {
 // Zero the Address of the value passed in to ask about the association rather
 // than one path.
 func (c *SCTPConn) GetPeerAddrParams(p *PeerAddrParams) error {
-	b := p.marshal()
+	// Only the association id and the address go in — they are the lookup key.
+	// Marshalling the whole value would send the caller's own HBInterval,
+	// Flags, DSCP and flow label down as well, and any field the kernel does
+	// not overwrite would come back looking like a reading when it is just the
+	// caller's input echoed.
+	req := PeerAddrParams{AssocID: p.AssocID, Address: p.Address}
+	b := req.marshal()
 	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_PARAMS,
 		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
@@ -2972,46 +3016,6 @@ func (c *SCTPConn) RemoteAddr() net.Addr {
 		return nil
 	}
 	return addr
-}
-
-// peeloffArg mirrors sctp_peeloff_arg_t.
-//
-// Both members are 32 bits in the kernel — sctp_assoc_t is __s32 and sd is an
-// int — so the struct is 8 bytes with sd at offset 4. The Go version used to
-// declare sd as int, which is 64 bits on every target anyone runs this on. That
-// made the struct 16 bytes with sd at offset 8, so the kernel wrote the new
-// descriptor at offset 4 and PeelOff read offset 8, which nothing had written:
-// it returned an SCTPConn wrapping descriptor 0, and leaked the real one.
-//
-// It went unnoticed because it is right on 32-bit, where Go's int is 32 bits,
-// and because nothing tested it.
-type peeloffArg struct {
-	assocID int32
-	sd      int32
-}
-
-// PeelOff detaches association id onto its own socket (RFC 6458 §9.2).
-//
-// This only works on a one-to-many (SOCK_SEQPACKET) socket, which is what
-// peeling off is for: it turns one association out of many into a socket of its
-// own. Every socket this package creates is one-to-one, so calling this on one
-// of them returns EINVAL from the kernel — sctp_do_peeloff rejects any other
-// style. It is usable through NewSCTPConn on a one-to-many descriptor the
-// caller made themselves.
-func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
-	param := peeloffArg{assocID: int32(id)}
-	optlen := unsafe.Sizeof(param)
-	_, _, err := getsockopt(c.fd(), SCTP_SOCKOPT_PEELOFF, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
-	if err != nil {
-		return nil, err
-	}
-	if param.sd < 0 {
-		// Defensive: the kernel returns the descriptor in the struct rather
-		// than as the syscall result, so a negative value here would otherwise
-		// become an SCTPConn that fails every call with EBADF.
-		return nil, syscall.EINVAL
-	}
-	return &SCTPConn{_fd: param.sd}, nil
 }
 
 // SetDeadline sets both the read and write deadlines.

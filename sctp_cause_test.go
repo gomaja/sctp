@@ -438,3 +438,68 @@ func TestNotificationTypeNumbersMatchTheKernel(t *testing.T) {
 		}
 	}
 }
+
+// TestNotificationPPIDStaysInNetworkOrder pins a byte-order asymmetry that is
+// deliberate but easy to trip over.
+//
+// SndRcvInfo.PPID is documented as holding what the kernel delivered, in
+// network byte order, with SCTPRead converting. A notification is not
+// SCTPRead: SendFailed.Info and SendFailedEvent.Info come straight out of the
+// notification body, so the same struct field means host order from a read and
+// network order from an event.
+//
+// That is worth a test either way. Left undefined, a caller comparing
+// sf.Info.PPID against a locally held identifier gets a comparison that never
+// matches and no clue why; and if a future change decides to convert here for
+// consistency with SCTPRead, this test says so rather than the behaviour
+// shifting silently under callers who already compensate.
+func TestNotificationPPIDStaysInNetworkOrder(t *testing.T) {
+	const ppid = 0x11223344
+
+	t.Run("SendFailed", func(t *testing.T) {
+		minSize := notificationHeaderSize + 4 + int(sndRcvInfoSize) + 4
+		b := make([]byte, minSize)
+		putNotificationHeader(b, SCTP_SEND_FAILED, 0, uint32(minSize))
+		// The kernel copies the sender's SndRcvInfo through untouched, so what
+		// lands here is whatever the sender wrote — which by this package's
+		// convention is htonl of the identifier.
+		//
+		// PPID sits at offset 8 in SndRcvInfo, not 4: the two uint16 fields
+		// ahead of it are followed by two pad bytes, because a uint32 needs
+		// four-byte alignment. SndInfo has no third uint16 and so puts PPID at
+		// 4, which is why the same offset does not serve both.
+		nativeEndian.PutUint32(b[12+8:12+12], htonl(ppid))
+
+		note, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("ParseNotification: %v", err)
+		}
+		got := note.(*SendFailed).Info.PPID
+		if got != htonl(ppid) {
+			t.Errorf("Info.PPID = %#x, want %#x (network order, unconverted)",
+				got, htonl(ppid))
+		}
+		if ntohl(got) != ppid {
+			t.Errorf("ntohl(Info.PPID) = %#x, want %#x; the documented way to "+
+				"read it does not recover the identifier", ntohl(got), ppid)
+		}
+	})
+
+	t.Run("SendFailedEvent", func(t *testing.T) {
+		b := make([]byte, sendFailedEventMinSize)
+		putNotificationHeader(b, SCTP_SEND_FAILED_EVENT, 0, sendFailedEventMinSize)
+		// SndInfo.PPID is at offset 4 within the struct, which starts at 12.
+		nativeEndian.PutUint32(b[12+4:12+8], htonl(ppid))
+
+		note, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("ParseNotification: %v", err)
+		}
+		got := note.(*SendFailedEvent).Info.PPID
+		if got != htonl(ppid) {
+			t.Errorf("Info.PPID = %#x, want %#x (network order, unconverted); "+
+				"the two send-failure events must agree with each other",
+				got, htonl(ppid))
+		}
+	})
+}

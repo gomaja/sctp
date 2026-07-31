@@ -175,3 +175,11 @@ func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr 
 func isNonblocking(fd int) bool {
 	return true
 }
+
+// PeelOff is Linux-only for the same reason as the rest of this file, and
+// additionally because it names syscall.SOCK_CLOEXEC, which the syscall package
+// does not define everywhere. Keeping it in the shared file is what broke the
+// Windows build once already.
+func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
+	return nil, ErrUnsupported
+}

@@ -27,6 +27,9 @@ import (
 //	sctp_remote_error      16   sctp_send_failed       48
 //	sctp_shutdown_event    12   sctp_adaptation_event  16
 //	sctp_pdapi_event       24   sctp_sender_dry_event  12
+//	sctp_authkey_event     20   sctp_stream_reset_event   12
+//	sctp_assoc_reset_event 20   sctp_stream_change_event  16
+//	sctp_send_failed_event 32
 //
 // A parser that reads past the end of a truncated notification panics in the
 // read path, so each minimum below is load-bearing.
@@ -43,6 +46,11 @@ func TestNotificationSizesMatchKernel(t *testing.T) {
 		{"sctp_adaptation_event", adaptationIndicationSize, 16},
 		{"sctp_pdapi_event", partialDeliverySize, 24},
 		{"sctp_sender_dry_event", senderDrySize, 12},
+		{"sctp_authkey_event", authKeyEventSize, 20},
+		{"sctp_stream_reset_event", streamResetMinSize, 12},
+		{"sctp_assoc_reset_event", assocResetSize, 20},
+		{"sctp_stream_change_event", streamChangeSize, 16},
+		{"sctp_send_failed_event", sendFailedEventMinSize, 32},
 		{"notification header", notificationHeaderSize, 8},
 	} {
 		if tc.got != tc.want {
@@ -271,10 +279,13 @@ func FuzzParseNotification(f *testing.F) {
 		SCTP_ASSOC_CHANGE, SCTP_PEER_ADDR_CHANGE, SCTP_REMOTE_ERROR,
 		SCTP_SEND_FAILED, SCTP_SHUTDOWN_EVENT, SCTP_ADAPTATION_INDICATION,
 		SCTP_PARTIAL_DELIVERY_EVENT, SCTP_SENDER_DRY_EVENT,
+		SCTP_AUTHENTICATION_EVENT, SCTP_STREAM_RESET_EVENT,
+		SCTP_ASSOC_RESET_EVENT, SCTP_STREAM_CHANGE_EVENT,
+		SCTP_SEND_FAILED_EVENT,
 	}
 	for _, typ := range types {
 		// Seed each type at a few lengths either side of its struct.
-		for _, size := range []int{0, 8, 12, 16, 20, 24, 48, 148} {
+		for _, size := range []int{0, 8, 11, 12, 13, 15, 16, 20, 24, 31, 32, 33, 48, 148} {
 			f.Add(uint16(typ), notif(typ, size))
 		}
 	}

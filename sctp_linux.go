@@ -1607,3 +1607,66 @@ func readSomaxconn() (int, error) {
 	}
 	return n, nil
 }
+
+// peeloffArg mirrors sctp_peeloff_arg_t.
+//
+// Both members are 32 bits in the kernel — sctp_assoc_t is __s32 and sd is an
+// int — so the struct is 8 bytes with sd at offset 4. The Go version used to
+// declare sd as int, which is 64 bits on every target anyone runs this on. That
+// made the struct 16 bytes with sd at offset 8, so the kernel wrote the new
+// descriptor at offset 4 and PeelOff read offset 8, which nothing had written:
+// it returned an SCTPConn wrapping descriptor 0, and leaked the real one.
+//
+// It went unnoticed because it is right on 32-bit, where Go's int is 32 bits,
+// and because nothing tested it.
+type peeloffArg struct {
+	assocID int32
+	sd      int32
+}
+
+// PeelOff detaches association id onto its own socket (RFC 6458 §9.2).
+//
+// This only works on a one-to-many (SOCK_SEQPACKET) socket, which is what
+// peeling off is for: it turns one association out of many into a socket of its
+// own. Every socket this package creates is one-to-one, so calling this on one
+// of them returns EINVAL from the kernel — sctp_do_peeloff rejects any other
+// style. It is usable through NewSCTPConn on a one-to-many descriptor the
+// caller made themselves.
+func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
+	// SCTP_SOCKOPT_PEELOFF gives no way to ask for close-on-exec, so the
+	// peeled descriptor would leak into any child forked afterwards — the same
+	// defect accept4 had here. SCTP_SOCKOPT_PEELOFF_FLAGS exists for exactly
+	// this and takes the same struct with a flags word appended. It is the
+	// newer of the two, so an older kernel answering ENOPROTOOPT falls back
+	// rather than failing the call.
+	flagged := struct {
+		arg   peeloffArg
+		flags uint32
+	}{arg: peeloffArg{assocID: int32(id)}, flags: syscall.SOCK_CLOEXEC}
+	optlen := unsafe.Sizeof(flagged)
+	_, _, err := getsockopt(c.fd(), SCTP_SOCKOPT_PEELOFF_FLAGS,
+		uintptr(unsafe.Pointer(&flagged)), uintptr(unsafe.Pointer(&optlen)))
+	if err == nil {
+		if flagged.arg.sd < 0 {
+			return nil, syscall.EINVAL
+		}
+		return &SCTPConn{_fd: flagged.arg.sd}, nil
+	}
+	if !errors.Is(err, syscall.ENOPROTOOPT) {
+		return nil, err
+	}
+
+	param := peeloffArg{assocID: int32(id)}
+	optlen = unsafe.Sizeof(param)
+	_, _, err = getsockopt(c.fd(), SCTP_SOCKOPT_PEELOFF, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return nil, err
+	}
+	if param.sd < 0 {
+		// Defensive: the kernel returns the descriptor in the struct rather
+		// than as the syscall result, so a negative value here would otherwise
+		// become an SCTPConn that fails every call with EBADF.
+		return nil, syscall.EINVAL
+	}
+	return &SCTPConn{_fd: param.sd}, nil
+}

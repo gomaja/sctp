@@ -23,23 +23,18 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
 
-      # sudo rather than a container: the runner is already Linux with SCTP
-      # available, and the steps below are exactly what testdata/run-tests.sh
-      # does for a privileged container.
+      # The runner is already Linux with SCTP available, so it needs the setup
+      # rather than a container — but it must be testdata/run-tests.sh doing it
+      # rather than an inline copy. Inlining the four steps and then calling
+      # `go test` directly is what a first attempt at this did, and it silently
+      # dropped the script's second pass: the two tests asserting the
+      # AUTH-disabled contract skip while net.sctp.auth_enable is on, and only
+      # that pass runs them with it off. An inline copy also drifts.
       - name: Prepare the SCTP stack
-        run: |
-          sudo modprobe sctp
-          test -e /proc/net/sctp/snmp
-          sudo sysctl -w net.sctp.auth_enable=1
-          for a in 127.0.0.2 127.0.0.3 127.0.0.4; do
-            sudo ip addr add "$a/8" dev lo || true
-          done
-          sudo iptables -A OUTPUT -d 192.0.2.1 -j DROP
+        run: sudo modprobe sctp && test -e /proc/net/sctp/snmp
 
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test ./... -count=1 -timeout 900s
-      - run: go test ./... -count=1 -race -timeout 900s
+      - run: sudo -E env "PATH=$PATH" bash testdata/run-tests.sh ./... -count=1 -timeout 900s
+      - run: sudo -E env "PATH=$PATH" bash testdata/run-tests.sh ./... -count=1 -race -timeout 900s
 
   # The suite only ever runs on one platform at a time, so nothing in it notices
   # a non-portable symbol landing in a file with no build tag. TestCrossCompiles
