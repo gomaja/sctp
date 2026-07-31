@@ -206,6 +206,75 @@ func TestListenerAcceptDeadline(t *testing.T) {
 	}
 }
 
+// TestAcceptReportsEAGAINRatherThanAPhantomDeadline is the other half of
+// TestListenerAcceptDeadline: an accept that ends in EAGAIN without a deadline
+// programmed through this package must report EAGAIN.
+//
+// The two cases are identical at the syscall. sctp_accept takes its wait budget
+// from SO_RCVTIMEO and reports the expiry as EAGAIN, which is also the errno a
+// non-blocking accept returns, so nothing in the answer distinguishes them —
+// only the listener's own record of whether SetDeadline was called. SyscallConn
+// hands the descriptor to the caller, and a timeout set through it is invisible
+// to that record: rcvTimeoSet stays 0, so the package neither clears the
+// timeout nor knows it is there.
+//
+// Answering os.ErrDeadlineExceeded here would invent a deadline the caller
+// never set, on a listener they configured themselves. Reaching the branch
+// needs the out-of-band setsockopt: with SetDeadline the record is accurate and
+// the conversion is correct, which is why every existing accept test leaves
+// this side of it untouched.
+func TestAcceptReportsEAGAINRatherThanAPhantomDeadline(t *testing.T) {
+	addr, err := ResolveSCTPAddr("sctp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	ln, err := ListenSCTP("sctp", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }()
+
+	rc, err := ln.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	var sockErr error
+	if err := rc.Control(func(fd uintptr) {
+		tv := syscall.NsecToTimeval(int64(300 * time.Millisecond))
+		sockErr = syscall.SetsockoptTimeval(int(fd), syscall.SOL_SOCKET,
+			syscall.SO_RCVTIMEO, &tv)
+	}); err != nil {
+		t.Fatalf("Control: %v", err)
+	}
+	if sockErr != nil {
+		t.Fatalf("SO_RCVTIMEO: %v", sockErr)
+	}
+
+	start := time.Now()
+	conn, err := ln.AcceptSCTP()
+	elapsed := time.Since(start)
+	if err == nil {
+		_ = conn.CloseWithTimeout(200 * time.Millisecond)
+		t.Fatal("AcceptSCTP succeeded with no peer connecting")
+	}
+	if elapsed < 250*time.Millisecond {
+		t.Fatalf("accept returned after %v, before the SO_RCVTIMEO it was "+
+			"given could have expired; the error under test is not the one "+
+			"this covers", elapsed)
+	}
+
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("AcceptSCTP reported os.ErrDeadlineExceeded after %v, but no "+
+			"deadline was ever set on this listener — the timeout is the "+
+			"caller's own SO_RCVTIMEO, and reporting it as a deadline hides "+
+			"which of the two the caller has to change", elapsed)
+	}
+	if !errors.Is(err, syscall.EAGAIN) {
+		t.Errorf("AcceptSCTP err = %v, want EAGAIN unchanged from the kernel",
+			err)
+	}
+}
+
 // TestListenerDeadlineInThePast checks the boundary, matching SCTPConn's
 // treatment of a deadline that has already elapsed.
 func TestListenerDeadlineInThePast(t *testing.T) {

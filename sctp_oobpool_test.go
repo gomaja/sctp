@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -160,6 +161,100 @@ func TestPooledOobDoesNotCrossAssociations(t *testing.T) {
 		t.Errorf("%d of %d exchanges saw another association's ancillary data",
 			n, peers*msgs)
 	}
+}
+
+// TestPooledOobHoldsEveryInfoCmsgAtOnce sizes the pooled buffer against what
+// the kernel actually delivers, rather than against one cmsg at a time.
+//
+// The buffer's size had no coverage at all: shrinking it from 254 bytes to 48
+// left the whole suite green. 48 is not an innocent number — it is exactly
+// CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)), so every existing assertion still
+// found the one cmsg it was looking for and the truncation landed on the fields
+// nothing read.
+//
+// Three can arrive on a single read, and the kernel emits them in this order,
+// measured on 6.12 with all three subscribed and a message queued behind:
+//
+//	SCTP_NXTINFO   16 bytes of payload, CMSG_SPACE  32
+//	SCTP_RCVINFO   28 bytes of payload, CMSG_SPACE  48
+//	SCTP_SNDRCV    32 bytes of payload, CMSG_SPACE  48
+//	                                         total 128
+//
+// SCTP_NXTINFO coming first is what makes an undersized buffer quiet. The
+// truncation takes SCTP_SNDRCV — the last one written and the one SCTPRead
+// reports as info — so a caller that asked for the next message's size still
+// gets it, and loses the description of the message in their hand. The kernel
+// sets MSG_CTRUNC to say so; nothing in this package looks at it.
+func TestPooledOobHoldsEveryInfoCmsgAtOnce(t *testing.T) {
+	// sndinfoPair already subscribes SCTP_EVENT_DATA_IO on the server, which is
+	// what SCTP_SNDRCV depends on.
+	client, server := sndinfoPair(t)
+
+	if err := server.SetRecvRcvInfo(true); err != nil {
+		t.Fatalf("SetRecvRcvInfo: %v", err)
+	}
+	if err := server.SetRecvNxtInfo(true); err != nil {
+		t.Fatalf("SetRecvNxtInfo: %v", err)
+	}
+
+	// Two messages, because SCTP_NXTINFO describes the message queued behind
+	// the one being read. With a single message the kernel emits no NXTINFO at
+	// all, and the read fits in a buffer far smaller than the one under test.
+	send := func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			if err := writeAll(client, []byte("payload"),
+				&SndRcvInfo{Stream: uint16(i % 4)}); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+		}
+		// The successor has to be queued before the read, or there is nothing
+		// for the kernel to report and the coverage is vacuous.
+		time.Sleep(200 * time.Millisecond)
+	}
+	send(2)
+
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 256)
+	_, info, nxt, flags, err := server.SCTPReadNextInfo(buf)
+	if err != nil {
+		t.Fatalf("SCTPReadNextInfo: %v", err)
+	}
+
+	if flags&syscall.MSG_CTRUNC != 0 {
+		t.Errorf("the kernel set MSG_CTRUNC: the pooled control buffer is too "+
+			"small for the cmsgs this subscription asks for, and one of them "+
+			"was dropped (flags=%#x)", flags)
+	}
+	if nxt == nil {
+		t.Error("no NxtInfo with a second message queued and SetRecvNxtInfo on")
+	}
+	if info == nil {
+		t.Error("no SndRcvInfo alongside the NxtInfo — SCTP_SNDRCV is written " +
+			"last, so this is what an undersized control buffer costs, and it " +
+			"is lost silently: the read itself succeeds")
+	}
+
+	// The sizing, measured rather than asserted. Reading the same subscription
+	// into a buffer far larger than the pool's says what the kernel really
+	// needs, so this keeps holding if a kernel starts sending more.
+	send(2)
+	oobp := oobPool.Get().(*[]byte)
+	pooled := len(*oobp)
+	oobPool.Put(oobp)
+
+	_, oobn, _, err := recvmsg(server.fd(), buf, make([]byte, 4096), 0)
+	if err != nil {
+		t.Fatalf("recvmsg: %v", err)
+	}
+	if oobn > pooled {
+		t.Errorf("one read carried %d bytes of control data; the pool hands "+
+			"out %d, so the excess is truncated away", oobn, pooled)
+	}
+	t.Logf("kernel delivered %d control bytes for this subscription; the pool "+
+		"holds %d", oobn, pooled)
 }
 
 // TestPooledOobSurvivesReuse pins the property the pooling depends on: the

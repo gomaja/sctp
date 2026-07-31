@@ -4,8 +4,12 @@
 package sctp
 
 import (
+	"bufio"
 	"errors"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -55,6 +59,89 @@ func newRawSCTPSocket(t *testing.T, nonblocking bool) int {
 		t.Fatalf("SetNonblock(%v): %v", nonblocking, err)
 	}
 	return fd
+}
+
+// assocExistsFor reports whether the kernel holds an association whose local
+// port is port.
+//
+// The column index is read from the header rather than hard-coded, because the
+// row is positional and a kernel that adds a column would otherwise silently
+// shift the field being compared — which reads as "no association yet" and
+// turns a wait into a timeout.
+func assocExistsFor(t *testing.T, port int) bool {
+	t.Helper()
+	f, err := os.Open("/proc/net/sctp/assocs")
+	if err != nil {
+		t.Skipf("cannot read /proc/net/sctp/assocs: %v", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	lport := -1
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
+		if len(fields) == 0 {
+			continue
+		}
+		if fields[0] == "ASSOC" {
+			for i, name := range fields {
+				if name == "LPORT" {
+					lport = i
+				}
+			}
+			continue
+		}
+		if lport < 0 || len(fields) <= lport {
+			continue
+		}
+		if p, err := strconv.Atoi(fields[lport]); err == nil && p == port {
+			return true
+		}
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("scanning assocs: %v", err)
+	}
+	return false
+}
+
+// waitAssocExists blocks until the kernel holds an association for fd.
+//
+// TestSCTPConnectEALREADYOnBlockingSocketMidHandshake needs a second connect to
+// find an association a goroutine is still creating, and closing a channel as
+// that goroutine starts says only that it was scheduled — not that its connect
+// reached the kernel. When the probing connect wins that race it becomes the
+// call that creates the association, and on a blocking socket to a blackholed
+// address it then waits out the entire INIT retransmission schedule: measured
+// at a flat 342s, ending in ETIMEDOUT, reported as a failure of a branch it
+// never reached. Under -race that happened in 3 of 12 runs; without it, in none
+// of more than twenty.
+//
+// The state is observable, contrary to what that test used to say. SCTP_STATUS
+// does answer EINVAL mid-handshake — measured across every pre-association
+// state — but /proc/net/sctp/assocs lists the association in COOKIE_WAIT within
+// 50ms of the connect beginning. Waiting on it removes the race without
+// changing what is covered: the probing connect still runs against a blocking
+// socket with a handshake genuinely in flight.
+//
+// The port comes from getsockname rather than being chosen, because the socket
+// is unbound until the connect autobinds it — a zero port is itself the signal
+// that the kernel has not started yet.
+func waitAssocExists(t *testing.T, fd int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if sa, err := syscall.Getsockname(fd); err == nil {
+			if in4, ok := sa.(*syscall.SockaddrInet4); ok && in4.Port != 0 {
+				if assocExistsFor(t, in4.Port) {
+					return
+				}
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no association appeared for the socket within 10s; the " +
+		"goroutine's connect never reached the kernel, so the second connect " +
+		"would be the one creating it")
 }
 
 // TestSCTPConnectEALREADYOnNonblockingSocket pins that a non-blocking caller
@@ -232,10 +319,12 @@ func TestSCTPConnectEALREADYOnBlockingSocketMidHandshake(t *testing.T) {
 	}()
 	<-started
 
-	// Give the blocking call time to create the association and enter
-	// COOKIE_WAIT. Without an observable state to poll — SCTP_STATUS reports
-	// EINVAL mid-handshake — this waits for the condition by retrying below
-	// rather than by sleeping once and hoping.
+	// Wait for the association to exist before probing for it. The channel says
+	// the goroutine was scheduled, not that its connect reached the kernel, and
+	// a probing connect that arrives first creates the association itself and
+	// blocks for the whole retransmission schedule — see waitAssocExists.
+	waitAssocExists(t, fd)
+
 	var reachedBranch bool
 	for i := 0; i < 50; i++ {
 		if _, err := SCTPConnect(fd, raddr); err == nil {

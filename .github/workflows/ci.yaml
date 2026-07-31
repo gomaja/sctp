@@ -54,31 +54,49 @@ jobs:
             GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
           done
 
-  # Four of the option structs embed a sockaddr_storage that is not inside a
-  # packed struct, so their layout follows the word size — sctp_udpencaps is 144
-  # bytes with the address at 8 on a 64-bit kernel and 136 with it at 4 on a
-  # 32-bit one. Mutation shows what that costs: pinning the alignment to 8, or
-  # giving sctp_paddrthlds_v2 the same size as v1, or hard-coding the
-  # sctp_assoc_stats address offset, all survive on amd64 and all fail here.
-  # Vetting is not enough, since none of it is a type error.
+  # Two properties an amd64 run cannot see. Both are structural rather than
+  # behavioural, so neither vet nor the socket suite notices them; the only way
+  # to check either is to execute on a machine that differs.
+  #
+  # Word size. Four of the option structs embed a sockaddr_storage that is not
+  # inside a packed struct, so their layout follows the word size —
+  # sctp_udpencaps is 144 bytes with the address at 8 on a 64-bit kernel and 136
+  # with it at 4 on a 32-bit one. Mutation shows what that costs: pinning the
+  # alignment to 8, or giving sctp_paddrthlds_v2 the same size as v1, or
+  # hard-coding the sctp_assoc_stats address offset, all survive on amd64 and
+  # all fail on arm.
+  #
+  # Byte order. htons and htonl swap only on a little-endian host, so on amd64
+  # the swap always runs and the identity branch never does. A mutation making
+  # the swap unconditional — which corrupts every port and PPID on a big-endian
+  # kernel — survives the entire suite on amd64, and fails on s390x at
+  # TestToRawSockAddrBufEncodesEachFamily with "port encoded as 0x3412, want
+  # 0x1234". The assertion was already there; only the platform was missing.
   #
   # Only the pure-Go tests run. qemu-user does not forward SOL_SCTP, so anything
-  # touching a socket would fail for reasons that have nothing to do with the code.
-  layout-32bit:
+  # touching a socket fails for reasons that have nothing to do with the code.
+  cross-layout:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ['linux/arm/v7', 'linux/s390x']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
-      # Named individually rather than matched on "Layout". Two tests carry that
-      # word and open a socket anyway — TestSackTimerLayoutAndRoundTrip and
-      # TestResetStreamsWireLayout — and under qemu they fail with
-      # "protocol not available" for reasons that have nothing to do with the
-      # code. Everything below runs without a kernel.
-      - name: Layout assertions under linux/arm
+      # Named individually rather than matched on a word. Two tests carry
+      # "Layout" and open a socket anyway — TestSackTimerLayoutAndRoundTrip and
+      # TestResetStreamsWireLayout — and TestSubscribedEventsReportsEachFlagIndependently
+      # and TestSubscribedEventsRoundTripsTheWholeSet are byte-order relevant but
+      # need one too. Under qemu all four fail with "protocol not available".
+      # Everything below runs without a kernel, on both platforms.
+      - name: Layout and byte-order assertions under ${{ matrix.platform }}
+        env:
+          RUN: '^(TestSockaddrStorageOptionLayouts|TestSockaddrStorageLayoutFormula|TestSockaddrStorageOptionsRoundTripThroughBytes|TestStructLayoutsMatchKernel|TestNotificationSizesMatchKernel|TestNxtInfoLayoutMatchesKernel|TestPeerAddrParamsLayoutMatchesKernel|TestPeerAddrParamsRoundTripsThroughItsPackedForm|TestRtoInfoLayoutMatchesKernel|TestAssocInfoLayoutMatchesKernel|TestAssocValueLayoutMatchesKernel|TestEventStructMatchesKernel|TestPollFdLayoutMatchesKernel|TestBuildSndRcvCmsgOffsetsMatchStruct|TestBuildersMatchKernelLayout|TestToBufSerialisesFixedSizeStructs|TestParseSndRcvInfoPrefersSndRcvOverRcvInfo|TestOptionNumbersMatchHeader|TestToRawSockAddrBufEncodesEachFamily|TestAssocChangeErrorIsDecodedFromNetworkOrder|TestRemoteErrorErrorIsDecodedFromNetworkOrder|TestSendFailedErrorIsDecodedFromNetworkOrder|TestPeerAddrChangeErrorStaysHostOrder|TestErrorCauseStringNamesTheRFCCauses|TestParsesTheEventsStreamReconfigurationNeeds|TestNewNotificationsRejectTruncation|TestNotificationTypeNumbersMatchTheKernel|TestNotificationPPIDStaysInNetworkOrder|TestParseNotificationRejectsADeclaredLengthItDoesNotHave|TestBuildSndRcvCmsgMatchesLegacy|TestBuildSndRcvCmsgHeader|TestBuildSndRcvCmsgRoundTripsThroughParser|TestResolveFromRawAddrMixedFamilies|TestResolveFromRawAddrV6First|TestResolveFromRawAddrUnknownFamilyIsRejected|TestResolveFromRawAddrZeroCount|TestResolveFromRawAddrRespectsBuffer|TestResolveFromRawAddrNegativeCount|TestResolveFromRawAddrPortFromLaterEntriesIgnored|TestResolveFromRawAddrPortFromFirstEntry|TestResolveFromRawAddrDoesNotAliasBuffer|TestToBufPanicsOnUnserialisableType)$'
         run: |
-          docker run --rm --platform linux/arm/v7 \
+          docker run --rm --platform ${{ matrix.platform }} \
             -v "$PWD":/src -w /src golang:1.24-bookworm \
-            go test -count=1 -v -run '^(TestSockaddrStorageOptionLayouts|TestSockaddrStorageLayoutFormula|TestSockaddrStorageOptionsRoundTripThroughBytes|TestStructLayoutsMatchKernel|TestNotificationSizesMatchKernel|TestNxtInfoLayoutMatchesKernel|TestPeerAddrParamsLayoutMatchesKernel|TestPeerAddrParamsRoundTripsThroughItsPackedForm|TestRtoInfoLayoutMatchesKernel|TestAssocInfoLayoutMatchesKernel|TestAssocValueLayoutMatchesKernel|TestEventStructMatchesKernel|TestPollFdLayoutMatchesKernel|TestBuildSndRcvCmsgOffsetsMatchStruct|TestBuildersMatchKernelLayout|TestToBufSerialisesFixedSizeStructs|TestParseSndRcvInfoPrefersSndRcvOverRcvInfo|TestOptionNumbersMatchHeader)$' .
+            go test -count=1 -v -run "$RUN" .
 
   # Nothing else executes sctp_unsupported.go. `go build` for a cross target
   # skips _test.go files, `go vet` type-checks without running, and every other

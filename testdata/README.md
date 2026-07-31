@@ -2142,3 +2142,265 @@ The platform promise was overstated in two directions: `plan9`, `js/wasm` and
 and `ResolveSCTPAddr` and the deadline setters work everywhere rather than
 returning `ErrUnsupported`, so the `errors.Is` gate shown next to the claim never
 trips for them.
+
+## Round six: twenty mutations against the suite as a whole
+
+Individual fixes here are mutation-tested as they are made. The suite as a whole
+never had been. Twenty mutations were applied across `sctp.go` and
+`sctp_linux.go` — one per run, the complete suite each time through
+`run-tests.sh`, both source files restored from a pristine copy between every
+one so a mutation that fails to apply cannot leak into the next.
+
+```
+13 caught   6 survived   1 failed to compile
+```
+
+The six survivors are the point of the exercise, and they do not mean six
+missing tests. Two were, three cannot be observed on this platform at all, and
+one is a branch the kernel never reaches.
+
+### Two mutants that never ran are worth as much as the ones that did
+
+The generator requires each target string to match **exactly once** in its file,
+and aborts otherwise, on the reasoning that a zero- or multi-match is a defect in
+the mutation rather than a finding about the code. It earned that immediately:
+
+```
+mutation htons-alwaysswap: '\tif nativeEndian == binary.LittleEndian {'
+matches 2 times in sctp.go, want exactly 1
+```
+
+`htons` and `htonl` carry a byte-identical guard. Matching on the condition alone
+would have silently mutated whichever came first, and the conclusion drawn would
+have been about the wrong function.
+
+The other is subtler. Deleting `SetInitMsg`'s upper bound did not compile:
+
+```
+./sctp.go:71:2: "math" imported and not used
+```
+
+`math.MaxUint16` at line 1592 is the only use of the `math` import in the whole
+file, so removing the comparison orphans the import. **A mutant that does not
+build tests nothing while looking like a result** — it would have been recorded
+as a compile error and quietly counted as "the suite noticed". Retargeted to
+`math.MaxInt32`, which keeps the import live, still rejects negatives, and lets
+70000 through to truncate, it is caught by
+`TestSetInitMsgRejectsOutOfRangeValues`. `math.MaxUint32` would not do: as an
+untyped constant compared against an `int` it overflows on 32-bit targets.
+
+### The control buffer was sized against one cmsg; the kernel sends three
+
+Shrinking the pooled `oob` buffer from 254 bytes to **48** left the entire suite
+green. 48 is not an arbitrary number — it is exactly
+`CMSG_SPACE(sizeof(struct sctp_sndrcvinfo))`.
+
+The comment above `oobPool` explained the size by reasoning about one control
+message at a time: `SCTP_SNDRCV` is 32 bytes of payload plus a 16-byte header,
+and `SCTP_RCVINFO` and `SCTP_NXTINFO` are smaller again. Every part of that is
+true and the conclusion does not follow, because they are not delivered one at a
+time. Measured on 6.12 with every info option enabled and a message queued
+behind the one being read:
+
+```
+read n=7 oobn=128 MSG_CTRUNC=false
+  cmsg level=132 type=4 (SCTP_NXTINFO) len=32 space=32
+  cmsg level=132 type=3 (SCTP_RCVINFO) len=44 space=48
+  cmsg level=132 type=1 (SCTP_SNDRCV)  len=48 space=48
+                                       total 128
+```
+
+**`SCTP_NXTINFO` comes first**, which is what makes an undersized buffer quiet.
+`SCTP_SNDRCV` is written last, so the truncation takes the description of the
+message in the caller's hand while still delivering the prediction of the next
+one — and the read itself succeeds. The kernel says so only through
+`MSG_CTRUNC`, which nothing in this package inspects.
+
+That ordering is also why `TestSCTPReadNextInfoReportsTheQueuedMessage` passed at
+48 bytes despite subscribing both. Its subscription needs 80:
+
+```
+DATA_IO+NXTINFO: oobn=80 MSG_CTRUNC=false
+with a 48-byte control buffer: oobn=48 MSG_CTRUNC=true
+```
+
+Its first read wants `NxtInfo`, which survives the truncation; its second read
+happens with nothing queued behind, so the kernel emits no `NXTINFO` at all and
+the lone `SCTP_SNDRCV` fits in 48 exactly. Each assertion found the one cmsg it
+was looking for, and the loss landed between them.
+
+`TestPooledOobHoldsEveryInfoCmsgAtOnce` closes it from both ends: it requires
+`MSG_CTRUNC` clear with both structs returned, and separately measures what one
+read carries into an oversized buffer and requires the pool to be at least that
+large — so it keeps holding if a kernel starts sending more.
+
+### An accept could report a deadline the caller never set
+
+`AcceptSCTP` converts `EAGAIN` to `os.ErrDeadlineExceeded` only when a deadline
+was programmed through `SetDeadline`, and making that conversion unconditional
+survived the suite. The two cases are identical at the syscall — `sctp_accept`
+takes its wait budget from `SO_RCVTIMEO` and reports expiry as `EAGAIN`, the same
+errno a non-blocking accept gives — so only the listener's own record
+distinguishes them.
+
+`SyscallConn` is what makes the untested case reachable. A caller who sets
+`SO_RCVTIMEO` on the descriptor themselves leaves `rcvTimeoSet` at 0, so the
+package neither clears the timeout nor knows it is there:
+
+```
+accept after 204.116ms with SO_RCVTIMEO set out-of-band and no package-level
+deadline: err=resource temporarily unavailable EAGAIN=true
+ErrDeadlineExceeded=false
+```
+
+Reporting a deadline there would invent one the caller never set, on a listener
+they configured themselves. `TestAcceptReportsEAGAINRatherThanAPhantomDeadline`
+covers it. The read path already drew the same distinction and already had a test
+for it; only the accept path was uncovered.
+
+### Three survivors that no test on this host can catch
+
+Recorded rather than papered over, because each is a mutation that changes the
+source and cannot change the behaviour here:
+
+**`EAGAIN` alone no longer mapping to a deadline.** `toDeadlineErr` tests for
+`EAGAIN || EWOULDBLOCK`; on Linux the two errnos are the same value, so dropping
+either arm is a no-op. Expected to survive before the run started, and it did.
+
+**`htons` swapping unconditionally.** The swap is guarded by
+`nativeEndian == binary.LittleEndian`, so on amd64 the guard is always true and
+the mutant is byte-for-byte equivalent. This one is not untestable, only
+unrunnable — it needs a big-endian machine, and under
+`docker run --platform linux/s390x` an assertion that already existed fails
+immediately:
+
+```
+--- FAIL: TestToRawSockAddrBufEncodesEachFamily/empty_address_list_falls_back_to_IPv4_zero
+    sctp_untested_test.go:244: port encoded as 0x3412, want 0x1234
+```
+
+The gap was the platform, not the assertion. The `layout-32bit` CI job is now
+`cross-layout`, a matrix over `linux/arm/v7` and `linux/s390x` sharing one list
+of socket-free tests, so word size and byte order are both covered by the same
+job. Four tests are excluded because they open a socket and qemu-user does not
+forward `SOL_SCTP`: `TestSackTimerLayoutAndRoundTrip`,
+`TestResetStreamsWireLayout` and the two `TestSubscribedEvents*`.
+
+**`hasEstablishedAssoc` returning a bare `true`.** The function returns false on
+a `getsockopt` error and `status.State != 0` otherwise, and replacing the second
+with `true` changes nothing, because the second never decides anything.
+`SCTP_STATUS` was probed across every state a socket passes through before an
+association exists:
+
+```
+one-to-one, fresh              errno=invalid argument
+one-to-one, bound              errno=invalid argument
+one-to-one, listening          errno=invalid argument
+one-to-many, fresh             errno=invalid argument
+one-to-many, bound             errno=invalid argument
+one-to-many, listening         errno=invalid argument
+one-to-one, COOKIE_WAIT        errno=invalid argument
+one-to-one, ESTABLISHED        OK state=4 assoc=152471
+one-to-one, after peer close   errno=invalid argument
+one-to-one, after own shutdown errno=invalid argument
+```
+
+`EINVAL` in every case, and only an established association answers at all —
+`sctp_id2assoc` declines to hand back an association on a one-to-one socket
+unless the socket is itself `ESTABLISHED` or `CLOSING`. So the doc comment's
+claim that `SCTP_STATUS` "reports state 0 when there is nothing to describe" was
+never observed. The check stays as a guard; the comment now says it is one.
+
+### And one branch the kernel does not reach
+
+`dialSCTPExtConfigContext` tolerates `EALREADY` from its connect alongside
+`EINPROGRESS`, and removing the tolerance survived. It is the first connect on a
+socket the function just created, so the kernel has no earlier attempt to find:
+
+```
+first connect on a fresh non-blocking socket, 200 attempts: map[EINPROGRESS:200]
+```
+
+Zero `EALREADY` in two hundred. What keeps the tolerance is the `control` hook,
+which is handed the descriptor before that point and could have connected it —
+but the comment implied a live path and now says defensive.
+
+### A test that raced against itself, found while validating the above
+
+Running the suite under `-race` to check the two new tests turned up a failure in
+one neither of them touches:
+
+```
+--- FAIL: TestSCTPConnectEALREADYOnBlockingSocketMidHandshake (340.34s)
+    sctp_already_test.go:248: second SCTPConnect gave connection timed out,
+                              want success once the association exists
+```
+
+**The first attempt to attribute it was a bad experiment.** HEAD ran first and
+the working tree second in every round, so "which tree" and "which slot" were one
+variable, and the result — HEAD 3 passes, working tree 2 failures — read as
+though the change had caused it. Reversing the order broke the correlation.
+Across both orders it is 3 failures in 12, split cleanly by neither variable,
+which is far too small a sample to separate anything. The same trap this
+document already records for `TestStreams`, walked into again.
+
+What settled it was not the counting. Every changed line in `sctp.go` and
+`sctp_linux.go` this round is a comment, and neither new test matches the `-run`
+filter used, so both trees executed identical code.
+
+The mechanism is a race between the test's own two goroutines. It starts one
+that calls `SCTPConnect` to the blackholed address and then probes with a second
+`SCTPConnect` on the same socket, expecting to find the association the first
+created — but `close(started)` says only that the goroutine was scheduled, not
+that its connect reached the kernel. When the probe arrives first, **it** becomes
+the call that creates the association, and on a blocking socket to an address
+that never answers it waits out the entire INIT retransmission schedule: a flat
+342s, ending in `ETIMEDOUT`, reported as a failure of a branch it never reached.
+Every failing run took 341.6s to 342.2s; every passing run took 1.3s.
+
+The fix is a precondition rather than a sleep, and it exists because the test's
+own comment was wrong about what could be observed:
+
+> Without an observable state to poll — SCTP_STATUS reports EINVAL mid-handshake
+
+`SCTP_STATUS` does answer `EINVAL` mid-handshake, confirmed by the probe above.
+But `/proc/net/sctp/assocs` lists the association in `COOKIE_WAIT` within 50 ms
+of the connect beginning, and the suite already reads that file for
+`countAssocs`. `waitAssocExists` polls `getsockname` for the port the connect
+autobinds, then waits for a row carrying it — reading the `LPORT` column index
+out of the header rather than hard-coding it, since the row is positional.
+
+Measured after the fix, on the same host, same conditions:
+
+```
+30 runs under -race:  PASS=30  FAIL=0     (before: 3 failures in 12)
+```
+
+And it keeps its teeth, which is the risk with any fix that makes a test wait
+for something. Making `isEstablishedAssoc` return false for `EALREADY` on every
+socket — the conversion this test exists to cover — still fails it, and now in
+1.47s rather than 342s, because the test no longer has to exhaust a timeout to
+discover the branch was never reached.
+
+### What the exercise says about the suite
+
+Two real holes in twenty mutations, both in code with tests either side of the
+gap rather than in code nobody had covered. The `oob` buffer had two tests
+already, for aliasing and for crosstalk, and neither touched its size; the
+deadline conversion had a test on the read path and none on the accept path. The
+useful signal was not "this function is untested" but "this function is tested
+for the property somebody thought of".
+
+The three equivalent mutants are worth as much as the two holes, in a different
+way: each one had a comment above it asserting behaviour that was never measured,
+and two of the three comments were wrong. So did the flaky test's own comment,
+which is what had kept the race in place.
+
+One process note. An early validation run reported a red suite that had never
+executed a single test: `run-tests.sh` runs under `set -e`, and
+`have=$(ip -4 addr show dev lo | grep -c ...)` fails the script outright on a
+host without `iproute2`. The image reached for was stock `golang:1.24-bookworm`,
+which carries neither `ip` nor `iptables`; only the `sctp-test` image built from
+`testdata/Dockerfile` does. The tell was a failure with no `--- FAIL` line
+anywhere in the log — the same signature as a suite killed by contention, and
+worth recognising, because both look like "the tests failed" and neither is.

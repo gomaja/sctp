@@ -1502,10 +1502,22 @@ func waitEstablished(fd int, timeout time.Duration) bool {
 // hasEstablishedAssoc reports whether fd currently carries an association the
 // kernel considers usable.
 //
-// SCTP_STATUS fails with EINVAL on a socket with no association, and reports
-// state 0 (SCTP_EMPTY, which the kernel never leaves an established
-// association in) when there is nothing to describe. Either answer means the
-// socket is not connected.
+// SCTP_STATUS answers EINVAL whenever there is no established association to
+// describe, and that is the only negative answer it gives. Measured on 6.12:
+// fresh, bound and listening sockets all returned EINVAL, on one-to-one and
+// one-to-many alike; so did a one-to-one socket left mid-handshake by a
+// non-blocking connect to a blackholed address, one whose peer had closed, and
+// one that had shut down its own end. Only an established association answered
+// at all. sctp_id2assoc is the reason: on a one-to-one socket it declines to
+// hand back an association unless the socket is itself ESTABLISHED or CLOSING,
+// so the option has nothing to fill in.
+//
+// The State check below therefore never fires. SCTP_EMPTY is still 0 in the
+// uapi enum, so a kernel reporting it would be describing a socket with nothing
+// behind it and false is the right answer — the check is kept as a guard
+// against that, not as a path this package has been observed to take. A
+// mutation replacing it with a bare true survives the whole suite, and this is
+// why, rather than a missing test.
 func hasEstablishedAssoc(fd int) bool {
 	status := &Status{}
 	optlen := unsafe.Sizeof(*status)

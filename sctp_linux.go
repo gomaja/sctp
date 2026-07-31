@@ -910,9 +910,20 @@ func errClosed(op string) error {
 
 // oobPool holds the per-read control-message buffers.
 //
-// 254 bytes is what the read path has always asked for, and it is comfortably
-// more than the cmsgs SCTP delivers: SCTP_SNDRCV is 32 bytes of payload plus a
-// 16-byte header, and SCTP_RCVINFO and SCTP_NXTINFO are smaller again.
+// 254 bytes is what the read path has always asked for. It is enough, but not
+// for the reason it looks like: the cmsgs are not delivered one at a time. With
+// every info option this package can enable turned on and a message queued
+// behind the one being read, one recvmsg carries three, measured on 6.12 as
+// SCTP_NXTINFO (CMSG_SPACE 32), SCTP_RCVINFO (48) and SCTP_SNDRCV (48) — 128
+// bytes in that order.
+//
+// The order is what makes an undersized buffer quiet. SCTP_SNDRCV is written
+// last, so a buffer too small for all three loses the description of the
+// message in the caller's hand while still delivering the prediction of the
+// next one, and the read itself succeeds; the kernel says so only through
+// MSG_CTRUNC, which nothing here inspects. Shrinking this to 48 — exactly
+// CMSG_SPACE(sizeof(struct sctp_sndrcvinfo)) — left the entire suite green
+// until TestPooledOobHoldsEveryInfoCmsgAtOnce existed.
 //
 // Pointers to slices are pooled rather than slices, so putting one back does
 // not allocate a header on the heap to hold it.
@@ -1680,10 +1691,18 @@ func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr 
 	}
 
 	// On a non-blocking socket the handshake is started and EINPROGRESS comes
-	// straight back; EALREADY means one is already under way. Neither is a
+	// straight back; EALREADY would mean one is already under way. Neither is a
 	// failure. The EALREADY settle the blocking path needs does not apply here,
 	// because the wait below confirms establishment in every case rather than
 	// trusting what connect returned.
+	//
+	// Tolerating EALREADY is defensive rather than load-bearing. This is the
+	// first connect on a socket this function created, so the kernel has no
+	// earlier attempt to find: 200 of 200 measured attempts against a
+	// blackholed address returned EINPROGRESS and none returned EALREADY. What
+	// keeps it here is the control hook above, which is handed the descriptor
+	// and could have connected it. A mutation dropping the tolerance survives
+	// the suite for the same reason the branch is unreachable.
 	if _, _, err = sctpConnect(sock, raddr); err != nil &&
 		!errors.Is(err, syscall.EINPROGRESS) && !errors.Is(err, syscall.EALREADY) {
 		return nil, err
