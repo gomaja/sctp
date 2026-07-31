@@ -2351,11 +2351,16 @@ func (c *SCTPConn) GetAssocStats() (*AssocStats, error) {
 // SetAuthActiveKey selects which shared key signs outbound AUTH chunks
 // (RFC 4895 §6.5).
 //
-// The whole SCTP_AUTH_* family depends on the net.sctp.auth_enable sysctl, which
-// is 0 on a stock kernel. With it off every one of these calls fails with
+// The whole SCTP_AUTH_* family needs AUTH negotiated on the socket, and on a
+// stock kernel it is not. With it off every one of these calls fails with
 // EACCES — not EOPNOTSUPP, which is what makes it look like a permissions
-// problem rather than a disabled feature. That was measured; enabling the sysctl
-// makes them all work.
+// problem rather than a disabled feature. That was measured.
+//
+// There are two ways to turn it on, and the per-socket one is usually what a
+// caller wants: SetAuthSupported before binding, which needs no privilege. The
+// other is the net.sctp.auth_enable sysctl, which is system-wide and root-only;
+// this comment used to name it as the only option, which is why the rest of
+// this family still points here.
 func (c *SCTPConn) SetAuthActiveKey(keyNumber uint16) error {
 	id := AuthKeyID{KeyNumber: keyNumber}
 	optlen := unsafe.Sizeof(id)
@@ -2757,7 +2762,14 @@ func (c *SCTPConn) EcnSupported() (bool, error) {
 // SetInterleavingSupported negotiates user message interleaving, the I-DATA
 // chunk of RFC 8260.
 //
-// The kernel refuses this with EPERM unless net.sctp.intl_enable is on and
+// Set it before binding, like the other capability negotiations here: the
+// kernel stores it on the endpoint and reads it when the INIT is built, so on a
+// connection returned by Dial or Accept this succeeds and changes nothing, and
+// InterleavingSupported then reports false — which reads like a broken getter
+// rather than a call that came too late. Use SocketConfig.Control to reach the
+// descriptor beforehand.
+//
+// It is also refused with EPERM unless net.sctp.intl_enable is on and
 // SetFragmentInterleave has been given a non-zero level, because interleaving
 // without that would deliver fragments of different messages to a caller not
 // expecting them.
@@ -2783,8 +2795,12 @@ func (c *SCTPConn) InterleavingSupported() (bool, error) {
 // SCTP_PEER_ADDR_CHANGE and never sees SCTP_ADDR_POTENTIALLY_FAILED concludes
 // the state does not exist.
 //
-// level is one of the SCTPPFState constants. SCTPPFStateHiddenNoOverride locks
-// the setting, after which this returns EACCES.
+// level is one of the SCTPPFState constants; SCTPPFStateEnabled is the one that
+// turns reporting on. Unlike most of the options here it may be changed on a
+// live association, and it can be changed back: sctp_setsockopt_pf_expose
+// rejects only a value above SCTPPFStateEnabled, with EINVAL, and has no locked
+// state. An earlier version of this comment said otherwise; that was not
+// measured, and the kernel has no such path.
 func (c *SCTPConn) SetExposePotentiallyFailed(level uint32) error {
 	return setAssocValue(c.fd(), SCTP_EXPOSE_POTENTIALLY_FAILED_STATE, level)
 }

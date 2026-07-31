@@ -573,3 +573,47 @@ func TestUDPEncapsAndProbeIntervalRoundTrip(t *testing.T) {
 		}
 	})
 }
+
+// TestExposePotentiallyFailedHasNoLockedState pins the corrected claim.
+//
+// The doc comment used to say SCTPPFStateHiddenNoOverride locked the option and
+// that a later change returned EACCES. Neither was true, and neither was
+// measured: sctp_setsockopt_pf_expose rejects only a value above
+// SCTP_PF_EXPOSE_ENABLE, with EINVAL, and has no locked state at all. The
+// constant named there had also been renamed out of existence, so godoc showed a
+// dangling identifier.
+//
+// A wrong doc comment is not caught by any of the round-trip tests, which is how
+// an invented behaviour survived review. This asserts the real one.
+func TestExposePotentiallyFailedHasNoLockedState(t *testing.T) {
+	conn := unboundConn(t)
+
+	// Every order, including returning to a level already used. If any level
+	// locked the option, one of these would fail.
+	for _, level := range []uint32{
+		SCTPPFStateEnabled, SCTPPFStateDisabled, SCTPPFStateEnabled,
+		SCTPPFStateUnset, SCTPPFStateEnabled, SCTPPFStateUnset,
+	} {
+		if err := conn.SetExposePotentiallyFailed(level); err != nil {
+			t.Fatalf("SetExposePotentiallyFailed(%d) after earlier changes: %v; "+
+				"the option is not supposed to lock", level, err)
+		}
+		got, err := conn.ExposePotentiallyFailed()
+		if err != nil {
+			t.Fatalf("ExposePotentiallyFailed: %v", err)
+		}
+		if got != level {
+			t.Fatalf("level = %d after setting %d", got, level)
+		}
+	}
+
+	// A value above the maximum is the one thing it does reject, and with
+	// EINVAL rather than EACCES.
+	err := conn.SetExposePotentiallyFailed(SCTPPFStateEnabled + 1)
+	if err == nil {
+		t.Fatal("an out-of-range exposure level was accepted")
+	}
+	if !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("out-of-range level = %v, want EINVAL", err)
+	}
+}
