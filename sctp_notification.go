@@ -65,10 +65,24 @@ var ErrShortNotification = errors.New("sctp: notification truncated")
 // It is not a bound on every notification. SCTP_SEND_FAILED,
 // SCTP_SEND_FAILED_EVENT and SCTP_REMOTE_ERROR carry a variable tail — the
 // undelivered message, or the peer's ERROR chunk — so their size follows the
-// data rather than the struct, and a failed 64 KiB send produces an event far
-// larger than this. Those are the reads that come back split, and
-// ParseNotification reports them as ErrShortNotification rather than as a
-// complete event with a short tail.
+// data rather than the struct. Measured on 6.12, by queueing to a peer that
+// never reads and then aborting:
+//
+//	message   notifications                       payload each
+//	65485     65516 + 33                          65484 + 1
+//	204800    65516 + 65516 + 65516 + 8380        65484 x3 + 8348
+//
+// So the tail is capped at 65484 bytes and the event around it is 32 bytes
+// larger for SCTP_SEND_FAILED_EVENT, 48 for the legacy SCTP_SEND_FAILED. An
+// undelivered message longer than that arrives as several notifications whose
+// payloads sum to exactly the message, and a single one is already 64 times
+// this constant. A message over roughly a megabyte is refused at the send with
+// EMSGSIZE instead.
+//
+// Those several notifications are each complete, with MSG_EOR set — that is the
+// kernel dividing one message across events, and is not the same thing as the
+// truncation ErrShortNotification reports. Truncation is what an undersized
+// read buffer produces, and it is distinguished by MSG_EOR being clear.
 const NotificationMaxSize = 1024
 
 // notificationHeaderSize is the common prefix every notification shares:

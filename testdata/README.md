@@ -2801,3 +2801,195 @@ A first attempt at that mutation used 2 rather than 4 and produced a compile
 error, since it collided with `SCTP_BINDX_REM_ADDR` in the same switch. A
 mutation that does not build tests nothing, and the harness reports it as such
 rather than counting it either way.
+
+## Round eight: the four items that had been deferred
+
+Four things had been carried as known gaps for several rounds: an unmeasured
+claim about notification sizes, `PeelOff` with no concurrency coverage, a
+descriptor-leak fix with no test, and impairment testing that loopback cannot
+do. Taken one at a time.
+
+### How large a notification really gets
+
+`NotificationMaxSize` is 1024 and documented as holding any *fixed-size*
+notification, with the send-failed events called out as unbounded because they
+carry the undelivered message. That was deduced from the struct and never
+measured, and the deduction had an obvious way to be wrong: the kernel could cap
+the tail it copies, which would make the whole caveat unnecessary.
+
+It does cap it, at 65484 bytes, and the caveat is right anyway. Measured by
+queueing to a peer that never reads and then aborting:
+
+```
+message   notifications                    payload each
+65485     65516 + 33                       65484 + 1
+204800    65516 x3 + 8380                  65484 x3 + 8348
+1048576   refused at the send with EMSGSIZE
+```
+
+The payloads sum to exactly the message. So one event is already 64 times the
+constant, and a longer message arrives as several events rather than one huge
+one.
+
+That last part corrects the wording as much as it confirms it. The old text said
+these are "the reads that come back split", next to a paragraph about
+`ErrShortNotification`, which conflates two things: the kernel dividing one
+message across several **complete** events, each with `MSG_EOR` set, and an
+undersized read buffer truncating one event, which is signalled by `MSG_EOR`
+being **clear**. Only the second is what `ErrShortNotification` reports.
+
+### Close on a peeled connection aborts
+
+`PeelOff` had a layout test, an EINVAL test and a success test, and no
+concurrency coverage at all — the one lifecycle operation with none, while
+`Close` already had four race tests against reads and writes.
+
+Racing it against `Close` turned up something the race itself was not looking
+for: closing a peeled connection takes the full grace period and then aborts.
+
+```
+                    ordinary conn   peeled conn
+Close returned in   21.7us          3.005s
+SHUTDOWN on wire    1               0
+SHUTDOWN_ACK        1               0
+SHUTDOWN_COMPLETE   1               0
+ABORT on wire       0               1
+```
+
+The cause is in the kernel and is deliberate. `sctp_do_peeloff` builds the new
+socket with `sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH)`, and
+`sctp_shutdown` begins:
+
+```c
+	if (!sctp_style(sk, TCP))
+		return;
+```
+
+So `shutdown(2)` on a peeled socket succeeds and does nothing. `SCTP_STATUS`
+goes on reporting `SCTP_ESTABLISHED` — measured, unchanged for well over a
+second after the shutdown, where an ordinary connection reports EINVAL within
+150ms — so `assocGone` never fires, `waitAssocGone` runs its budget out, and the
+close falls back to the abort it keeps for exactly that case.
+
+Nothing here is worked around. It is documented on `PeelOff`, and
+`TestClosingAPeeledConnectionAbortsRatherThanShuttingDown` asserts today's
+behaviour in the form that fails if a later kernel starts honouring shutdown on
+these sockets.
+
+It also explains a cost: the race test was taking 84 seconds, essentially all of
+it peeled connections waiting out grace periods. With a short budget it takes
+0.79 seconds.
+
+### A fix whose failure path cannot be reached
+
+`FileListener` duplicates the descriptor it is handed and then clears the
+non-blocking flag. The fix under test released the duplicate when that second
+step fails. Reaching it needs `fcntl(F_SETFL)` to fail on a descriptor that
+`F_DUPFD_CLOEXEC` has just returned, and it does not: the `O_PATH` descriptor
+that looked most likely to refuse it accepts it, and Go's `SetNonblock` skips
+the call entirely when the flag is already in the requested state.
+
+So that branch is unreachable from a test, which is worth stating rather than
+working around with a seam that exists only for the test. It stays as a
+defensive close, in the same spirit as the state check in `hasEstablishedAssoc`.
+
+What is reachable is covered: the dup failing outright, which owns nothing and
+so can leak nothing; fifty create-and-close cycles returning to the same
+descriptor count; and the property the dup exists for, that the caller's file
+still works after the listener built from it is closed.
+
+### Impairment on a path that has one
+
+Every timing and reliability claim in this package had been made against
+loopback, which bypasses the qdisc layer: netem attached to `lo` affects nothing
+and `tc -s qdisc show dev lo` reports zero packets. Two containers on a docker
+network, netem on the real interface, capture on the sender:
+
+```
+case             median    p90        SRTT     qdisc pkts   retransmissions
+control          0.0ms     0.1ms      0ms      0            0
+delay 100ms      208.1ms   211.1ms    207ms    46 / 45      0
+loss 20%         64.1ms    2043.8ms   68ms     47 / 42      3
+reorder 25%      46.8ms    49.9ms     40ms     45 / 44      0
+```
+
+The delay row is the one that could not have been obtained before:
+`GetPeerAddrInfo` reports an SRTT of 207ms against an application round trip of
+208.1ms, on a path told to add 100ms each way. That the package's SRTT is real
+rather than a plausible-looking number is not checkable where the RTT is zero.
+
+The `qdisc pkts` column is the guard. Zero means the rule was attached where the
+traffic does not go, which is the loopback trap this harness exists to avoid; it
+reads zero for the control, where no qdisc is attached, and non-zero everywhere
+else.
+
+Loss produces retransmissions and a p90 two seconds long, which is the
+retransmission timeout rather than the path. Reordering at 25% is absorbed
+without a single retransmission — SCTP has its own sequence numbers and does not
+need the network to keep order.
+
+Loss also drives the path into RFC 7829's potentially-failed state, which is the
+one state this package exposes that nothing had ever observed happening. It is
+not reliable enough to assert from a single run, which is why it was repeated
+rather than reported from the first sighting:
+
+```
+                  path state     rto        cwnd    delivered
+20% loss   run 1  SCTP_PF        4000ms     1500    35/40
+           run 2  SCTP_ACTIVE    1000ms     6000    32/40
+           run 3  SCTP_PF        60000ms    1500    36/40
+           run 4  SCTP_ACTIVE    1000ms     6000    38/40
+           run 5  SCTP_PF        4000ms     1500    40/40
+40% loss   run 1  SCTP_PF        60000ms    1500    15/40
+           run 2  SCTP_PF        4000ms     1500    19/40
+```
+
+Three of five at 20%, two of two at 40%. Every run that reached `SCTP_PF` also
+shows the congestion window collapsed from 4380 to 1500 and the retransmission
+timeout backed off, twice as far as 60000ms — which is `RtoInfo.Max`'s default,
+and the number BLACKHOLE.md gives as the reason an unreachable peer takes
+minutes to report. Under heavy loss it is reached in seconds.
+
+The first version of this note was written from one run that happened to hit
+`SCTP_PF`. The next run did not, and a flat claim that the state is reached
+under 20% loss would have been wrong three times in five.
+
+The existing `testdata/failover.sh` was also run rather than assumed to work: a
+multi-homed association survived its primary path being cut (115 of 115 round
+trips), and the single-homed control broke as it must (3 failures), with the
+DROP rules matching packets in both cases.
+
+### Two more counting mistakes
+
+Both produced a confident wrong number rather than an error, like the tshark
+mistakes recorded in round seven.
+
+Retransmissions were counted as duplicate TSNs across the whole capture. The
+capture sees both directions and the two endpoints number their TSNs
+independently, so every TSN appearing in both sequences counted as a
+retransmission: the control run reported 60 of them on an unimpaired path with
+no loss, exactly one per round trip. Filtered to one direction it reports 0.
+
+The other was a process mistake rather than an analysis one. The harness was
+edited while running, and `bash` reads a script incrementally: the interpreter
+picked up the new bytes at its old offset, died on a syntax error, and the last
+case never ran. The same hazard as validating a source tree that is being edited
+underneath the test run.
+
+### Four mutations
+
+Each of the new assertions was broken deliberately and watched to fail: the
+send-failed decoder dropping its undelivered data, `NotificationMaxSize`
+inflated past every event, `FileListener` adopting the caller's descriptor
+instead of duplicating it, and `waitAssocGone` returning true immediately. Four
+for four, each caught by exactly the test written for it.
+
+The second is the one worth recording. The first version of
+`TestSendFailedEventExceedsNotificationMaxSize` **survived** it: with the
+constant raised above every event, each one fell through the size check and the
+test ended in a skip, which the runner reports as success. It now separates the
+two ways of finding nothing — no events at all, which is the environment
+refusing to cooperate, from events that all fit inside the constant, which means
+the constant has stopped warning about anything — and fails on the second. The
+mutation harness for this round reports skips alongside failures for the same
+reason.

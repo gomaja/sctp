@@ -276,3 +276,207 @@ func TestAbortDoesNotWait(t *testing.T) {
 		t.Errorf("Abort took %v against a dead peer; it must not wait", d)
 	}
 }
+
+// oneToManyPair returns a bound and listening one-to-many socket wrapped as an
+// SCTPConn, plus a connected client, and the association id to peel.
+//
+// PeelOff is only meaningful on a one-to-many socket; this package creates only
+// one-to-one ones, so the socket is made here by hand exactly as
+// TestPeelOffSucceedsOnAOneToManySocket does.
+func oneToManyPair(t *testing.T) (server, client *SCTPConn, assocID int) {
+	t.Helper()
+
+	m2m, err := syscall.Socket(syscall.AF_INET,
+		syscall.SOCK_SEQPACKET|syscall.SOCK_CLOEXEC, syscall.IPPROTO_SCTP)
+	if err != nil {
+		t.Skipf("cannot create a one-to-many SCTP socket: %v", err)
+	}
+	sa := &syscall.SockaddrInet4{}
+	copy(sa.Addr[:], []byte{127, 0, 0, 1})
+	if err := syscall.Bind(m2m, sa); err != nil {
+		_ = syscall.Close(m2m)
+		t.Skipf("bind: %v", err)
+	}
+	if err := syscall.Listen(m2m, 4); err != nil {
+		_ = syscall.Close(m2m)
+		t.Skipf("listen: %v", err)
+	}
+	bound, err := syscall.Getsockname(m2m)
+	if err != nil {
+		_ = syscall.Close(m2m)
+		t.Fatalf("getsockname: %v", err)
+	}
+	port := bound.(*syscall.SockaddrInet4).Port
+
+	server = NewSCTPConn(m2m, nil)
+	if err := server.SubscribeEvents(SCTP_EVENT_DATA_IO); err != nil {
+		_ = server.Close()
+		t.Skipf("SubscribeEvents: %v", err)
+	}
+
+	client, err = DialSCTP("sctp", nil, mustResolve(t, "127.0.0.1:"+itoa(port)))
+	if err != nil {
+		_ = server.Close()
+		t.Skipf("dial: %v", err)
+	}
+	if _, err := client.SCTPWrite([]byte("x"), nil); err != nil {
+		_ = server.Close()
+		_ = client.Close()
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 64)
+	if err := server.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	_, info, err := server.SCTPRead(buf)
+	if err != nil || info == nil || info.AssocID == 0 {
+		_ = server.Close()
+		_ = client.Close()
+		t.Skipf("no association id to peel (%v)", err)
+	}
+	return server, client, int(info.AssocID)
+}
+
+// TestPeelOffRacesWithClose is the one lifecycle operation that had no
+// concurrency coverage.
+//
+// Close swaps the descriptor to -1 and closes it, while PeelOff reads the
+// descriptor and then makes a syscall with it. Between those two points the
+// number can be closed and handed to something else, so the invariants that
+// matter are not about which of the two wins: either outcome is legitimate.
+// What must hold is that PeelOff never reports success while handing back a
+// descriptor it does not own, and that neither ordering leaks one.
+//
+// The descriptor check is the same signature the original ABI defect had — a
+// peeled fd of 0, 1 or 2 means the reply was read from the wrong offset, and
+// under this race it would also mean a standard stream had been adopted.
+func TestPeelOffRacesWithClose(t *testing.T) {
+	before := openFds(t)
+
+	for round := 0; round < 30; round++ {
+		server, client, assocID := oneToManyPair(t)
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		peeled := make(chan *SCTPConn, 4)
+		go func() {
+			defer wg.Done()
+			defer close(peeled)
+			for i := 0; i < 4; i++ {
+				p, err := server.PeelOff(assocID)
+				if err != nil {
+					continue
+				}
+				if p == nil {
+					t.Error("PeelOff returned a nil connection and a nil error")
+					return
+				}
+				if fd := p.fd(); fd <= 2 {
+					t.Errorf("PeelOff returned descriptor %d while the parent "+
+						"was closing; anything at or below 2 is a standard "+
+						"stream", fd)
+				}
+				peeled <- p
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			// Vary where the close lands relative to the peel, so the window
+			// between reading the descriptor and using it is hit sometimes
+			// rather than never.
+			time.Sleep(time.Duration(round%7) * 200 * time.Microsecond)
+			// A short grace period rather than Close's default three seconds.
+			// The racy part is the descriptor swap, which is identical either
+			// way; the timeout only governs how long the teardown waits for a
+			// peer that is not going to answer, and thirty rounds of that is
+			// seventy-five seconds of the suite spent waiting.
+			_ = server.CloseWithTimeout(50 * time.Millisecond)
+		}()
+
+		wg.Wait()
+		for p := range peeled {
+			// A peeled descriptor is the caller's to close, and closing it must
+			// not be affected by the parent having gone away underneath.
+			// A short budget on purpose: Close of a peeled connection always
+			// runs its grace period out, because shutdown(2) does nothing on
+			// these sockets. See PeelOff. Thirty rounds at the default would
+			// be ninety seconds of the suite spent waiting for that.
+			if err := p.CloseWithTimeout(20 * time.Millisecond); err != nil &&
+				!errors.Is(err, syscall.EBADF) {
+				t.Errorf("closing a peeled connection gave %v", err)
+			}
+		}
+		_ = server.CloseWithTimeout(50 * time.Millisecond)
+		_ = client.CloseWithTimeout(50 * time.Millisecond)
+	}
+
+	// Every descriptor opened above is closed above, so the count must come
+	// back. A peel that succeeded and was then dropped on the floor by an error
+	// path would show up here and nowhere else.
+	if after := openFds(t); after > before+2 {
+		t.Errorf("descriptors grew from %d to %d over 30 rounds of racing "+
+			"PeelOff against Close", before, after)
+	}
+}
+
+// TestClosingAPeeledConnectionAbortsRatherThanShuttingDown pins behaviour this
+// package cannot change and a caller has to know about.
+//
+// sctp_do_peeloff builds the new socket with SCTP_SOCKET_UDP_HIGH_BANDWIDTH,
+// and sctp_shutdown begins "if (!sctp_style(sk, TCP)) return". So shutdown(2)
+// on a peeled socket reports success and emits nothing, SCTP_STATUS goes on
+// reporting SCTP_ESTABLISHED, and closeSctpSocket has no way to learn the
+// handshake will never finish. It waits out the whole budget and aborts.
+//
+// Captured on both sides: an ordinary Close puts SHUTDOWN, SHUTDOWN_ACK and
+// SHUTDOWN_COMPLETE on the wire in 21.7us, while a peeled one puts a single
+// ABORT after 3.005s.
+//
+// This asserts today's imperfect behaviour and is written to fail if it
+// improves — if a kernel starts honouring shutdown here, the close returns
+// early and the assertion below stops holding, which is the notification that
+// the documentation on PeelOff needs revisiting.
+func TestClosingAPeeledConnectionAbortsRatherThanShuttingDown(t *testing.T) {
+	server, client, assocID := oneToManyPair(t)
+	defer func() {
+		_ = server.CloseWithTimeout(20 * time.Millisecond)
+		_ = client.CloseWithTimeout(20 * time.Millisecond)
+	}()
+
+	peeled, err := server.PeelOff(assocID)
+	if err != nil {
+		t.Skipf("PeelOff: %v", err)
+	}
+
+	// Short enough to keep the suite quick, long enough that the difference
+	// between "ran the budget out" and "finished early" is unambiguous.
+	const grace = 400 * time.Millisecond
+
+	start := time.Now()
+	if err := peeled.CloseWithTimeout(grace); err != nil {
+		t.Fatalf("CloseWithTimeout: %v", err)
+	}
+	took := time.Since(start)
+	t.Logf("closing the peeled connection took %v against a %v grace period",
+		took, grace)
+
+	if took < grace {
+		t.Errorf("the close finished in %v, inside its %v grace period, so the "+
+			"association was shut down gracefully; shutdown(2) now works on a "+
+			"peeled socket and the note on PeelOff is out of date", took, grace)
+	}
+
+	// The contrast is what makes the number above mean something: the same
+	// call on an ordinary connection returns far inside the same budget.
+	c2, s2 := eorPairNoCleanup(t)
+	defer func() { _ = s2.CloseWithTimeout(20 * time.Millisecond) }()
+	start = time.Now()
+	if err := c2.CloseWithTimeout(grace); err != nil {
+		t.Fatalf("CloseWithTimeout on an ordinary conn: %v", err)
+	}
+	if ordinary := time.Since(start); ordinary >= grace {
+		t.Errorf("an ordinary Close also ran its %v budget out (%v), so the "+
+			"peeled result above says nothing about peeling", grace, ordinary)
+	}
+}

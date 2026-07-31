@@ -1808,6 +1808,26 @@ type peeloffArg struct {
 // of them returns EINVAL from the kernel — sctp_do_peeloff rejects any other
 // style. It is usable through NewSCTPConn on a one-to-many descriptor the
 // caller made themselves.
+//
+// Close on the result does not shut the association down gracefully. A peeled
+// socket looks one-to-one from userspace but is not one internally:
+// sctp_do_peeloff builds it with sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH),
+// and sctp_shutdown opens with "if (!sctp_style(sk, TCP)) return", so shutdown(2)
+// on it succeeds and does nothing. Measured, with a capture on both sides:
+//
+//	                    ordinary conn   peeled conn
+//	Close returned in   21.7us          3.005s
+//	SHUTDOWN on wire    1               0
+//	ABORT on wire       0               1
+//
+// So Close waits out its whole grace period — SCTP_STATUS keeps reporting
+// SCTP_ESTABLISHED, so nothing tells it the handshake finished — and then falls
+// back to the abort. The peer sees an ABORT rather than a SHUTDOWN.
+//
+// Use CloseWithTimeout with a short budget, or Abort, if that outcome is
+// acceptable and the delay is not. This is kernel behaviour rather than a defect
+// here, and TestClosingAPeeledConnectionAbortsRatherThanShuttingDown is written
+// to fail if a later kernel starts honouring shutdown on these sockets.
 func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
 	// SCTP_SOCKOPT_PEELOFF gives no way to ask for close-on-exec, so the
 	// peeled descriptor would leak into any child forked afterwards — the same
