@@ -491,11 +491,40 @@ GET_ASSOC_NUMBER:    Operation not supported
 GET_ASSOC_ID_LIST:   Operation not supported
 ```
 
-`SCTP_PR_ASSOC_STATUS` (RFC 7496 §4.3) and `SCTP_PEER_ADDR_THLDS_V2` both work on
+`SCTP_PR_ASSOC_STATUS` (RFC 7496 §4.4) and `SCTP_PEER_ADDR_THLDS_V2` both work on
 a one-to-one socket and are now bound. The v2 thresholds add `spt_pathcpthld`,
-which bounds how long a Potentially Failed path keeps being probed; its default of
-`0xffff` means indefinitely, and asserting that default is what proves the field
-is read at the right offset. Its layout matches v1 — address at 8, 144 bytes.
+the RFC 7829 §5 Primary Path Switchover threshold — the consecutive-error count
+on the primary path at which the stack makes the current active path primary
+instead. Its default of `0xffff` disables switchover, and asserting that default
+is what proves the field is read at the right offset.
+
+It is not a probing control, which is what an earlier version of this note said.
+The kernel stores it in `transport->ps_retrans` and reads it in exactly one
+place, `sm_sideeffect.c`:
+
+```c
+if (transport->error_count > transport->ps_retrans &&
+    asoc->peer.primary_path == transport &&
+    asoc->peer.active_path != transport)
+        sctp_assoc_set_primary(asoc, asoc->peer.active_path);
+```
+
+Nothing consults it when deciding whether to keep heartbeating a path.
+Confirmed live as well: `PathCpThld` read back through the getter tracks
+`net.sctp.ps_retrans` exactly (65535 → 1234 → 7) while `PathPfThld` tracks
+`net.sctp.pf_retrans` independently.
+
+Its layout does **not** simply match v1. Both put a `sockaddr_storage` after the
+association id without being packed, so the address offset follows the word
+size, and the two structs round to different totals on 32-bit:
+
+| | linux/amd64 | linux/arm/v7 |
+|---|---|---|
+| `sctp_paddrthlds` | 144, addr@8 | 136, addr@4 |
+| `sctp_paddrthlds_v2` | 144, addr@8 | 140, addr@4 |
+
+Both are marshalled through derived offsets for that reason; see
+`TestSockaddrStorageOptionLayouts`.
 
 `SCTP_GET_ASSOC_NUMBER` and `SCTP_GET_ASSOC_ID_LIST` genuinely return EOPNOTSUPP
 here. `SCTP_SOCKOPT_CONNECTX_OLD` and `SCTP_SOCKOPT_PEELOFF_FLAGS` are internal
@@ -1919,3 +1948,197 @@ The last two that did apply are bound now: RFC 6951 UDP encapsulation, which is
 what lets an association cross a middlebox that drops IP protocol 132, and
 RFC 8899 PLPMTUD, which finds a path's MTU without trusting ICMP. Both round-trip
 against a live association.
+
+## Round five: the edges
+
+A sixth review pass, run the same way as the last — independent finders across
+new code, kernel ABI, concurrency, documentation truth, test holes and API
+surface, each finding then handed to two agents whose job was to refute it. The
+struct-layout and constant surface came back clean again. Everything below is at
+an edge: descriptor lifecycle, zero-length buffers, word size, and prose.
+
+### `Abort()` did nothing while a reader was parked
+
+`abortSctpSocket` armed `SO_LINGER{1,0}` and closed the descriptor. That is
+enough on an idle socket and not enough when another goroutine is blocked in
+`recvmsg`: the blocked call holds a reference to the `struct file`, so `close()`
+only unhooks the descriptor number and defers the final release. `sctp_close`
+never runs, so the ABORT is never emitted.
+
+Captured on loopback, before and after:
+
+| | before | after |
+|---|---|---|
+| ABORT (chunk 6) | absent | frame 5 |
+| SHUTDOWN (chunk 7) | frame 7 | absent |
+| parked reader | still blocked at 4s | returned in 5ms |
+
+The pre-fix capture also shows HEARTBEAT and HEARTBEAT_ACK: the association was
+alive and being maintained throughout, and was eventually torn down *gracefully*
+with SHUTDOWN/SHUTDOWN_ACK/SHUTDOWN_COMPLETE. So `Abort()` — which returned
+`nil` in 29µs — did the exact opposite of what it promises, and the caller had
+no way to know.
+
+The fix is `shutdown(fd, SHUT_RD)` before the close. `SHUT_RD` specifically:
+`SHUT_RDWR` and `SHUT_WR` also wake the reader, so they pass the waking test,
+but they ask for a graceful teardown and the capture then shows SHUTDOWN and no
+ABORT at all. That mutation is caught by `TestAbortReportsTheUserAbortCause`,
+which asserts the peer sees `SCTP_COMM_LOST`.
+
+### An accept deadline leaked into every connection
+
+`sctp_copy_sock` copies `sk_rcvtimeo` onto the socket the kernel creates for a
+new association, and the accept deadline is implemented by putting `SO_RCVTIMEO`
+on the listener. So the polling accept loop — a short deadline so the server can
+notice a shutdown flag between accepts — handed out connections already armed to
+time out. The `SCTPConn` wrapping the descriptor records no deadline, so the read
+path's corrective `applyTimeout` never runs.
+
+Measured: a `Read` on a connection that never had a deadline of its own returned
+after 309ms against a 300ms accept window, with `SO_RCVTIMEO` reading back
+`0s300000us`. And because no deadline is recorded locally the errno is not
+mapped, so the caller gets a bare `EAGAIN` for which
+`errors.Is(err, os.ErrDeadlineExceeded)` is false — the failure cannot even be
+classified.
+
+### A zero-length read consumed a byte
+
+`recvmsg` substitutes a one-byte scratch iovec when the data buffer is empty and
+the control buffer is not, mirroring the stdlib. The control buffer on this path
+is never empty, so a caller's empty slice became a one-byte read into a
+package-local variable: the kernel dequeued a payload byte, `recvmsg` returned 1,
+and `Read` returned `n=1` for a zero-length buffer. Eight bytes queued, `Read(nil)`
+returned 1, the next read returned `"BCDEFGH"`.
+
+It is not only `Read(nil)` that gets there. The ordinary framing loop reads into
+`b[total:]`, which is empty the moment the buffer fills — so `total` grew past
+`cap` and the caller's next line, `b[:total]`, panicked.
+
+### Four option structs were wrong on 32-bit
+
+Most SCTP option structs carrying an address are `packed, aligned(4)` and so are
+identical everywhere. Four are not, and their `sockaddr_storage` keeps the
+alignment of the `unsigned long` inside it — which follows the word size:
+
+| | linux/amd64 | linux/arm/v7 |
+|---|---|---|
+| `sockaddr_storage` | align 8 | align 4 |
+| `sctp_udpencaps` | 144, addr@8 | 136, addr@4 |
+| `sctp_probeinterval` | 144, addr@8 | 136, addr@4 |
+| `sctp_paddrthlds` | 144, addr@8 | 136, addr@4 |
+| `sctp_paddrthlds_v2` | 144, addr@8 | 140, addr@4 |
+| `sctp_paddrparams` (packed) | 156, addr@4 | 156, addr@4 |
+
+The Go mirrors baked in the 64-bit answer, and `sctp_linux.go` is tagged
+`linux && !386`, so `linux/arm` and `linux/mips` compile the real setsockopt
+path. The setters demand an exact `optlen` and would be refused outright; the
+getters only check the length is *at least* `sizeof`, so an oversized 144 is
+accepted, the kernel reads the address from the wrong offset and writes back 136
+bytes, leaving the trailing field holding whatever the caller passed in. That
+one is silent.
+
+`sctp_assoc_stats` is a case the review missed and the probe caught: it is 256
+bytes with its counters at 136 on **both** word sizes, and only the
+`sockaddr_storage` between them moves — 8 on 64-bit, 4 on 32-bit, the difference
+absorbed by padding. No length check can see that at all.
+
+All five are marshalled through derived offsets now. The mutation results are
+the interesting part: pinning the alignment to 8, giving `sctp_paddrthlds_v2` the
+same size as v1, and hard-coding the `sctp_assoc_stats` address offset all
+**survive on amd64 and fail on arm** — so the layout assertions run under
+`linux/arm/v7` in CI, and a formula test checks both alignments on any host.
+
+### Tests that could not fail
+
+- **Option numbers 32 to 133 were unpinned.** Their only coverage was set/get
+  round trips through the same constant, which cannot fail whatever the number
+  is. Swapping `SCTP_ASCONF_SUPPORTED` with `SCTP_AUTH_SUPPORTED` left the
+  complete suite green while a live probe showed `SetAuthSupported(true)` reading
+  back 1 through the wrong option, with AUTH still off and dynamic address
+  reconfiguration switched on instead.
+- **`NotificationMaxSize` was never compared against anything.** Shrinking it
+  from 1024 to 128 survived the full suite — and 128 is below the 148 of
+  `SCTP_PEER_ADDR_CHANGE`, so a caller sizing their buffer as documented would
+  read the path-failure event in fragments and reject every one as truncated.
+- **`sctp_unsupported.go` is executed by nothing.** `go build` for a cross
+  target skips `_test.go` files, `go vet` type-checks without running, and every
+  CI job was `ubuntu-latest`. Twenty-six of the thirty stubs could return `nil`
+  with the suite green — and `ListenSCTP` returning `(nil, nil)` makes a caller
+  who correctly checks `err` panic on the next line. There is a `macos-latest`
+  job now, and the test covers all thirty.
+- **`TestReadMsgZeroLengthMessage` had never run.** Its guard skipped when the
+  zero-length write was refused, and the kernel always refuses one. Unlike the
+  two AUTH skips, no second pass reached it. It now asserts the contract that
+  exists: `SCTPWrite` of an empty buffer is `EINVAL`, `Conn.Write` is `(0, nil)`.
+- **`TestSCTPReadRetriesEINTRUnderLoad` passes with the retry deleted.** It
+  dials sixty peers and asserts no read returned `EINTR`, but the read path's own
+  comment records that EINTR appears at a thousand peers and never at a hundred.
+  Deleting the retry left it green in 0.13s. The replacement pins the reader to
+  an OS thread and delivers SIGURG to that thread with `tgkill` while it is
+  blocked in `recvmsg` — the read deadline is what makes the signal observable,
+  since Go installs handlers with `SA_RESTART` and only a socket carrying
+  `SO_RCVTIMEO` returns `EINTR` anyway.
+- **No test ever created an AF_INET6 endpoint**, so `bindLocal`'s v6 wildcard
+  could become `IPv4zero` undetected. The new test skips on an independent
+  syscall-level probe rather than on `ListenSCTP`'s own error — the first version
+  skipped instead of failing under exactly the mutation it existed to catch.
+- **`blackholeAvailable` reported a false positive.** It inspected only the
+  immediate return of one non-blocking connect, so a gateway that ICMPs a few
+  milliseconds later still read as "blackholed" and the tests it guards failed on
+  a surprising errno instead of skipping. It now polls `SO_ERROR`; in Docker the
+  gateway answers `ENOPROTOOPT` (errno 92) and the tests skip cleanly.
+
+### Documentation that was wrong
+
+`PathCpThld` was documented as the count at which the stack stops probing a
+Potentially Failed path. It is the RFC 7829 §5 Primary Path Switchover
+threshold. The kernel stores it in `transport->ps_retrans` and reads it in
+exactly one place:
+
+```c
+if (transport->error_count > transport->ps_retrans &&
+    asoc->peer.primary_path == transport &&
+    asoc->peer.active_path != transport)
+        sctp_assoc_set_primary(asoc, asoc->peer.active_path);
+```
+
+Nothing consults it when deciding whether to keep heartbeating. Confirmed live:
+the value read back through the getter tracks `net.sctp.ps_retrans` exactly
+(65535 → 1234 → 7) while `PathPfThld` tracks `net.sctp.pf_retrans`
+independently. So the `0xffff` default disables switchover; it does not mean
+probing continues indefinitely.
+
+`SCTPPFStateDisabled` was documented as making `GetPeerAddrInfo` report a
+potentially-failed path as `SCTP_ACTIVE`. It makes it fail:
+
+```c
+if (transport->state == SCTP_PF &&
+    transport->asoc->pf_expose == SCTP_PF_EXPOSE_DISABLE) {
+        retval = -EACCES;
+        goto out;
+}
+```
+
+and the `SCTP_UNKNOWN → SCTP_ACTIVE` fixup happens after that check. The sysctl
+default is `UNSET` (0), not `DISABLE`, and at `UNSET` the PF state *is* visible —
+only the notification is withheld. So the comment told every default-socket user
+they would not see states they will in fact see.
+
+Also corrected: `SetAutoAsconf` needs a socket bound to the **wildcard**, not
+merely a bound one (`!sctp_is_ep_boundall(sk) && *val` → `EINVAL`), which rules
+out the listener-bound-to-named-addresses case the old advice pointed at;
+`SCTP_PR_SCTP_ALL` is not a send flag at all, its only two kernel uses being in
+the PR status getters; `SCTP_AUTH_FREE_KEY` is local and says nothing about the
+peer; `SetAuthKey`'s documented 8192-byte bound does not exist, the kernel's is
+`USHRT_MAX`; error causes 11 to 13 are attributed to RFC 9260 by IANA, not to the
+Implementation Guide, and 14 is Unassigned; RFC 6951 is updated by RFC 8899, not
+RFC 9899, which is a YANG ACL model. And roughly thirty RFC section numbers were
+wrong — RFC 4895 has no §6.5 to §6.9 at all, RFC 6525 has no §6.5, and the AUTH
+socket options are defined by RFC 6458 §8, not by RFC 4895. Each was checked
+against the RFC text rather than corrected from the review's list.
+
+The platform promise was overstated in two directions: `plan9`, `js/wasm` and
+`wasip1/wasm` do not compile (`syscall.RawSockaddrInet4` is undefined there),
+and `ResolveSCTPAddr` and the deadline setters work everywhere rather than
+returning `ErrUnsupported`, so the `errors.Is` gate shown next to the claim never
+trips for them.
