@@ -38,15 +38,22 @@ type Notification interface {
 }
 
 // ErrShortNotification is returned by ParseNotification when the buffer holds
-// fewer bytes than the notification declares itself to be.
+// fewer bytes than the notification declares itself to be, or when the declared
+// length is too small to be an event at all.
 //
 // A notification read into an undersized buffer arrives split, and what follows
-// is not dropped. Measured by reading a 24 byte SCTP_ASSOC_CHANGE with an 8 byte
-// buffer: three reads, every one of them flagged MSG_NOTIFICATION, with MSG_EOR
-// set only on the last. So the continuation fragments look like fresh
-// notifications to anything that only tests the flag — and a fragment whose
-// first two bytes happen to match a known type would decode into an event
-// assembled from the middle of another one.
+// is not dropped. Measured by reading a 20 byte SCTP_ASSOC_CHANGE with an 8 byte
+// buffer:
+//
+//	read 1: n=8 notification=1 eor=0  0180 0000 14000000
+//	read 2: n=8 notification=1 eor=0  00000000 0a000a00
+//	read 3: n=4 notification=1 eor=1  68030100
+//
+// Every one is flagged MSG_NOTIFICATION, with MSG_EOR set only on the last. So
+// the continuation fragments look like fresh notifications to anything that only
+// tests the flag — and a fragment whose first two bytes happen to match a known
+// type would otherwise decode into an event assembled from the middle of
+// another one.
 //
 // Read with a buffer of at least NotificationMaxSize, and treat a fragment
 // without MSG_EOR as incomplete rather than as an event.
@@ -73,9 +80,14 @@ const notificationHeaderSize = 8
 //
 // These are the values the peer puts in an ERROR or ABORT chunk, so they answer
 // "why did this association fail" — the question those three notifications
-// exist to answer. Codes 11 to 14 are not in the base specification's table;
-// they come from the Implementation Guide and from RFC 6951, and Linux both
-// sends and reports them.
+// exist to answer.
+//
+// Codes 1 to 13 are all in the base specification and IANA attributes every one
+// of them to RFC 9260; an earlier version of this comment placed 11 to 13 in the
+// Implementation Guide instead, which was where they were first written but not
+// where they live now. Code 14 is the odd one: IANA lists 14-159 as Unassigned,
+// and Linux defines SCTP_ERROR_NEW_ENCAP_PORT there from the UDP encapsulation
+// work. So a peer that is not Linux may mean something else by it.
 //
 // They are deliberately untyped, so that comparing them against Error works
 // whether the field is a uint16 or a uint32.
@@ -185,6 +197,11 @@ type AssocChange struct {
 	AssocID         SCTPAssocID
 	// Info carries any additional data the kernel appended, most usefully the
 	// ABORT chunk when State is SCTP_COMM_LOST.
+	//
+	// Its extent comes from the length in the event's own header, not from the
+	// buffer the event was read into, so passing a read buffer rather than
+	// b[:n] to ParseNotification does not append whatever the previous read
+	// left behind.
 	Info []byte
 }
 
@@ -365,9 +382,16 @@ const (
 
 // Indications reported by AuthKeyEvent.
 const (
-	SCTP_AUTH_NEW_KEY  = iota // a new shared key is usable
-	SCTP_AUTH_FREE_KEY        // a key has been released and will not be used again
-	SCTP_AUTH_NO_AUTH         // the peer does not support AUTH
+	SCTP_AUTH_NEW_KEY = iota // a new shared key is usable
+	// SCTP_AUTH_FREE_KEY says this endpoint has released a key: it is emitted
+	// when the local refcount drops, from sctp_auth_deact_key_id and from the
+	// destructor of the last locally queued chunk that referenced the key. It
+	// says nothing about the peer, which may still have packets in flight
+	// signed with it — so waiting for this before DeleteAuthKey does not make
+	// the deletion safe. RFC 6458 §6.1.8 words it the same way: the SCTP
+	// implementation will no longer use the key.
+	SCTP_AUTH_FREE_KEY
+	SCTP_AUTH_NO_AUTH // the peer does not support AUTH
 )
 
 // Flags reported by SendFailed and SendFailedEvent, saying how far the
@@ -389,6 +413,11 @@ type StreamReset struct {
 	AssocID SCTPAssocID
 	// Streams are the stream identifiers the event covers. Empty means all of
 	// them, which is how the kernel reports a request made with no list.
+	//
+	// The list ends where the event's declared length ends, not where the read
+	// buffer does. That distinction decides the meaning rather than a detail of
+	// it: bounding by the buffer invents one identifier per two spare bytes, so
+	// an event covering every stream arrives naming a handful of specific ones.
 	Streams []uint16
 }
 
@@ -471,9 +500,10 @@ const sendFailedEventMinSize = 32
 // AuthKeyEvent is SCTP_AUTHENTICATION_EVENT (RFC 6458 §6.1.8), reporting a
 // change in the AUTH shared keys in force.
 //
-// It is what makes key rollover observable: DeactivateAuthKey and
-// DeleteAuthKey act locally, and only SCTP_AUTH_FREE_KEY says the peer has
-// stopped using the old one.
+// It is what makes key rollover observable, but every indication it carries is
+// about this endpoint. SCTP_AUTH_FREE_KEY in particular says the local stack
+// has released a key, not that the peer has stopped using it — see the constant
+// — so it is not the signal to wait for before DeleteAuthKey.
 type AuthKeyEvent struct {
 	typ          uint16
 	flags        uint16
@@ -532,16 +562,40 @@ func ParseNotification(b []byte) (Notification, error) {
 	length := nativeEndian.Uint32(b[4:8])
 
 	// The header says how long the whole event is; b is what actually arrived.
-	// Without this the two were never compared, so a notification split across
-	// reads — which is what happens whenever the buffer is smaller than the
-	// event, and unavoidable for the ones carrying a variable tail — decoded
-	// from its first fragment and came back with a nil error and a short tail.
-	// A caller reading Data then saw a truncated message it had no way to know
+	//
+	// A declared length longer than what arrived means the notification was split
+	// across reads — which is what happens whenever the buffer is smaller than
+	// the event, and unavoidable for the ones carrying a variable tail. Until
+	// these were compared, such a fragment decoded and came back with a nil error
+	// and a short tail, leaving the caller reading Data with no way to know it
 	// was truncated. Measured: a header declaring 65516 bytes with 20 present
 	// returned an AssocChange reporting Length() == 65516 and no error.
+	//
+	// This is also what keeps the reslice below in range, so the boundary at
+	// exactly len(b)+1 is the one that matters: one byte further and the slice
+	// panics instead of returning an error.
 	if length > uint32(len(b)) {
 		return nil, ErrShortNotification
 	}
+
+	// From here the declared length is the event, and b is only the buffer it
+	// came in. The kernel sets sn_length to the whole size of the event and
+	// delivers exactly that many bytes — verified on a live association, where
+	// SCTP_ASSOC_CHANGE arrived as 20 bytes declaring 20 and SCTP_PEER_ADDR_CHANGE
+	// as 148 declaring 148 — so anything past it belongs to some other read.
+	//
+	// Comparing the two and then going on to slice by len(b) is what the decoders
+	// below used to do, and it had two consequences. A caller who passed their
+	// read buffer rather than b[:n] got the stale bytes behind the event returned
+	// as sac_info, sre_data, ssf_data or a list of stream ids: a 20-byte
+	// SCTP_ASSOC_CHANGE in a 64-byte buffer came back with 44 bytes of Info and a
+	// nil error. And an event whose header under-declared had its fixed fields
+	// read from beyond its own extent, so a length of 8 still produced a state
+	// and an association id, invented from whatever was there.
+	//
+	// Truncating once here fixes both, and leaves every bound below expressed
+	// against the event rather than against the buffer.
+	b = b[:length]
 
 	switch SCTPNotificationType(typ) {
 	case SCTP_ASSOC_CHANGE:

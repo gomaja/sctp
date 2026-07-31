@@ -64,6 +64,50 @@ func TestNotificationSizesMatchKernel(t *testing.T) {
 	}
 }
 
+// TestNotificationMaxSizeHoldsEveryFixedNotification is the assertion that gives
+// NotificationMaxSize a reason to be the number it is.
+//
+// It is documented as a read buffer that holds any fixed-size notification, and
+// callers are told to size their buffer by it — but nothing compared it against
+// the sizes. Shrinking it to 128 survived the complete suite, and 128 is below
+// the 148 of SCTP_PEER_ADDR_CHANGE: a caller following the documentation would
+// have read the path-failure event, the one this package exists to surface, in
+// fragments and rejected every one as truncated.
+func TestNotificationMaxSizeHoldsEveryFixedNotification(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"sctp_assoc_change", assocChangeMinSize},
+		{"sctp_paddr_change", peerAddrChangeSize},
+		{"sctp_remote_error", remoteErrorMinSize},
+		{"sctp_send_failed", notificationHeaderSize + 4 + int(sndRcvInfoSize) + 4},
+		{"sctp_shutdown_event", shutdownEventSize},
+		{"sctp_adaptation_event", adaptationIndicationSize},
+		{"sctp_pdapi_event", partialDeliverySize},
+		{"sctp_sender_dry_event", senderDrySize},
+		{"sctp_authkey_event", authKeyEventSize},
+		{"sctp_stream_reset_event", streamResetMinSize},
+		{"sctp_assoc_reset_event", assocResetSize},
+		{"sctp_stream_change_event", streamChangeSize},
+		{"sctp_send_failed_event", sendFailedEventMinSize},
+	} {
+		if tc.size > NotificationMaxSize {
+			t.Errorf("%s is %d bytes but NotificationMaxSize is %d; a caller "+
+				"sizing their buffer as documented cannot read this event whole",
+				tc.name, tc.size, NotificationMaxSize)
+		}
+	}
+
+	// The largest fixed notification is sctp_paddr_change at 148. Anything at
+	// or below that would be too small; the headroom above it is for the
+	// variable-tail events, which have no fixed bound at all.
+	if NotificationMaxSize <= peerAddrChangeSize {
+		t.Errorf("NotificationMaxSize = %d, which does not exceed the largest "+
+			"fixed notification (%d)", NotificationMaxSize, peerAddrChangeSize)
+	}
+}
+
 // notif builds a notification buffer of the given type and length.
 func notif(typ SCTPNotificationType, size int) []byte {
 	b := make([]byte, size)
@@ -117,6 +161,195 @@ func TestParseNotificationRejectsTruncated(t *testing.T) {
 			t.Errorf("%s at its full %d bytes: nil notification", tc.name, tc.full)
 		}
 	}
+}
+
+// notifSized builds a notification whose header declares one length while the
+// buffer it arrived in is another, and fills everything past the header with a
+// recognisable byte.
+//
+// notif cannot express this: it derives the declared length from the buffer
+// size, so every test built on it has the two agreeing. That is precisely why
+// none of them reached the bug below.
+func notifSized(typ SCTPNotificationType, declared, bufSize int, fill byte) []byte {
+	b := make([]byte, bufSize)
+	for i := range b {
+		b[i] = fill
+	}
+	nativeEndian.PutUint16(b[0:2], uint16(typ))
+	nativeEndian.PutUint16(b[2:4], 0)
+	nativeEndian.PutUint32(b[4:8], uint32(declared))
+	return b
+}
+
+// TestParseNotificationBoundsByDeclaredLength checks that the length in the
+// header is the authoritative extent of the event, not merely an upper bound
+// checked against the buffer.
+//
+// The kernel sets sn_length to the whole size of the event and delivers exactly
+// that many bytes: measured on a live association, SCTP_ASSOC_CHANGE arrives as
+// 20 bytes declaring 20, and SCTP_PEER_ADDR_CHANGE as 148 declaring 148. So a
+// buffer longer than the declared length holds bytes that are not part of this
+// event — normally whatever the previous read left there, since a caller who
+// passes their read buffer rather than b[:n] hands over the whole thing.
+//
+// Before this, ParseNotification compared length against len(b) in one
+// direction only and then sliced every variable tail by len(b), so those stale
+// bytes came back as event data with a nil error. Under-declaring was worse:
+// nothing stopped a decoder reading fixed fields from beyond the extent its own
+// header described.
+func TestParseNotificationBoundsByDeclaredLength(t *testing.T) {
+	t.Run("tail past the declared length is not returned", func(t *testing.T) {
+		// A complete 20-byte SCTP_ASSOC_CHANGE sitting in a 64-byte read
+		// buffer. Info must be empty: the event declares no sac_info.
+		b := notifSized(SCTP_ASSOC_CHANGE, assocChangeMinSize, 64, 0xAA)
+		nativeEndian.PutUint16(b[8:10], uint16(SCTP_COMM_UP))
+		nativeEndian.PutUint16(b[10:12], 0)
+		nativeEndian.PutUint16(b[12:14], 10)
+		nativeEndian.PutUint16(b[14:16], 10)
+		nativeEndian.PutUint32(b[16:20], 7)
+
+		n, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("ParseNotification: %v", err)
+		}
+		ac, ok := n.(*AssocChange)
+		if !ok {
+			t.Fatalf("got %T, want *AssocChange", n)
+		}
+		if len(ac.Info) != 0 {
+			t.Errorf("Info = % x (%d bytes), want empty: the event declares %d bytes "+
+				"and the rest of the buffer is not part of it",
+				ac.Info, len(ac.Info), ac.Length())
+		}
+	})
+
+	t.Run("a declared tail is still returned, exactly", func(t *testing.T) {
+		// The same event declaring four bytes of sac_info, in a buffer with
+		// room for far more. Bounding must not become dropping.
+		b := notifSized(SCTP_ASSOC_CHANGE, assocChangeMinSize+4, 64, 0xAA)
+		copy(b[assocChangeMinSize:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+
+		n, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("ParseNotification: %v", err)
+		}
+		ac := n.(*AssocChange)
+		if want := []byte{0xDE, 0xAD, 0xBE, 0xEF}; string(ac.Info) != string(want) {
+			t.Errorf("Info = % x, want % x", ac.Info, want)
+		}
+	})
+
+	t.Run("under-declared events are refused", func(t *testing.T) {
+		// A header claiming the event is 8 bytes, in a 24-byte buffer. The
+		// fields after the header belong to no event, so decoding them yields
+		// invented state — AssocID came back as -1 from the 0xFF fill.
+		b := notifSized(SCTP_ASSOC_CHANGE, notificationHeaderSize, 24, 0xFF)
+		n, err := ParseNotification(b)
+		if !errors.Is(err, ErrShortNotification) {
+			t.Errorf("err = %v, want ErrShortNotification", err)
+		}
+		if n != nil {
+			ac, ok := n.(*AssocChange)
+			if ok {
+				t.Errorf("decoded %T from an 8-byte event: State=%d AssocID=%d, "+
+					"read from bytes outside the declared extent",
+					n, ac.State, ac.AssocID)
+			} else {
+				t.Errorf("returned %T from an under-declared event", n)
+			}
+		}
+	})
+
+	t.Run("a length below the header is refused", func(t *testing.T) {
+		for _, declared := range []int{0, 1, 4, 7} {
+			b := notifSized(SCTP_ASSOC_CHANGE, declared, 64, 0xFF)
+			n, err := ParseNotification(b)
+			if !errors.Is(err, ErrShortNotification) {
+				t.Errorf("declared %d: err = %v, want ErrShortNotification", declared, err)
+			}
+			if n != nil {
+				t.Errorf("declared %d: returned %T", declared, n)
+			}
+		}
+	})
+
+	t.Run("one byte over the buffer is refused, not panicked on", func(t *testing.T) {
+		// The interesting length is exactly len(b)+1. Anything beyond it is
+		// caught by a bound that is wrong by any amount, so an off-by-one in
+		// the comparison survives a test that only over-declares wildly — and
+		// an off-by-one here does not merely mis-parse, it reslices past the
+		// end of the buffer and panics in the caller's read loop.
+		//
+		// The exact length must still parse, or the bound has moved the other
+		// way and every complete notification is rejected.
+		const buf = 64
+		for _, declared := range []int{buf + 1, buf + 2, buf + 8, 65516} {
+			b := notifSized(SCTP_ASSOC_CHANGE, declared, buf, 0xFF)
+			n, err := ParseNotification(b)
+			if !errors.Is(err, ErrShortNotification) {
+				t.Errorf("declared %d with %d present: err = %v, want ErrShortNotification",
+					declared, buf, err)
+			}
+			if n != nil {
+				t.Errorf("declared %d with %d present: returned %T", declared, buf, n)
+			}
+		}
+		b := notifSized(SCTP_ASSOC_CHANGE, buf, buf, 0)
+		if _, err := ParseNotification(b); err != nil {
+			t.Errorf("declared %d with %d present: %v, want it to parse", buf, buf, err)
+		}
+	})
+
+	t.Run("the stream list stops at the declared length", func(t *testing.T) {
+		// srs_stream_list is a flexible array member, so only the declared
+		// length says how many ids are really there. Bounding it by the buffer
+		// invents one id per two spare bytes.
+		b := notifSized(SCTP_STREAM_RESET_EVENT, streamResetMinSize+2, 24, 0xEE)
+		nativeEndian.PutUint32(b[8:12], 3)
+		nativeEndian.PutUint16(b[streamResetMinSize:], 1)
+
+		n, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("ParseNotification: %v", err)
+		}
+		sr := n.(*StreamReset)
+		if len(sr.Streams) != 1 || sr.Streams[0] != 1 {
+			t.Errorf("Streams = %v, want [1]: the event declares one stream id "+
+				"and the remaining %d buffer bytes are not part of it",
+				sr.Streams, 24-(streamResetMinSize+2))
+		}
+	})
+
+	t.Run("every variable tail is bounded", func(t *testing.T) {
+		// One case per decoder that carries a tail, each complete and each in a
+		// buffer with slack behind it.
+		for _, tc := range []struct {
+			name string
+			typ  SCTPNotificationType
+			size int
+			tail func(Notification) int
+		}{
+			{"assoc_change", SCTP_ASSOC_CHANGE, assocChangeMinSize,
+				func(n Notification) int { return len(n.(*AssocChange).Info) }},
+			{"remote_error", SCTP_REMOTE_ERROR, remoteErrorMinSize,
+				func(n Notification) int { return len(n.(*RemoteError).Data) }},
+			{"send_failed", SCTP_SEND_FAILED, notificationHeaderSize + 4 + int(sndRcvInfoSize) + 4,
+				func(n Notification) int { return len(n.(*SendFailed).Data) }},
+			{"send_failed_event", SCTP_SEND_FAILED_EVENT, sendFailedEventMinSize,
+				func(n Notification) int { return len(n.(*SendFailedEvent).Data) }},
+		} {
+			b := notifSized(tc.typ, tc.size, tc.size+40, 0xAA)
+			n, err := ParseNotification(b)
+			if err != nil {
+				t.Errorf("%s: ParseNotification: %v", tc.name, err)
+				continue
+			}
+			if got := tc.tail(n); got != 0 {
+				t.Errorf("%s: tail = %d bytes, want 0: the event declares %d bytes "+
+					"and the buffer holds %d", tc.name, got, tc.size, tc.size+40)
+			}
+		}
+	})
 }
 
 // TestParseNotificationAssocChange checks the fields land in the right places.

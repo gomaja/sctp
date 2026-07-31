@@ -571,10 +571,26 @@ func TestParseNotificationRejectsADeclaredLengthItDoesNotHave(t *testing.T) {
 		// truncation: there is nothing missing.
 		b := make([]byte, assocChangeMinSize+8)
 		putNotificationHeader(b, SCTP_ASSOC_CHANGE, 0, assocChangeMinSize)
+		for i := assocChangeMinSize; i < len(b); i++ {
+			b[i] = 0xAA
+		}
 
-		if _, err := ParseNotification(b); err != nil {
-			t.Errorf("err = %v; the buffer holds more than the header declares, "+
+		n, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("err = %v; the buffer holds more than the header declares, "+
 				"which is not truncation", err)
+		}
+		// And the surplus must not come back as event data. Asserting only
+		// err == nil left that open, which is exactly how the tails came to be
+		// bounded by the buffer instead of by the declared length.
+		ac, ok := n.(*AssocChange)
+		if !ok {
+			t.Fatalf("got %T, want *AssocChange", n)
+		}
+		if len(ac.Info) != 0 {
+			t.Errorf("Info = % x (%d bytes), want empty: the event declares %d "+
+				"bytes and the other %d belong to no event",
+				ac.Info, len(ac.Info), ac.Length(), len(b)-assocChangeMinSize)
 		}
 	})
 }
