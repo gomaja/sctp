@@ -54,14 +54,117 @@ const NotificationMaxSize = 1024
 // uint16 type, uint16 flags, uint32 length.
 const notificationHeaderSize = 8
 
+// Error cause codes, RFC 9260 section 3.3.10, as carried by AssocChange.Error,
+// RemoteError.Error and SendFailed.Error.
+//
+// These are the values the peer puts in an ERROR or ABORT chunk, so they answer
+// "why did this association fail" — the question those three notifications
+// exist to answer. Codes 11 to 14 are not in the base specification's table;
+// they come from the Implementation Guide and from RFC 6951, and Linux both
+// sends and reports them.
+//
+// They are deliberately untyped, so that comparing them against Error works
+// whether the field is a uint16 or a uint32.
+const (
+	SCTP_ERROR_NO_ERROR           = 0x00
+	SCTP_ERROR_INV_STRM           = 0x01  // Invalid Stream Identifier
+	SCTP_ERROR_MISS_PARAM         = 0x02  // Missing Mandatory Parameter
+	SCTP_ERROR_STALE_COOKIE       = 0x03  // Stale Cookie
+	SCTP_ERROR_NO_RESOURCE        = 0x04  // Out of Resource
+	SCTP_ERROR_DNS_FAILED         = 0x05  // Unresolvable Address
+	SCTP_ERROR_UNKNOWN_CHUNK      = 0x06  // Unrecognized Chunk Type
+	SCTP_ERROR_INV_PARAM          = 0x07  // Invalid Mandatory Parameter
+	SCTP_ERROR_UNKNOWN_PARAM      = 0x08  // Unrecognized Parameters
+	SCTP_ERROR_NO_DATA            = 0x09  // No User Data
+	SCTP_ERROR_COOKIE_IN_SHUTDOWN = 0x0a  // Cookie Received While Shutting Down
+	SCTP_ERROR_RESTART            = 0x0b  // Restart with New Addresses
+	SCTP_ERROR_USER_ABORT         = 0x0c  // User Initiated Abort
+	SCTP_ERROR_PROTO_VIOLATION    = 0x0d  // Protocol Violation
+	SCTP_ERROR_NEW_ENCAP_PORT     = 0x0e  // Restart with New Encapsulation Port
+	SCTP_ERROR_DEL_LAST_IP        = 0xa0  // Delete Last Remaining Address (RFC 5061)
+	SCTP_ERROR_RSRC_LOW           = 0xa1  // Operation Refused Due to Resources
+	SCTP_ERROR_DEL_SRC_IP         = 0xa2  // Delete Source IP Address (RFC 5061)
+	SCTP_ERROR_ASCONF_ACK         = 0xa3  // Association Aborted due to ASCONF-ACK
+	SCTP_ERROR_REQ_REFUSED        = 0xa4  // Request Refused - No Authorization
+	SCTP_ERROR_UNSUP_HMAC         = 0x105 // Unsupported HMAC Identifier (RFC 4895)
+)
+
+// errorCauseNames is only consulted by ErrorCauseString, which is the sole
+// reason the vocabulary is worth carrying at all: a bare number in a log is
+// what made the byte-order defect below survive as long as it did.
+var errorCauseNames = map[uint32]string{
+	SCTP_ERROR_NO_ERROR:           "SCTP_ERROR_NO_ERROR",
+	SCTP_ERROR_INV_STRM:           "SCTP_ERROR_INV_STRM",
+	SCTP_ERROR_MISS_PARAM:         "SCTP_ERROR_MISS_PARAM",
+	SCTP_ERROR_STALE_COOKIE:       "SCTP_ERROR_STALE_COOKIE",
+	SCTP_ERROR_NO_RESOURCE:        "SCTP_ERROR_NO_RESOURCE",
+	SCTP_ERROR_DNS_FAILED:         "SCTP_ERROR_DNS_FAILED",
+	SCTP_ERROR_UNKNOWN_CHUNK:      "SCTP_ERROR_UNKNOWN_CHUNK",
+	SCTP_ERROR_INV_PARAM:          "SCTP_ERROR_INV_PARAM",
+	SCTP_ERROR_UNKNOWN_PARAM:      "SCTP_ERROR_UNKNOWN_PARAM",
+	SCTP_ERROR_NO_DATA:            "SCTP_ERROR_NO_DATA",
+	SCTP_ERROR_COOKIE_IN_SHUTDOWN: "SCTP_ERROR_COOKIE_IN_SHUTDOWN",
+	SCTP_ERROR_RESTART:            "SCTP_ERROR_RESTART",
+	SCTP_ERROR_USER_ABORT:         "SCTP_ERROR_USER_ABORT",
+	SCTP_ERROR_PROTO_VIOLATION:    "SCTP_ERROR_PROTO_VIOLATION",
+	SCTP_ERROR_NEW_ENCAP_PORT:     "SCTP_ERROR_NEW_ENCAP_PORT",
+	SCTP_ERROR_DEL_LAST_IP:        "SCTP_ERROR_DEL_LAST_IP",
+	SCTP_ERROR_RSRC_LOW:           "SCTP_ERROR_RSRC_LOW",
+	SCTP_ERROR_DEL_SRC_IP:         "SCTP_ERROR_DEL_SRC_IP",
+	SCTP_ERROR_ASCONF_ACK:         "SCTP_ERROR_ASCONF_ACK",
+	SCTP_ERROR_REQ_REFUSED:        "SCTP_ERROR_REQ_REFUSED",
+	SCTP_ERROR_UNSUP_HMAC:         "SCTP_ERROR_UNSUP_HMAC",
+}
+
+// ErrorCauseString names an RFC 9260 section 3.3.10 error cause.
+func ErrorCauseString(cause uint32) string {
+	if name, ok := errorCauseNames[cause]; ok {
+		return name
+	}
+	return fmt.Sprintf("SCTPErrorCause(%d)", cause)
+}
+
+// causeFromU16 decodes an error cause the kernel stored in a __u16.
+//
+// The kernel's cause constants are declared cpu_to_be16, and every path that
+// fills sac_error and sre_error assigns one of them — or, for a received ABORT
+// or ERROR, the __be16 straight off the wire — into a host-typed field without
+// converting. So the two bytes in the buffer are always the network
+// representation regardless of the host's byte order, and reading them big-endian
+// is right everywhere.
+//
+// Decoding them natively is what this package used to do, and on a little-endian
+// host it reported SCTP_ERROR_USER_ABORT as 3072 rather than 12. Note that the
+// kernel's own uapi header points the wrong way here: it documents sac_error as
+// holding an sctp_sn_error_t, a small host-order enum. That is true of
+// spc_error, which is why PeerAddrChange.Error is still read natively, but no
+// path in the stack puts one in sac_error.
+func causeFromU16(b []byte) uint16 {
+	return binary.BigEndian.Uint16(b)
+}
+
+// causeFromU32 decodes an error cause the kernel widened into a __u32.
+//
+// ssf_error is __u32 but holds the same cpu_to_be16 constant, widened by an
+// ordinary integer promotion. The promotion happens in host arithmetic, so
+// unlike the __u16 case the bytes are not simply the network form: on a
+// little-endian host the value 0x0c00 lands in the low half. Reading the field
+// natively and then undoing the byte order recovers the cause on both.
+func causeFromU32(b []byte) uint32 {
+	return uint32(ntohs(uint16(nativeEndian.Uint32(b))))
+}
+
 // AssocChange is SCTP_ASSOC_CHANGE (RFC 6458 6.1.1), reporting that an
 // association has come up, come down, restarted, or failed to start. State
 // says which.
 type AssocChange struct {
-	typ             uint16
-	flags           uint16
-	length          uint32
-	State           SCTPState
+	typ    uint16
+	flags  uint16
+	length uint32
+	State  SCTPState
+	// Error is an RFC 9260 section 3.3.10 error cause, in host byte order —
+	// see ErrorCauseString. It is meaningful when State is SCTP_COMM_LOST or
+	// SCTP_CANT_STR_ASSOC and zero otherwise.
 	Error           uint16
 	OutboundStreams uint16
 	InboundStreams  uint16
@@ -106,6 +209,11 @@ const (
 	SCTP_ADDR_ADDED
 	SCTP_ADDR_MADE_PRIM
 	SCTP_ADDR_CONFIRMED
+	// SCTP_ADDR_POTENTIALLY_FAILED is RFC 7829's early warning: the path has
+	// missed enough retransmissions to be suspect but not enough to be
+	// unreachable. The kernel suppresses it unless SetExposePotentiallyFailed
+	// is on, which is why it is easy to conclude the state does not exist.
+	SCTP_ADDR_POTENTIALLY_FAILED
 )
 
 // peerAddrChangeSize is sizeof(struct sctp_paddr_change): 8 byte header,
@@ -215,6 +323,150 @@ func (n *PartialDelivery) Length() uint32             { return n.length }
 
 const partialDeliverySize = 24
 
+// Flags reported by StreamReset, AssocReset and StreamChange.
+//
+// DENIED means the peer refused the request; FAILED means it could not be
+// carried out. Either way the request did not take effect, which is the whole
+// reason these events matter: ResetStreams and AddStreams return as soon as the
+// request is away, so success there means "sent", not "done".
+const (
+	SCTP_STREAM_RESET_INCOMING_SSN = 0x0001
+	SCTP_STREAM_RESET_OUTGOING_SSN = 0x0002
+	SCTP_STREAM_RESET_DENIED       = 0x0004
+	SCTP_STREAM_RESET_FAILED       = 0x0008
+
+	SCTP_ASSOC_RESET_DENIED = 0x0004
+	SCTP_ASSOC_RESET_FAILED = 0x0008
+
+	SCTP_STREAM_CHANGE_DENIED = 0x0004
+	SCTP_STREAM_CHANGE_FAILED = 0x0008
+)
+
+// Indications reported by AuthKeyEvent.
+const (
+	SCTP_AUTH_NEW_KEY  = iota // a new shared key is usable
+	SCTP_AUTH_FREE_KEY        // a key has been released and will not be used again
+	SCTP_AUTH_NO_AUTH         // the peer does not support AUTH
+)
+
+// Flags reported by SendFailed and SendFailedEvent, saying how far the
+// undelivered message got.
+const (
+	SCTP_DATA_UNSENT = iota // never put on the wire
+	SCTP_DATA_SENT          // transmitted, but not acknowledged
+)
+
+// StreamReset is SCTP_STREAM_RESET_EVENT (RFC 6525 §6.1.1), reporting the
+// outcome of a stream reset — this side's or the peer's.
+//
+// This is the answer to ResetStreams, which only reports that the request was
+// sent. Check Flags for SCTP_STREAM_RESET_DENIED and SCTP_STREAM_RESET_FAILED.
+type StreamReset struct {
+	typ     uint16
+	flags   uint16
+	length  uint32
+	AssocID SCTPAssocID
+	// Streams are the stream identifiers the event covers. Empty means all of
+	// them, which is how the kernel reports a request made with no list.
+	Streams []uint16
+}
+
+func (n *StreamReset) Type() SCTPNotificationType { return SCTPNotificationType(n.typ) }
+func (n *StreamReset) Flags() uint16              { return n.flags }
+func (n *StreamReset) Length() uint32             { return n.length }
+
+// streamResetMinSize is sizeof(struct sctp_stream_reset_event) without the
+// flexible strreset_stream_list.
+const streamResetMinSize = 12
+
+// AssocReset is SCTP_ASSOC_RESET_EVENT (RFC 6525 §6.1.2), reporting the outcome
+// of an association reset and the TSNs the two sides restarted from.
+type AssocReset struct {
+	typ       uint16
+	flags     uint16
+	length    uint32
+	AssocID   SCTPAssocID
+	LocalTSN  uint32
+	RemoteTSN uint32
+}
+
+func (n *AssocReset) Type() SCTPNotificationType { return SCTPNotificationType(n.typ) }
+func (n *AssocReset) Flags() uint16              { return n.flags }
+func (n *AssocReset) Length() uint32             { return n.length }
+
+// assocResetSize is sizeof(struct sctp_assoc_reset_event).
+const assocResetSize = 20
+
+// StreamChange is SCTP_STREAM_CHANGE_EVENT (RFC 6525 §6.1.3), reporting the
+// stream counts in force after an AddStreams request.
+type StreamChange struct {
+	typ            uint16
+	flags          uint16
+	length         uint32
+	AssocID        SCTPAssocID
+	InboundStreams uint16
+	// OutboundStreams is the count that matters to a sender: writing to a
+	// stream at or above it fails, whatever AddStreams reported.
+	OutboundStreams uint16
+}
+
+func (n *StreamChange) Type() SCTPNotificationType { return SCTPNotificationType(n.typ) }
+func (n *StreamChange) Flags() uint16              { return n.flags }
+func (n *StreamChange) Length() uint32             { return n.length }
+
+// streamChangeSize is sizeof(struct sctp_stream_change_event).
+const streamChangeSize = 16
+
+// SendFailedEvent is SCTP_SEND_FAILED_EVENT (RFC 6458 §6.1.11), the replacement
+// for SCTP_SEND_FAILED.
+//
+// It carries SndInfo where the older event carries the deprecated SndRcvInfo,
+// and it is the one RFC 6458 §6.1.4 tells new code to subscribe to. Both
+// describe the same failure, so a socket subscribed to both sees it twice.
+type SendFailedEvent struct {
+	typ    uint16
+	flags  uint16
+	length uint32
+	// Error is an RFC 9260 section 3.3.10 error cause; see ErrorCauseString.
+	Error   uint32
+	Info    SndInfo
+	AssocID SCTPAssocID
+	// Data is the message that was not delivered.
+	Data []byte
+}
+
+func (n *SendFailedEvent) Type() SCTPNotificationType { return SCTPNotificationType(n.typ) }
+func (n *SendFailedEvent) Flags() uint16              { return n.flags }
+func (n *SendFailedEvent) Length() uint32             { return n.length }
+
+// sendFailedEventMinSize is sizeof(struct sctp_send_failed_event) without
+// ssf_data: 8 byte header, uint32 error, 16 byte sctp_sndinfo, association id.
+const sendFailedEventMinSize = 32
+
+// AuthKeyEvent is SCTP_AUTHENTICATION_EVENT (RFC 6458 §6.1.8), reporting a
+// change in the AUTH shared keys in force.
+//
+// It is what makes key rollover observable: DeactivateAuthKey and
+// DeleteAuthKey act locally, and only SCTP_AUTH_FREE_KEY says the peer has
+// stopped using the old one.
+type AuthKeyEvent struct {
+	typ          uint16
+	flags        uint16
+	length       uint32
+	KeyNumber    uint16
+	AltKeyNumber uint16
+	// Indication is SCTP_AUTH_NEW_KEY, SCTP_AUTH_FREE_KEY or SCTP_AUTH_NO_AUTH.
+	Indication uint32
+	AssocID    SCTPAssocID
+}
+
+func (n *AuthKeyEvent) Type() SCTPNotificationType { return SCTPNotificationType(n.typ) }
+func (n *AuthKeyEvent) Flags() uint16              { return n.flags }
+func (n *AuthKeyEvent) Length() uint32             { return n.length }
+
+// authKeyEventSize is sizeof(struct sctp_authkey_event).
+const authKeyEventSize = 20
+
 // String names the association state an AssocChange reports. SCTP_COMM_LOST is
 // the one that surfaces an unreachable peer: the association failed, either
 // because the peer aborted it or because it exhausted its retransmission
@@ -264,7 +516,7 @@ func ParseNotification(b []byte) (Notification, error) {
 			flags:           flags,
 			length:          length,
 			State:           SCTPState(nativeEndian.Uint16(b[8:10])),
-			Error:           nativeEndian.Uint16(b[10:12]),
+			Error:           causeFromU16(b[10:12]),
 			OutboundStreams: nativeEndian.Uint16(b[12:14]),
 			InboundStreams:  nativeEndian.Uint16(b[14:16]),
 			AssocID:         SCTPAssocID(nativeEndian.Uint32(b[16:20])),
@@ -299,7 +551,7 @@ func ParseNotification(b []byte) (Notification, error) {
 			typ:     typ,
 			flags:   flags,
 			length:  length,
-			Error:   nativeEndian.Uint16(b[8:10]),
+			Error:   causeFromU16(b[8:10]),
 			AssocID: SCTPAssocID(nativeEndian.Uint32(b[12:16])),
 		}
 		if len(b) > remoteErrorMinSize {
@@ -317,7 +569,7 @@ func ParseNotification(b []byte) (Notification, error) {
 			typ:    typ,
 			flags:  flags,
 			length: length,
-			Error:  nativeEndian.Uint32(b[8:12]),
+			Error:  causeFromU32(b[8:12]),
 		}
 		infoEnd := 12 + int(sndRcvInfoSize)
 		if err := binary.Read(bytes.NewReader(b[12:infoEnd]), nativeEndian, &n.Info); err != nil {
@@ -379,6 +631,83 @@ func ParseNotification(b []byte) (Notification, error) {
 			length:  length,
 			AssocID: SCTPAssocID(nativeEndian.Uint32(b[8:12])),
 		}, nil
+
+	case SCTP_AUTHENTICATION_INDICATION:
+		if len(b) < authKeyEventSize {
+			return nil, ErrShortNotification
+		}
+		return &AuthKeyEvent{
+			typ:          typ,
+			flags:        flags,
+			length:       length,
+			KeyNumber:    nativeEndian.Uint16(b[8:10]),
+			AltKeyNumber: nativeEndian.Uint16(b[10:12]),
+			Indication:   nativeEndian.Uint32(b[12:16]),
+			AssocID:      SCTPAssocID(nativeEndian.Uint32(b[16:20])),
+		}, nil
+
+	case SCTP_STREAM_RESET_EVENT:
+		if len(b) < streamResetMinSize {
+			return nil, ErrShortNotification
+		}
+		n := &StreamReset{
+			typ:     typ,
+			flags:   flags,
+			length:  length,
+			AssocID: SCTPAssocID(nativeEndian.Uint32(b[8:12])),
+		}
+		// The stream list is a flexible array member, so its extent is
+		// whatever arrived. An odd trailing byte cannot be half a stream id,
+		// so the loop stops one short of it rather than reading past the end.
+		for off := streamResetMinSize; off+2 <= len(b); off += 2 {
+			n.Streams = append(n.Streams, nativeEndian.Uint16(b[off:off+2]))
+		}
+		return n, nil
+
+	case SCTP_ASSOC_RESET_EVENT:
+		if len(b) < assocResetSize {
+			return nil, ErrShortNotification
+		}
+		return &AssocReset{
+			typ:       typ,
+			flags:     flags,
+			length:    length,
+			AssocID:   SCTPAssocID(nativeEndian.Uint32(b[8:12])),
+			LocalTSN:  nativeEndian.Uint32(b[12:16]),
+			RemoteTSN: nativeEndian.Uint32(b[16:20]),
+		}, nil
+
+	case SCTP_STREAM_CHANGE_EVENT:
+		if len(b) < streamChangeSize {
+			return nil, ErrShortNotification
+		}
+		return &StreamChange{
+			typ:             typ,
+			flags:           flags,
+			length:          length,
+			AssocID:         SCTPAssocID(nativeEndian.Uint32(b[8:12])),
+			InboundStreams:  nativeEndian.Uint16(b[12:14]),
+			OutboundStreams: nativeEndian.Uint16(b[14:16]),
+		}, nil
+
+	case SCTP_SEND_FAILED_EVENT:
+		if len(b) < sendFailedEventMinSize {
+			return nil, ErrShortNotification
+		}
+		n := &SendFailedEvent{
+			typ:    typ,
+			flags:  flags,
+			length: length,
+			Error:  causeFromU32(b[8:12]),
+		}
+		if err := binary.Read(bytes.NewReader(b[12:28]), nativeEndian, &n.Info); err != nil {
+			return nil, err
+		}
+		n.AssocID = SCTPAssocID(nativeEndian.Uint32(b[28:32]))
+		if len(b) > sendFailedEventMinSize {
+			n.Data = append([]byte(nil), b[sendFailedEventMinSize:]...)
+		}
+		return n, nil
 	}
 
 	// An event this package does not model yet. Not an error: the caller can

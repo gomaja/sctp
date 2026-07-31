@@ -285,7 +285,17 @@ const (
 	SCTP_ADAPTATION_INDICATION
 	SCTP_AUTHENTICATION_INDICATION
 	SCTP_SENDER_DRY_EVENT
+	SCTP_STREAM_RESET_EVENT
+	SCTP_ASSOC_RESET_EVENT
+	SCTP_STREAM_CHANGE_EVENT
+	SCTP_SEND_FAILED_EVENT
 )
+
+// SCTP_AUTHENTICATION_EVENT is the spelling RFC 6458 §6.1.8 and the kernel's
+// enum sctp_sn_type use. SCTP_AUTHENTICATION_INDICATION is the name Linux gives
+// the same value through its compatibility #define, and is what this package
+// has always called it.
+const SCTP_AUTHENTICATION_EVENT = SCTP_AUTHENTICATION_INDICATION
 
 type NotificationHandler func([]byte) error
 
@@ -892,17 +902,39 @@ func (a *SCTPAddr) String() string {
 
 func (a *SCTPAddr) Network() string { return "sctp" }
 
-func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
-	tcpnet := ""
+// canonicalNetwork validates an SCTP network name and returns it with the empty
+// string spelled out, along with the TCP network used to resolve its addresses.
+//
+// It is the single place that decides which names are valid, and every entry
+// point that takes a network calls it. That matters for two reasons.
+//
+// favoriteAddrFamily, vendored from the standard library, picks an address
+// family from the name's last byte. The standard library only ever calls it
+// with a name its own caller has already checked; this package called it with
+// whatever the caller passed. So ListenSCTP("") and DialSCTP("") panicked with
+// an index out of range — the empty string has no last byte — and
+// ListenSCTP("tcp") quietly created an SCTP socket, because "p" is neither '4'
+// nor '6' and the default is reached. Rejecting unknown names and expanding the
+// empty one here keeps the vendored function byte-identical to upstream.
+//
+// The empty string means "sctp", which is what ResolveSCTPAddr has always
+// accepted and what net.Dial does for its own networks.
+func canonicalNetwork(network string) (sctpnet, tcpnet string, err error) {
 	switch network {
 	case "", "sctp":
-		tcpnet = "tcp"
+		return "sctp", "tcp", nil
 	case "sctp4":
-		tcpnet = "tcp4"
+		return "sctp4", "tcp4", nil
 	case "sctp6":
-		tcpnet = "tcp6"
-	default:
-		return nil, fmt.Errorf("invalid net: %s", network)
+		return "sctp6", "tcp6", nil
+	}
+	return "", "", net.UnknownNetworkError(network)
+}
+
+func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
+	_, tcpnet, err := canonicalNetwork(network)
+	if err != nil {
+		return nil, err
 	}
 	elems := strings.Split(addrs, "/")
 	if len(elems) == 0 {

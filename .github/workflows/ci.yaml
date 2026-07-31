@@ -1,20 +1,86 @@
 name: ci
 
+# Pull requests only meant nothing on this fork's own branch ever ran: the work
+# happens on master-gomaja, and a push there triggered no job at all.
 on:
+  push:
   pull_request:
-    branches:
-      - master
 
 jobs:
+  # The suite needs a real SCTP stack and a configured host. Running plain
+  # `go test` without that setup is not a smaller version of this job — the AUTH
+  # tests skip, and the blackhole-dependent dial tests fail outright, so the
+  # result says nothing either way.
   test:
     strategy:
+      fail-fast: false
       matrix:
-        go: [1.22.x, 1.23.x, 1.24.x]
-        os: [ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+        go: ['1.22', '1.23', '1.24']
+    runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-go@v5
-      with:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
           go-version: ${{ matrix.go }}
-    - run: go test -race ./...
+
+      # sudo rather than a container: the runner is already Linux with SCTP
+      # available, and the steps below are exactly what testdata/run-tests.sh
+      # does for a privileged container.
+      - name: Prepare the SCTP stack
+        run: |
+          sudo modprobe sctp
+          test -e /proc/net/sctp/snmp
+          sudo sysctl -w net.sctp.auth_enable=1
+          for a in 127.0.0.2 127.0.0.3 127.0.0.4; do
+            sudo ip addr add "$a/8" dev lo || true
+          done
+          sudo iptables -A OUTPUT -d 192.0.2.1 -j DROP
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1 -timeout 900s
+      - run: go test ./... -count=1 -race -timeout 900s
+
+  # The suite only ever runs on one platform at a time, so nothing in it notices
+  # a non-portable symbol landing in a file with no build tag. TestCrossCompiles
+  # covers the build; vet is separate because it type-checks _test.go files,
+  # which `go build` does not, and that is where the 32-bit breakage was.
+  vet-cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Vet for 32-bit and big-endian targets
+        run: |
+          for target in linux/386 linux/arm linux/s390x linux/mips; do
+            echo "== $target =="
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt'd:"; echo "$unformatted"; exit 1
+          fi
+      # staticcheck and golangci-lint are clean for linux amd64/arm/arm64, the
+      # targets that carry an implementation. They are not clean for GOOS=darwin
+      # or linux/386, where sctp_linux.go is excluded and the helpers it alone
+      # calls are reported unused; that is a property of the build-tag split
+      # rather than a defect, so the check names the platform it covers.
+      - uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest

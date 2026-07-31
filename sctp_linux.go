@@ -67,6 +67,35 @@ func getsockopt(fd int, optname, optval, optlen uintptr) (uintptr, uintptr, erro
 	return r0, r1, nil
 }
 
+// bindLocal binds laddr, supplying the wildcard address when the caller named
+// only a port.
+//
+// The wildcard is written into a local copy rather than into the caller's
+// SCTPAddr. Appending to laddr.IPAddrs was visible after the call returned and
+// was a data race whenever one address value was shared between goroutines,
+// which is the ordinary way to run a client and a server against a fixed
+// endpoint. It also changed the caller's meaning: a *SCTPAddr that came back
+// from a "sctp6" listen carried [::], so reusing it for a "sctp4" dial failed
+// with EINVAL.
+//
+// Only the AF_INET6 arm is load-bearing. ToRawSockAddrBuf already encodes an
+// empty address list as IPv4 zero, so the AF_INET arm produces the bytes it
+// would have produced anyway; it is kept because relying on that coupling from
+// here would be a trap for whoever edits either half next.
+func bindLocal(sock int, laddr *SCTPAddr, af int) error {
+	if len(laddr.IPAddrs) == 0 {
+		local := SCTPAddr{Port: laddr.Port}
+		switch af {
+		case syscall.AF_INET:
+			local.IPAddrs = []net.IPAddr{{IP: net.IPv4zero}}
+		case syscall.AF_INET6:
+			local.IPAddrs = []net.IPAddr{{IP: net.IPv6zero}}
+		}
+		laddr = &local
+	}
+	return SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR)
+}
+
 // isNonblocking reports whether fd has O_NONBLOCK set. A descriptor that cannot
 // be queried is treated as non-blocking, which is the conservative answer: it
 // keeps EALREADY as an error rather than reporting a possibly unconnected socket
@@ -745,7 +774,17 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 			if errors.Is(err, syscall.EINTR) {
 				continue
 			}
-			return n, nil, recvflags, toDeadlineErr(err)
+			// Only a programmed deadline can turn a blocking recvmsg into
+			// EAGAIN, so only then does EAGAIN mean the deadline expired. A
+			// descriptor that is non-blocking for some other reason — one
+			// handed to NewSCTPConn, or one a Control hook set O_NONBLOCK on —
+			// gets its EAGAIN back unchanged, rather than a phantom timeout a
+			// caller would retry forever on. AcceptSCTP already draws the same
+			// distinction.
+			if deadline != 0 {
+				err = toDeadlineErr(err)
+			}
+			return n, nil, recvflags, err
 		}
 
 		if n == 0 && oobn == 0 {
@@ -862,6 +901,22 @@ func (c *SCTPConn) ReadMsg(max int) ([]byte, *SndRcvInfo, error) {
 		}
 
 		n, info, flags, err := c.SCTPReadFlags(buf[total:])
+		if flags&MSG_NOTIFICATION != 0 {
+			// A notification is not a message. It arrives interleaved on the
+			// same stream and is distinguished only by this flag, so returning
+			// it here would hand the caller a struct sctp_assoc_change as if
+			// the peer had sent it — with MSG_EOR set, since the kernel marks
+			// notifications complete, so it would look like a finished message.
+			//
+			// SCTPReadFlags has already offered it to the NotificationHandler
+			// if one is installed. Either way it is dropped rather than
+			// returned: this is the whole-message API, and a caller that wants
+			// events subscribes to them and reads with SCTPReadFlags.
+			if err != nil {
+				return buf[:total], first, err
+			}
+			continue
+		}
 		if n > 0 {
 			total += n
 		}
@@ -1126,6 +1181,11 @@ func ListenSCTPExt(network string, laddr *SCTPAddr, options InitMsg) (*SCTPListe
 
 // listenSCTPExtConfig - start listener on specified address/port with given SCTP options and socket configuration
 func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, control func(network, address string, c syscall.RawConn) error, notificationHandler NotificationHandler) (*SCTPListener, error) {
+	network, _, err := canonicalNetwork(network)
+	if err != nil {
+		return nil, err
+	}
+
 	af, ipv6only := favoriteAddrFamily(network, laddr, nil, "listen")
 	sock, err := syscall.Socket(
 		af,
@@ -1161,17 +1221,7 @@ func listenSCTPExtConfig(network string, laddr *SCTPAddr, options InitMsg, contr
 	}
 
 	if laddr != nil {
-		// If IP address and/or port was not provided so far, let's use the unspecified IPv4 or IPv6 address
-		if len(laddr.IPAddrs) == 0 {
-			switch af {
-			case syscall.AF_INET:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
-			case syscall.AF_INET6:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
-			}
-		}
-		err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR)
-		if err != nil {
+		if err = bindLocal(sock, laddr, af); err != nil {
 			return nil, err
 		}
 	}
@@ -1244,7 +1294,13 @@ func (ln *SCTPListener) AcceptSCTP() (*SCTPConn, error) {
 				atomic.StoreInt32(&ln.rcvTimeoSet, 0)
 			}
 		}
-		fd, _, err := syscall.Accept4(lnfd, 0)
+		// SOCK_CLOEXEC matters as much here as on the sockets this package
+		// creates itself, and for longer: an accepted descriptor is a live
+		// association. Without it a child process forked while the server is
+		// running inherits every connection open at that moment — it can read
+		// and write them, and because it holds the descriptor open, closing
+		// this side neither frees the port nor sends the peer a reset.
+		fd, _, err := syscall.Accept4(lnfd, syscall.SOCK_CLOEXEC)
 		if err != nil {
 			// A timed-out accept surfaces as EAGAIN, which is the same errno a
 			// non-blocking accept would give. Only a programmed deadline can
@@ -1328,6 +1384,11 @@ func DialSCTPExt(network string, laddr, raddr *SCTPAddr, options InitMsg) (*SCTP
 
 // dialSCTPExtConfig - same as DialSCTP but with given SCTP options and socket configuration
 func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network, address string, c syscall.RawConn) error, notificationHandler NotificationHandler) (*SCTPConn, error) {
+	network, _, err := canonicalNetwork(network)
+	if err != nil {
+		return nil, err
+	}
+
 	af, ipv6only := favoriteAddrFamily(network, laddr, raddr, "dial")
 	sock, err := syscall.Socket(
 		af,
@@ -1362,17 +1423,8 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 		return nil, err
 	}
 	if laddr != nil {
-		// If IP address and/or port was not provided so far, let's use the unspecified IPv4 or IPv6 address
-		if len(laddr.IPAddrs) == 0 {
-			switch af {
-			case syscall.AF_INET:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
-			case syscall.AF_INET6:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
-			}
-		}
-		err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR) // error EADDRINUSE "Address already in use" may occur if resource (source IP and Port) is occupied
-		if err != nil {
+		// EADDRINUSE here means the source address and port are already taken.
+		if err = bindLocal(sock, laddr, af); err != nil {
 			return nil, err
 		}
 	}
@@ -1415,6 +1467,11 @@ func dialSCTPExtConfig(network string, laddr, raddr *SCTPAddr, options InitMsg, 
 // net.sctp.rto_initial; MaxInitTimeout caps each RTO without bounding the total.
 // So the bound has to come from here.
 func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network, address string, c syscall.RawConn) error, notificationHandler NotificationHandler) (*SCTPConn, error) {
+	network, _, err := canonicalNetwork(network)
+	if err != nil {
+		return nil, err
+	}
+
 	// A context that is already done must not open a socket at all.
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -1460,15 +1517,7 @@ func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr 
 		return nil, err
 	}
 	if laddr != nil {
-		if len(laddr.IPAddrs) == 0 {
-			switch af {
-			case syscall.AF_INET:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv4zero})
-			case syscall.AF_INET6:
-				laddr.IPAddrs = append(laddr.IPAddrs, net.IPAddr{IP: net.IPv6zero})
-			}
-		}
-		if err = SCTPBind(sock, laddr, SCTP_BINDX_ADD_ADDR); err != nil {
+		if err = bindLocal(sock, laddr, af); err != nil {
 			return nil, err
 		}
 	}
