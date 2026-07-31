@@ -20,6 +20,7 @@ package sctp
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"syscall"
 	"testing"
@@ -420,24 +421,21 @@ func TestPeelOffRacesWithClose(t *testing.T) {
 	}
 }
 
-// TestClosingAPeeledConnectionAbortsRatherThanShuttingDown pins behaviour this
-// package cannot change and a caller has to know about.
+// TestClosingAPeeledConnectionShutsDownGracefully covers the one socket style
+// where shutdown(2) does nothing.
 //
-// sctp_do_peeloff builds the new socket with SCTP_SOCKET_UDP_HIGH_BANDWIDTH,
-// and sctp_shutdown begins "if (!sctp_style(sk, TCP)) return". So shutdown(2)
-// on a peeled socket reports success and emits nothing, SCTP_STATUS goes on
-// reporting SCTP_ESTABLISHED, and closeSctpSocket has no way to learn the
-// handshake will never finish. It waits out the whole budget and aborts.
+// sctp_do_peeloff builds the new socket with SCTP_SOCKET_UDP_HIGH_BANDWIDTH and
+// sctp_shutdown begins "if (!sctp_style(sk, TCP)) return", so the shutdown
+// closeSctpSocket issues reports success and emits nothing. Before
+// shutdownViaEOF was added, SCTP_STATUS went on reporting SCTP_ESTABLISHED, the
+// wait ran its whole budget out and the close fell back to an abort: 3.005s and
+// a single ABORT on the wire where an ordinary close took 21.7us and completed
+// the handshake.
 //
-// Captured on both sides: an ordinary Close puts SHUTDOWN, SHUTDOWN_ACK and
-// SHUTDOWN_COMPLETE on the wire in 21.7us, while a peeled one puts a single
-// ABORT after 3.005s.
-//
-// This asserts today's imperfect behaviour and is written to fail if it
-// improves — if a kernel starts honouring shutdown here, the close returns
-// early and the assertion below stops holding, which is the notification that
-// the documentation on PeelOff needs revisiting.
-func TestClosingAPeeledConnectionAbortsRatherThanShuttingDown(t *testing.T) {
+// The peer is what decides this. A fast close proves nothing on its own — an
+// abort is fast too — so the assertion is that the other end sees the end of the
+// stream rather than a connection reset.
+func TestClosingAPeeledConnectionShutsDownGracefully(t *testing.T) {
 	server, client, assocID := oneToManyPair(t)
 	defer func() {
 		_ = server.CloseWithTimeout(20 * time.Millisecond)
@@ -449,9 +447,9 @@ func TestClosingAPeeledConnectionAbortsRatherThanShuttingDown(t *testing.T) {
 		t.Skipf("PeelOff: %v", err)
 	}
 
-	// Short enough to keep the suite quick, long enough that the difference
-	// between "ran the budget out" and "finished early" is unambiguous.
-	const grace = 400 * time.Millisecond
+	// Long enough that running it out is unambiguous, short enough not to cost
+	// the suite anything when the graceful path works.
+	const grace = 2 * time.Second
 
 	start := time.Now()
 	if err := peeled.CloseWithTimeout(grace); err != nil {
@@ -461,22 +459,34 @@ func TestClosingAPeeledConnectionAbortsRatherThanShuttingDown(t *testing.T) {
 	t.Logf("closing the peeled connection took %v against a %v grace period",
 		took, grace)
 
-	if took < grace {
-		t.Errorf("the close finished in %v, inside its %v grace period, so the "+
-			"association was shut down gracefully; shutdown(2) now works on a "+
-			"peeled socket and the note on PeelOff is out of date", took, grace)
+	if took >= grace {
+		t.Errorf("the close ran its %v grace period out (%v), which is what it "+
+			"did before shutdownViaEOF existed: shutdown(2) does nothing on a "+
+			"peeled socket, so nothing reports the handshake finishing and the "+
+			"close falls back to an abort", grace, took)
 	}
 
-	// The contrast is what makes the number above mean something: the same
-	// call on an ordinary connection returns far inside the same budget.
-	c2, s2 := eorPairNoCleanup(t)
-	defer func() { _ = s2.CloseWithTimeout(20 * time.Millisecond) }()
-	start = time.Now()
-	if err := c2.CloseWithTimeout(grace); err != nil {
-		t.Fatalf("CloseWithTimeout on an ordinary conn: %v", err)
+	// The half a timing check cannot cover. An abort reaches the peer as
+	// ECONNRESET; a completed shutdown reaches it as the end of the stream.
+	if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
 	}
-	if ordinary := time.Since(start); ordinary >= grace {
-		t.Errorf("an ordinary Close also ran its %v budget out (%v), so the "+
-			"peeled result above says nothing about peeling", grace, ordinary)
+	buf := make([]byte, 64)
+	for {
+		n, rerr := client.Read(buf)
+		if rerr == nil {
+			// Notifications and any straggling data; keep reading for the end.
+			_ = n
+			continue
+		}
+		if errors.Is(rerr, io.EOF) {
+			break
+		}
+		if errors.Is(rerr, syscall.ECONNRESET) {
+			t.Fatalf("the peer's read gave ECONNRESET, so the association was "+
+				"aborted rather than shut down; the close returned in %v, which "+
+				"means it aborted promptly rather than gracefully", took)
+		}
+		t.Fatalf("the peer's read gave %v, want the end of the stream", rerr)
 	}
 }

@@ -2838,47 +2838,94 @@ message across several **complete** events, each with `MSG_EOR` set, and an
 undersized read buffer truncating one event, which is signalled by `MSG_EOR`
 being **clear**. Only the second is what `ErrShortNotification` reports.
 
-### Close on a peeled connection aborts
+### Close on a peeled connection aborted, and now does not
 
 `PeelOff` had a layout test, an EINVAL test and a success test, and no
 concurrency coverage at all — the one lifecycle operation with none, while
 `Close` already had four race tests against reads and writes.
 
 Racing it against `Close` turned up something the race itself was not looking
-for: closing a peeled connection takes the full grace period and then aborts.
+for. A race test that took 84 seconds was the tell: closing a peeled connection
+ran the full grace period out and then aborted.
 
 ```
-                    ordinary conn   peeled conn
-Close returned in   21.7us          3.005s
-SHUTDOWN on wire    1               0
-SHUTDOWN_ACK        1               0
-SHUTDOWN_COMPLETE   1               0
-ABORT on wire       0               1
+                    ordinary conn   peeled, before   peeled, now
+Close returned in   21.7us          3.005s           1.77ms
+SHUTDOWN on wire    1               0                1
+SHUTDOWN_ACK        1               0                1
+SHUTDOWN_COMPLETE   1               0                1
+ABORT on wire       0               1                0
 ```
 
-The cause is in the kernel and is deliberate. `sctp_do_peeloff` builds the new
-socket with `sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH)`, and
-`sctp_shutdown` begins:
+A peeled socket looks one-to-one from userspace and is not one internally.
+`sctp_do_peeloff` builds it with
+`sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH)`, and `sctp_shutdown`
+begins:
 
 ```c
 	if (!sctp_style(sk, TCP))
 		return;
 ```
 
-So `shutdown(2)` on a peeled socket succeeds and does nothing. `SCTP_STATUS`
-goes on reporting `SCTP_ESTABLISHED` — measured, unchanged for well over a
-second after the shutdown, where an ordinary connection reports EINVAL within
-150ms — so `assocGone` never fires, `waitAssocGone` runs its budget out, and the
-close falls back to the abort it keeps for exactly that case.
+So `shutdown(2)` succeeds and does nothing. `SCTP_STATUS` goes on reporting
+`SCTP_ESTABLISHED` — measured, unchanged for over a second, where an ordinary
+connection reports EINVAL within 150ms — so `assocGone` never fires,
+`waitAssocGone` runs its budget out, and the close falls back to the abort it
+keeps for exactly that case. A caller asking for a graceful close got the
+opposite of one, three seconds later.
 
-Nothing here is worked around. It is documented on `PeelOff`, and
-`TestClosingAPeeledConnectionAbortsRatherThanShuttingDown` asserts today's
-behaviour in the form that fails if a later kernel starts honouring shutdown on
-these sockets.
+The first version of this note stopped there and called it kernel behaviour to
+document rather than fix. That was giving up too early. There is a second way to
+ask, and the kernel's two mechanisms turn out to be exact complements:
 
-It also explains a cost: the race test was taking 84 seconds, essentially all of
-it peeled connections waiting out grace periods. With a short budget it takes
-0.79 seconds.
+```c
+	/* sctp_sendmsg_check_sflags */
+	if (sctp_style(sk, TCP) && (sflags & (SCTP_EOF | SCTP_ABORT)))
+		return -EINVAL;
+	if (((sflags & SCTP_EOF) && msg_len > 0) || ...)
+		return -EINVAL;
+	...
+	/* sctp_sendmsg_to_asoc */
+	if (sflags & SCTP_EOF) {
+		sctp_primitive_SHUTDOWN(net, asoc, NULL);
+		return 0;
+	}
+```
+
+`shutdown(2)` works only on one-to-one sockets; RFC 6458 §5.3.2's `SCTP_EOF`
+send flag works only on the others. Neither covers both, and this package had
+only ever used the first. Measured on a peeled socket, after
+`shutdown(SHUT_RDWR)` has already returned 0 and left the association
+established:
+
+```
+zero-length send with SCTP_EOF -> 0, association gone 50ms later
+same send on a one-to-one socket -> EINVAL
+```
+
+`closeSctpSocket` now issues both. The one that does not apply fails harmlessly,
+which is why the error is discarded: EINVAL is the expected answer on the
+one-to-one sockets this package usually holds, where the shutdown above has
+already done the work. Ordinary closes are unchanged at 47.7us with the full
+handshake and no abort.
+
+One detail decided the implementation. `syscall.SendmsgN` substitutes a one-byte
+scratch iovec whenever the payload is empty and the control buffer is not, on
+anything that is not `SOCK_DGRAM` — and a peeled socket is `SOCK_SEQPACKET`. The
+kernel rejects an `SCTP_EOF` send carrying any payload, so going through
+`SendmsgN` would have sent that byte and been refused. `shutdownViaEOF` makes
+the `sendmsg` syscall directly with no iovec at all. This is the same
+scratch-iovec behaviour `recvmsg` already documents on the read path, in the
+other direction, and it would have failed silently: the error is discarded, so
+the fix would simply not have worked.
+
+The test written for the old behaviour did its job on the way through. It
+asserted that the close runs its grace period out, and was written to fail if
+that ever improved; applying the fix failed it, which is how a test pinning
+today's imperfect behaviour is supposed to end. It now asserts the graceful
+close, and checks it at the peer rather than by timing — a fast close proves
+nothing on its own, because an abort is fast too. What it requires is that the
+other end sees the end of the stream rather than ECONNRESET.
 
 ### A fix whose failure path cannot be reached
 

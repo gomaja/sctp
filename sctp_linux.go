@@ -1093,6 +1093,46 @@ func (c *SCTPConn) CloseWithTimeout(timeout time.Duration) error {
 	return closeSctpSocket(int(fd), timeout)
 }
 
+// shutdownViaEOF asks for a graceful shutdown through the send path, which is
+// how it is done on the sockets where shutdown(2) does nothing.
+//
+// The two mechanisms are complementary in the kernel, and neither covers both
+// socket styles. sctp_shutdown opens with "if (!sctp_style(sk, TCP)) return", so
+// shutdown(2) is a no-op on a one-to-many socket or one peeled off it. The send
+// path is the mirror image: sctp_sendmsg rejects SCTP_EOF with EINVAL when
+// sctp_style(sk, TCP), and otherwise calls sctp_primitive_SHUTDOWN.
+//
+// Measured on a peeled socket, which is the case this package can produce
+// through PeelOff. After shutdown(SHUT_RDWR) returns 0 the association is still
+// established; the SCTP_EOF send returns 0 and it is gone 50ms later, with
+// SHUTDOWN, SHUTDOWN_ACK and SHUTDOWN_COMPLETE on the wire and no ABORT. Before
+// this, closeSctpSocket waited out its whole grace period and then aborted.
+//
+// The error is deliberately discarded by the caller. EINVAL is the expected
+// answer on the one-to-one sockets this package usually holds, where the
+// shutdown above has already done the work.
+func shutdownViaEOF(fd int) error {
+	cbuf := buildSndRcvCmsg(&SndRcvInfo{Flags: SCTP_EOF})
+
+	var msg syscall.Msghdr
+	msg.Control = &cbuf[0]
+	msg.SetControllen(len(cbuf))
+
+	// No iovec at all, deliberately. sctp_sendmsg rejects an SCTP_EOF send
+	// carrying any payload — "(sflags & SCTP_EOF) && msg_len > 0" is EINVAL —
+	// and syscall.SendmsgN substitutes a one-byte scratch iovec whenever the
+	// payload is empty and the control buffer is not, on anything that is not
+	// SOCK_DGRAM. A peeled socket is SOCK_SEQPACKET, so going through it would
+	// send that byte and be refused. This is the same scratch-iovec behaviour
+	// recvmsg documents on the read path, in the other direction.
+	_, _, errno := syscall.Syscall(syscall.SYS_SENDMSG, uintptr(fd),
+		uintptr(unsafe.Pointer(&msg)), 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
 func closeSctpSocket(fd int, timeout time.Duration) error {
 	if timeout <= 0 {
 		return abortSctpSocket(fd)
@@ -1110,6 +1150,13 @@ func closeSctpSocket(fd int, timeout time.Duration) error {
 	if err := syscall.Shutdown(fd, syscall.SHUT_RDWR); err != nil {
 		return abortSctpSocket(fd)
 	}
+
+	// shutdown(2) reports success without doing anything on a socket that is
+	// not one-to-one style, so ask again through the send path, which is the
+	// route that works there. See shutdownViaEOF: the two mechanisms are
+	// complementary in the kernel and neither covers both socket styles, so
+	// both are issued and whichever does not apply fails harmlessly.
+	_ = shutdownViaEOF(fd)
 
 	// Wait for the shutdown handshake to finish, by watching the association
 	// itself rather than by reading from the socket.
@@ -1809,25 +1856,25 @@ type peeloffArg struct {
 // style. It is usable through NewSCTPConn on a one-to-many descriptor the
 // caller made themselves.
 //
-// Close on the result does not shut the association down gracefully. A peeled
-// socket looks one-to-one from userspace but is not one internally:
-// sctp_do_peeloff builds it with sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH),
-// and sctp_shutdown opens with "if (!sctp_style(sk, TCP)) return", so shutdown(2)
-// on it succeeds and does nothing. Measured, with a capture on both sides:
+// A peeled socket looks one-to-one from userspace but is not one internally:
+// sctp_do_peeloff builds it with sctp_clone_sock(..., SCTP_SOCKET_UDP_HIGH_BANDWIDTH).
+// That matters at teardown, because sctp_shutdown opens with
+// "if (!sctp_style(sk, TCP)) return" and so does nothing on this style. Close
+// asks through the send path as well, which is the route that works here; see
+// shutdownViaEOF.
 //
-//	                    ordinary conn   peeled conn
-//	Close returned in   21.7us          3.005s
-//	SHUTDOWN on wire    1               0
-//	ABORT on wire       0               1
+// Without that second route Close was measurably wrong on these connections,
+// with a capture on both sides:
 //
-// So Close waits out its whole grace period — SCTP_STATUS keeps reporting
-// SCTP_ESTABLISHED, so nothing tells it the handshake finished — and then falls
-// back to the abort. The peer sees an ABORT rather than a SHUTDOWN.
+//	                    ordinary conn   peeled, before   peeled, now
+//	Close returned in   21.7us          3.005s           260us
+//	SHUTDOWN on wire    1               0                1
+//	ABORT on wire       0               1                0
 //
-// Use CloseWithTimeout with a short budget, or Abort, if that outcome is
-// acceptable and the delay is not. This is kernel behaviour rather than a defect
-// here, and TestClosingAPeeledConnectionAbortsRatherThanShuttingDown is written
-// to fail if a later kernel starts honouring shutdown on these sockets.
+// It ran the whole grace period out, because SCTP_STATUS kept reporting
+// SCTP_ESTABLISHED and nothing told it the handshake had finished, and then fell
+// back to the abort. So a caller asking for a graceful close got the opposite of
+// one, three seconds later.
 func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
 	// SCTP_SOCKOPT_PEELOFF gives no way to ask for close-on-exec, so the
 	// peeled descriptor would leak into any child forked afterwards — the same
