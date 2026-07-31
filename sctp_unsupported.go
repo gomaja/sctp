@@ -183,3 +183,7 @@ func isNonblocking(fd int) bool {
 func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
 	return nil, ErrUnsupported
 }
+
+func (c *SCTPConn) SCTPReadNextInfo(b []byte) (int, *SndRcvInfo, *NxtInfo, int, error) {
+	return 0, nil, nil, 0, ErrUnsupported
+}

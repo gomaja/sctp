@@ -503,3 +503,78 @@ func TestNotificationPPIDStaysInNetworkOrder(t *testing.T) {
 		}
 	})
 }
+
+// TestParseNotificationRejectsADeclaredLengthItDoesNotHave covers the check
+// that compares the header's length against the bytes present.
+//
+// Those two were never compared. A notification read into a buffer smaller than
+// the event arrives split — unavoidable for the three that carry a variable
+// tail, since their size follows the data — and the first fragment decoded into
+// a complete-looking event with a nil error and a short tail. A caller reading
+// Data got a truncated message with no way to know it was truncated.
+//
+// Measured before the fix: a header declaring 65516 bytes with 20 present
+// returned an AssocChange reporting Length() == 65516 and no error.
+func TestParseNotificationRejectsADeclaredLengthItDoesNotHave(t *testing.T) {
+	t.Run("declared longer than present", func(t *testing.T) {
+		b := make([]byte, assocChangeMinSize)
+		putNotificationHeader(b, SCTP_ASSOC_CHANGE, 0, 65516)
+
+		note, err := ParseNotification(b)
+		if err != ErrShortNotification {
+			t.Fatalf("err = %v, want ErrShortNotification; the header declares "+
+				"65516 bytes and only %d are present", err, len(b))
+		}
+		if note != nil {
+			t.Errorf("returned a %T alongside the error", note)
+		}
+	})
+
+	t.Run("a variable tail that did not all arrive", func(t *testing.T) {
+		// A send failure carrying 4000 bytes of undelivered message, read into
+		// a NotificationMaxSize buffer. This is the case the fix exists for.
+		b := make([]byte, NotificationMaxSize)
+		putNotificationHeader(b, SCTP_SEND_FAILED_EVENT, SCTP_DATA_UNSENT, 4000)
+
+		note, err := ParseNotification(b)
+		if err != ErrShortNotification {
+			t.Fatalf("err = %v, want ErrShortNotification", err)
+		}
+		if note != nil {
+			t.Errorf("returned a %T; a caller would read its Data as the whole "+
+				"undelivered message", note)
+		}
+	})
+
+	t.Run("declared exactly what is present", func(t *testing.T) {
+		// The bound must not reject a complete event, which is what every
+		// kernel-delivered notification looks like when the buffer was big
+		// enough.
+		b := make([]byte, assocChangeMinSize+4)
+		putNotificationHeader(b, SCTP_ASSOC_CHANGE, 0, uint32(len(b)))
+
+		note, err := ParseNotification(b)
+		if err != nil {
+			t.Fatalf("err = %v on a complete notification", err)
+		}
+		ac, ok := note.(*AssocChange)
+		if !ok {
+			t.Fatalf("got %T, want *AssocChange", note)
+		}
+		if len(ac.Info) != 4 {
+			t.Errorf("len(Info) = %d, want 4", len(ac.Info))
+		}
+	})
+
+	t.Run("declared shorter than present", func(t *testing.T) {
+		// Not something the kernel does, but it must not be treated as
+		// truncation: there is nothing missing.
+		b := make([]byte, assocChangeMinSize+8)
+		putNotificationHeader(b, SCTP_ASSOC_CHANGE, 0, assocChangeMinSize)
+
+		if _, err := ParseNotification(b); err != nil {
+			t.Errorf("err = %v; the buffer holds more than the header declares, "+
+				"which is not truncation", err)
+		}
+	})
+}

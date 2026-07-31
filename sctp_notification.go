@@ -37,17 +37,31 @@ type Notification interface {
 	Length() uint32
 }
 
-// ErrShortNotification is returned by ParseNotification when the buffer is
-// too short to hold the notification it declares itself to be.
+// ErrShortNotification is returned by ParseNotification when the buffer holds
+// fewer bytes than the notification declares itself to be.
 //
-// The kernel truncates a notification to whatever buffer the caller passed:
-// reading with a 16 byte buffer delivers a 16 byte SCTP_ASSOC_CHANGE, four
-// bytes short of the 20 byte event, and the remainder is dropped rather than
-// queued. Read with a buffer of at least NotificationMaxSize to avoid it.
+// A notification read into an undersized buffer arrives split, and what follows
+// is not dropped. Measured by reading a 24 byte SCTP_ASSOC_CHANGE with an 8 byte
+// buffer: three reads, every one of them flagged MSG_NOTIFICATION, with MSG_EOR
+// set only on the last. So the continuation fragments look like fresh
+// notifications to anything that only tests the flag — and a fragment whose
+// first two bytes happen to match a known type would decode into an event
+// assembled from the middle of another one.
+//
+// Read with a buffer of at least NotificationMaxSize, and treat a fragment
+// without MSG_EOR as incomplete rather than as an event.
 var ErrShortNotification = errors.New("sctp: notification truncated")
 
-// NotificationMaxSize is a read buffer size large enough for any notification
-// this package parses, so that none is truncated.
+// NotificationMaxSize is a read buffer size that holds any fixed-size
+// notification this package parses.
+//
+// It is not a bound on every notification. SCTP_SEND_FAILED,
+// SCTP_SEND_FAILED_EVENT and SCTP_REMOTE_ERROR carry a variable tail — the
+// undelivered message, or the peer's ERROR chunk — so their size follows the
+// data rather than the struct, and a failed 64 KiB send produces an event far
+// larger than this. Those are the reads that come back split, and
+// ParseNotification reports them as ErrShortNotification rather than as a
+// complete event with a short tail.
 const NotificationMaxSize = 1024
 
 // notificationHeaderSize is the common prefix every notification shares:
@@ -516,6 +530,18 @@ func ParseNotification(b []byte) (Notification, error) {
 	typ := nativeEndian.Uint16(b[0:2])
 	flags := nativeEndian.Uint16(b[2:4])
 	length := nativeEndian.Uint32(b[4:8])
+
+	// The header says how long the whole event is; b is what actually arrived.
+	// Without this the two were never compared, so a notification split across
+	// reads — which is what happens whenever the buffer is smaller than the
+	// event, and unavoidable for the ones carrying a variable tail — decoded
+	// from its first fragment and came back with a nil error and a short tail.
+	// A caller reading Data then saw a truncated message it had no way to know
+	// was truncated. Measured: a header declaring 65516 bytes with 20 present
+	// returned an AssocChange reporting Length() == 65516 and no error.
+	if length > uint32(len(b)) {
+		return nil, ErrShortNotification
+	}
 
 	switch SCTPNotificationType(typ) {
 	case SCTP_ASSOC_CHANGE:

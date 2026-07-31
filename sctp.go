@@ -1556,8 +1556,35 @@ func (c *SCTPConn) SetRecvRcvInfo(on bool) error {
 
 // SetRecvNxtInfo enables or disables delivery of SCTP_NXTINFO, which describes
 // the message following the one being read (RFC 6458 §8.1.30).
+//
+// Read the result with SCTPReadNextInfo. SCTPRead and SCTPReadFlags ignore the
+// ancillary data this enables, so enabling it and then reading with those
+// discards it — which is what this package did in both directions until
+// SCTPReadNextInfo existed.
 func (c *SCTPConn) SetRecvNxtInfo(on bool) error {
 	return setsockoptInt(c.fd(), SCTP_RECVNXTINFO, on)
+}
+
+// NxtInfo mirrors struct sctp_nxtinfo (RFC 6458 §5.3.6), describing the message
+// queued behind the one just read.
+//
+// Length is the point of it: a caller can size the next buffer exactly instead
+// of guessing, which on a message-oriented protocol is the difference between
+// one read and a reassembly loop. It arrives only when SetRecvNxtInfo is on and
+// only when there is a next message — an empty queue means no ancillary data,
+// which SCTPReadNextInfo reports as a nil NxtInfo rather than an error.
+type NxtInfo struct {
+	// SID is the stream the next message arrives on.
+	SID uint16
+	// Flags carries SCTP_UNORDERED and, if the next message is a notification,
+	// MSG_NOTIFICATION.
+	Flags uint16
+	// PPID is the payload protocol identifier, converted to host order as
+	// SCTPRead does for SndRcvInfo.PPID.
+	PPID uint32
+	// Length is the size of the whole next message in bytes.
+	Length  uint32
+	AssocID SCTPAssocID
 }
 
 // setsockoptInt sets one of the boolean-valued SCTP options. RFC 6458 specifies
@@ -3068,15 +3095,17 @@ func sctpGetAddrs(fd, id, optname int) (*SCTPAddr, error) {
 		unsafe.Sizeof(param.addrs))
 }
 
-func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
+// sctpGetSetPrim mirrors struct sctp_prim and struct sctp_setpeerprim, which
+// are the same shape: an association id followed by a sockaddr_storage. Both
+// are declared packed and aligned(4), so the address starts at offset 4 with no
+// pad and the whole thing is 132 bytes.
+type sctpGetSetPrim struct {
+	assocID int32
+	addrs   [128]byte
+}
 
-	type sctpGetSetPrim struct {
-		assocId int32
-		addrs   [128]byte
-	}
-	param := sctpGetSetPrim{
-		assocId: int32(0),
-	}
+func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
+	param := sctpGetSetPrim{}
 	optlen := unsafe.Sizeof(param)
 	_, _, err := getsockopt(c.fd(), SCTP_PRIMARY_ADDR, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
@@ -3084,6 +3113,48 @@ func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
 	}
 	return resolveFromRawAddrBuf(unsafe.Pointer(&param.addrs), 1,
 		unsafe.Sizeof(param.addrs))
+}
+
+// SetPrimaryPeerAddr makes addr the primary path for this association
+// (SCTP_PRIMARY_ADDR, RFC 6458 §8.1.9).
+//
+// The primary is where data goes when every path is usable; the others carry
+// retransmissions and take over on failure. Choosing it is the point of
+// multi-homing, and until now only the getter existed, so an application could
+// see which path was primary but not say which one should be. addr must be one
+// the peer announced — GetPeerAddrs lists them — and the kernel rejects
+// anything else with EINVAL.
+func (c *SCTPConn) SetPrimaryPeerAddr(addr *SCTPAddr) error {
+	param := sctpGetSetPrim{}
+	raw := addr.ToRawSockAddrBuf()
+	if len(raw) > len(param.addrs) {
+		return syscall.EINVAL
+	}
+	copy(param.addrs[:], raw)
+	_, _, err := setsockopt(c.fd(), SCTP_PRIMARY_ADDR,
+		uintptr(unsafe.Pointer(&param)), unsafe.Sizeof(param))
+	return err
+}
+
+// SetPeerPrimaryAddr asks the peer to make addr its primary destination
+// (SCTP_SET_PEER_PRIMARY_ADDR, RFC 6458 §8.1.10).
+//
+// This is the other direction from SetPrimaryPeerAddr: that one chooses where
+// this endpoint sends, while this one asks the peer to change where it sends.
+// The request travels as an ASCONF parameter, so it needs RFC 5061 negotiated —
+// see SetAsconfSupported, without which the kernel refuses with EPERM because
+// net.sctp.addip_enable defaults to 0. addr must be one of this endpoint's own
+// bound addresses.
+func (c *SCTPConn) SetPeerPrimaryAddr(addr *SCTPAddr) error {
+	param := sctpGetSetPrim{}
+	raw := addr.ToRawSockAddrBuf()
+	if len(raw) > len(param.addrs) {
+		return syscall.EINVAL
+	}
+	copy(param.addrs[:], raw)
+	_, _, err := setsockopt(c.fd(), SCTP_SET_PEER_PRIMARY_ADDR,
+		uintptr(unsafe.Pointer(&param)), unsafe.Sizeof(param))
+	return err
 }
 
 func (c *SCTPConn) SCTPLocalAddr(id int) (*SCTPAddr, error) {

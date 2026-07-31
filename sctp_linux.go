@@ -708,6 +708,52 @@ func parseSndRcvInfo(b []byte) (*SndRcvInfo, error) {
 	return fromRcvInfo, nil
 }
 
+// parseNxtInfo extracts SCTP_NXTINFO from a control message buffer, if it is
+// there.
+//
+// It is a separate walk rather than another case in parseSndRcvInfo because
+// this describes a different message: SndRcvInfo is about the bytes just read,
+// NxtInfo about the one behind them. Folding them together would mean changing
+// the return type of every read.
+//
+// A nil result with a nil error means the kernel sent no such cmsg, which is
+// what happens when SetRecvNxtInfo is off or the receive queue is empty. That is
+// not a failure, so it is not reported as one.
+func parseNxtInfo(b []byte) (*NxtInfo, error) {
+	msgs, err := syscall.ParseSocketControlMessage(b)
+	if err != nil {
+		return nil, err
+	}
+	for _, m := range msgs {
+		if m.Header.Level != SOL_SCTP || m.Header.Type != SCTP_CMSG_NXTINFO {
+			continue
+		}
+		if len(m.Data) < int(unsafe.Sizeof(NxtInfo{})) {
+			continue
+		}
+		// Copy rather than alias: m.Data points into the pooled control
+		// buffer, which the next read reuses. Aliasing it is the bug already
+		// fixed once for SndRcvInfo.
+		ni := *(*NxtInfo)(unsafe.Pointer(&m.Data[0]))
+		ni.PPID = ntohl(ni.PPID)
+		return &ni, nil
+	}
+	return nil, nil
+}
+
+// SCTPReadNextInfo is SCTPReadFlags, additionally returning what the kernel
+// said about the message queued behind this one.
+//
+// nxt is nil when SetRecvNxtInfo has not been enabled or when nothing else is
+// queued; neither is an error. Its Length is the whole size of the next
+// message, so a caller can size the next buffer exactly rather than reading
+// into a guess and reassembling.
+func (c *SCTPConn) SCTPReadNextInfo(b []byte) (int, *SndRcvInfo, *NxtInfo, int, error) {
+	var nxt *NxtInfo
+	n, info, flags, err := c.readFlags(b, &nxt)
+	return n, info, nxt, flags, err
+}
+
 // SCTPRead reads one message, or as much of one message as fits in b.
 //
 // If the message is larger than b, the remainder is not discarded: it is
@@ -729,6 +775,18 @@ func (c *SCTPConn) SCTPRead(b []byte) (int, *SndRcvInfo, error) {
 // checking it, an oversized message is silently split and the remainder is
 // delivered as what looks like a fresh message.
 func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
+	return c.readFlags(b, nil)
+}
+
+// readFlags is SCTPReadFlags, additionally filling *nxt from SCTP_NXTINFO when
+// nxt is non-nil.
+//
+// The two share one body because they share one recvmsg: the next-message
+// information arrives as ancillary data on the same call, so parsing it
+// afterwards would mean either a second read or stashing the result on the
+// connection, and the second is a race as soon as two goroutines read.
+// Passing nil keeps the ordinary path from walking the control buffer twice.
+func (c *SCTPConn) readFlags(b []byte, nxt **NxtInfo) (int, *SndRcvInfo, int, error) {
 	// The control buffer is pooled rather than allocated per call. This is only
 	// safe because parseSndRcvInfo copies: it used to return a pointer into
 	// this buffer and byte-swap PPID in place, so reusing the buffer would have
@@ -799,6 +857,12 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 			var info *SndRcvInfo
 			if oobn > 0 {
 				info, err = parseSndRcvInfo(oob[:oobn])
+				if nxt != nil && err == nil {
+					// A malformed SCTP_NXTINFO is not worth failing the read
+					// for: the message itself is fine, and the caller's
+					// fallback is to size the next buffer as they did before.
+					*nxt, _ = parseNxtInfo(oob[:oobn])
+				}
 			}
 			return n, info, recvflags, err
 		}
