@@ -67,6 +67,60 @@ func getsockopt(fd int, optname, optval, optlen uintptr) (uintptr, uintptr, erro
 	return r0, r1, nil
 }
 
+// isNonblocking reports whether fd has O_NONBLOCK set. A descriptor that cannot
+// be queried is treated as non-blocking, which is the conservative answer: it
+// keeps EALREADY as an error rather than reporting a possibly unconnected socket
+// as ready.
+//
+// It lives here rather than beside its caller in sctp.go because syscall.SYS_FCNTL
+// exists only on the platforms that have it, and sctp.go is built for all of them.
+// See isNonblocking in sctp_unsupported.go for the other half.
+func isNonblocking(fd int) bool {
+	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd),
+		syscall.F_GETFL, 0)
+	if errno != 0 {
+		return true
+	}
+	return flags&syscall.O_NONBLOCK != 0
+}
+
+// applyTimeout programs optname (SO_RCVTIMEO or SO_SNDTIMEO) from an absolute
+// deadline. It reports ErrDeadlineExceeded when the deadline has already
+// passed, since a zero timeval means "block forever" rather than "expire
+// immediately" and would otherwise hang.
+//
+// This is here for the same reason as isNonblocking: syscall.SetsockoptTimeval
+// takes an int on Unix and a syscall.Handle on Windows, so it cannot be called
+// from a file compiled for both. It has no non-Linux counterpart because nothing
+// outside this file calls it.
+func applyTimeout(fd int, optname int, deadline int64) error {
+	if deadline == 0 {
+		// No deadline: clear any timeout left by a previous call. Callers
+		// that track whether one is programmed skip this entirely.
+		return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname,
+			&syscall.Timeval{})
+	}
+
+	d := time.Until(time.Unix(0, deadline))
+	if d <= 0 {
+		return os.ErrDeadlineExceeded
+	}
+
+	// Round up so a sub-microsecond remainder does not truncate to zero,
+	// which the kernel would read as "no timeout".
+	usec := (d.Nanoseconds() + 999) / 1000
+
+	// Timeval field widths differ by platform (int64 on linux/amd64, int32 on
+	// linux/386 and darwin). syscall.NsecToTimeval builds the right shape for
+	// the target, so convert back to nanoseconds rather than assigning the
+	// fields directly.
+	tv := syscall.NsecToTimeval(usec * 1000)
+	if tv.Sec == 0 && tv.Usec == 0 {
+		tv.Usec = 1
+	}
+	return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname, &tv)
+}
+
 // poll(2) event bits. The syscall package generates the EPOLL* constants from
 // the kernel headers but no POLL* ones, and this module has no dependencies to
 // borrow them from. The kernel defines both sets to the same bits for the

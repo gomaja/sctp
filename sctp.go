@@ -1085,19 +1085,6 @@ func hasEstablishedAssoc(fd int) bool {
 	return status.State != 0
 }
 
-// isNonblocking reports whether fd has O_NONBLOCK set. A descriptor that cannot
-// be queried is treated as non-blocking, which is the conservative answer: it
-// keeps EALREADY as an error rather than reporting a possibly unconnected socket
-// as ready.
-func isNonblocking(fd int) bool {
-	flags, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd),
-		syscall.F_GETFL, 0)
-	if errno != 0 {
-		return true
-	}
-	return flags&syscall.O_NONBLOCK != 0
-}
-
 func SCTPBind(fd int, addr *SCTPAddr, flags int) error {
 	var option uintptr
 	switch flags {
@@ -2492,38 +2479,6 @@ func timeToUnixNano(t time.Time) int64 {
 		return 0
 	}
 	return t.UnixNano()
-}
-
-// applyTimeout programs optname (SO_RCVTIMEO or SO_SNDTIMEO) from an absolute
-// deadline. It reports ErrDeadlineExceeded when the deadline has already
-// passed, since a zero timeval means "block forever" rather than "expire
-// immediately" and would otherwise hang.
-func applyTimeout(fd int, optname int, deadline int64) error {
-	if deadline == 0 {
-		// No deadline: clear any timeout left by a previous call. Callers
-		// that track whether one is programmed skip this entirely.
-		return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname,
-			&syscall.Timeval{})
-	}
-
-	d := time.Until(time.Unix(0, deadline))
-	if d <= 0 {
-		return os.ErrDeadlineExceeded
-	}
-
-	// Round up so a sub-microsecond remainder does not truncate to zero,
-	// which the kernel would read as "no timeout".
-	usec := (d.Nanoseconds() + 999) / 1000
-
-	// Timeval field widths differ by platform (int64 on linux/amd64, int32 on
-	// linux/386 and darwin). syscall.NsecToTimeval builds the right shape for
-	// the target, so convert back to nanoseconds rather than assigning the
-	// fields directly.
-	tv := syscall.NsecToTimeval(usec * 1000)
-	if tv.Sec == 0 && tv.Usec == 0 {
-		tv.Usec = 1
-	}
-	return syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, optname, &tv)
 }
 
 // toDeadlineErr maps the kernel's timeout errno onto os.ErrDeadlineExceeded,

@@ -160,3 +160,18 @@ func DialSCTPContext(ctx context.Context, network string, laddr, raddr *SCTPAddr
 func dialSCTPExtConfigContext(ctx context.Context, network string, laddr, raddr *SCTPAddr, options InitMsg, control func(network string, address string, c syscall.RawConn) error, handler NotificationHandler) (*SCTPConn, error) {
 	return nil, ErrUnsupported
 }
+
+// isNonblocking is declared here because its caller, isEstablishedAssoc, is in
+// sctp.go and so is built for every platform, while the real implementation
+// needs syscall.SYS_FCNTL — which the syscall package does not define on
+// Windows. Without this the package stopped compiling there, which defeats the
+// point of this file: a caller cross-compiling for a platform without SCTP
+// should get ErrUnsupported at run time, not a build failure.
+//
+// The value is unreachable in practice. Every connect path here returns
+// ErrUnsupported from the getsockopt stub above, so isEstablishedAssoc never
+// sees the EISCONN or EALREADY that would make it ask. True is nonetheless the
+// answer that matches the documented conservative default.
+func isNonblocking(fd int) bool {
+	return true
+}
