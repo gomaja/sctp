@@ -109,7 +109,11 @@ const (
 	SCTP_ADAPTATION_LAYER
 	SCTP_DISABLE_FRAGMENTS
 	SCTP_PEER_ADDR_PARAMS
-	SCTP_DEFAULT_SENT_PARAM
+	// SCTP_DEFAULT_SEND_PARAM is option 10. Both the kernel's uapi header and
+	// RFC 6458 §8.1.31 spell it SEND; this package shipped it as SENT, so the
+	// name below is the correct one and SCTP_DEFAULT_SENT_PARAM is kept as an
+	// alias rather than renamed out from under callers.
+	SCTP_DEFAULT_SEND_PARAM
 	SCTP_EVENTS
 	SCTP_I_WANT_MAPPED_V4_ADDR
 	SCTP_MAXSEG
@@ -118,6 +122,10 @@ const (
 	SCTP_DELAYED_ACK_TIME
 	SCTP_DELAYED_ACK  = SCTP_DELAYED_ACK_TIME
 	SCTP_DELAYED_SACK = SCTP_DELAYED_ACK_TIME
+
+	// SCTP_DEFAULT_SENT_PARAM is the original misspelling of
+	// SCTP_DEFAULT_SEND_PARAM. Deprecated: use SCTP_DEFAULT_SEND_PARAM.
+	SCTP_DEFAULT_SENT_PARAM = SCTP_DEFAULT_SEND_PARAM
 
 	SCTP_SOCKOPT_BINDX_ADD = 100
 	SCTP_SOCKOPT_BINDX_REM = 101
@@ -422,17 +430,34 @@ func (c *SCTPConn) GetProbeInterval(p *ProbeInterval) error {
 }
 
 // Stream schedulers for SetStreamScheduler, from the kernel's
-// enum sctp_sched_type (RFC 8260 §4 describes the idea; the set Linux
-// implements is smaller than the one the RFC lists).
+// enum sctp_sched_type. RFC 8260 §3 defines six schedulers; Linux implements
+// five of them, all of the ones below.
+//
+// Measured on 6.12: 0 to 4 are accepted and read back unchanged, 5 and above are
+// refused with EINVAL. RFC 8260 §3.3's round-robin-per-packet (SCTP_SS_RR_PKT)
+// is the one with no Linux implementation and so no constant here.
+//
+// SetStreamScheduler does not police the value, so a caller may pass a number
+// the running kernel does not know; it will fail at the setsockopt with EINVAL
+// rather than silently doing something else.
 const (
 	// SCTPSchedFCFS sends messages in the order they were handed over,
-	// regardless of stream. It is the default.
+	// regardless of stream (RFC 8260 §3.1). It is the default.
 	SCTPSchedFCFS = 0
 	// SCTPSchedPrio serves streams by the priority set with
-	// SetStreamSchedulerValue, lowest number first.
+	// SetStreamSchedulerValue, lowest number first (RFC 8260 §3.4).
 	SCTPSchedPrio = 1
-	// SCTPSchedRR serves streams round-robin, one message at a time.
+	// SCTPSchedRR serves streams round-robin, one message at a time
+	// (RFC 8260 §3.2).
 	SCTPSchedRR = 2
+	// SCTPSchedFC distributes capacity fairly between streams, accounting for
+	// message length rather than message count (RFC 8260 §3.5). It takes no
+	// per-stream value.
+	SCTPSchedFC = 3
+	// SCTPSchedWFQ is weighted fair queueing: capacity is shared in proportion
+	// to the per-stream weight set with SetStreamSchedulerValue, so a stream
+	// weighted n times another gets n times the capacity (RFC 8260 §3.6).
+	SCTPSchedWFQ = 4
 )
 
 // PF state exposure levels for SetExposePotentiallyFailed (RFC 7829), from the
@@ -755,10 +780,35 @@ const (
 	// pass it to GetPrStreamStatus or GetPrAssocStatus, not to a send.
 	SCTP_PR_SCTP_ALL = 1 << 7
 
+	// SCTP_NOTIFICATION is the last member of the kernel's enum, and like
+	// SCTP_PR_SCTP_ALL it is not a send flag. It is MSG_NOTIFICATION, and the
+	// enum lists it because the field is wide enough to hold it, not because
+	// anything sets it there.
+	//
+	// Nothing does, on either path. Measured: with sctp_data_io_event on, a
+	// data message arrives carrying an SCTP_SNDRCV cmsg whose sinfo_flags is 0,
+	// and a notification arrives with no SCTP_SNDRCV cmsg at all — only
+	// MSG_NOTIFICATION in the recvmsg flags. So a caller cannot learn from
+	// SndRcvInfo.Flags that a message is a notification; test the flags word
+	// SCTPReadFlags returns instead.
+	SCTP_NOTIFICATION = 0x8000
+
 	// SCTP_EOF starts a graceful shutdown once the message is delivered. It is
 	// MSG_FIN, not a bit of its own.
 	SCTP_EOF = 0x200
 )
+
+// SCTP_EOR is deliberately absent. RFC 6458 erratum 6111 adds it to the
+// sinfo_flags of §5.3.2 and §5.3.4 as the flag that terminates a record built
+// from several sends, and §8.1.26 defines the SCTP_EXPLICIT_EOR option that
+// turns that mode on. Linux implements neither: there is no SCTP_EXPLICIT_EOR
+// socket option in the uapi header, and no SCTP_EOR in enum sctp_sinfo_flags.
+//
+// MSG_MORE is not a substitute, which was measured rather than assumed: a
+// sendmsg with MSG_MORE followed by a plain one produced two records, and the
+// first was delivered with MSG_EOR already set. Every send through this package
+// is therefore a complete record, and MSG_EOR is meaningful on the receive side
+// only — see SCTPReadFlags.
 
 const (
 	SCTP_MAX_STREAM = 0xffff
@@ -771,12 +821,63 @@ type InitMsg struct {
 	MaxInitTimeout uint16
 }
 
-// SackTimer Parameters defined in RFC 6458 8.1.19 - SCTP_DELAYED_SACK Delayed Sack Timer sack_timeout
+// SackTimer mirrors struct sctp_sack_info (RFC 6458 §8.1.19), the delayed
+// acknowledgement timer and the number of packets that force an acknowledgement
+// without waiting for it.
+//
+// A zero field means "leave this one alone", not "set it to zero". RFC 6458
+// §8.1.19 says so and Linux agrees, which makes this struct unlike most of the
+// package: the two fields cannot be set independently to a known state, because
+// there is no way to spell "no delay". Measured on 6.12, from a default of
+// 200/2:
+//
+//	set 137/5 -> 137/5    both taken
+//	set   0/9 -> 137/9    SackDelay ignored, previous value kept
+//	set 211/0 -> 211/9    SackFrequency ignored, previous value kept
+//	set   0/0 -> 211/9    accepted, and a complete no-op
+//
+// SackFrequency == 1 disables the delayed acknowledgement algorithm. That case
+// does not follow the rule above: setting 0/1 leaves SackDelay reading back as
+// 0 rather than unchanged, because disabling the algorithm clears the timer.
+//
+// SackDelay is policed. RFC 9260 §6.2 wants at most 500 ms; the kernel rejects
+// a value it considers out of range with EINVAL — 100000 was refused — so an
+// absurd delay fails at the call rather than being silently clamped.
 type SackTimer struct {
-	AssocID       SCTPAssocID
-	SackDelay     uint32
+	// AssocID is ignored on the one-to-one style sockets this package creates.
+	AssocID SCTPAssocID
+	// SackDelay is the delayed acknowledgement timer in milliseconds. Zero
+	// leaves the current value in place.
+	SackDelay uint32
+	// SackFrequency is the number of packets that must arrive before an
+	// acknowledgement is sent without waiting for SackDelay. Zero leaves the
+	// current value in place; 1 disables delayed acknowledgement entirely.
 	SackFrequency uint32
 }
+
+// Special association identifiers for the AssocID field of the option structs
+// in this package (RFC 6458 §7.2, and §9.5 for the getsockopt restriction).
+//
+// They exist for one-to-many sockets, where one descriptor carries many
+// associations and an option has to say which ones it means. This package
+// creates only one-to-one sockets, where the kernel ignores the field
+// altogether — measured: reading SCTP_MAX_BURST with each of the three returns
+// the same value and no error, so RFC 6458 §9.5's rule that SCTP_CURRENT_ASSOC
+// and SCTP_ALL_ASSOC must fail a getsockopt with EINVAL does not apply here.
+//
+// They are declared because zero is not self-describing. An option struct left
+// zeroed is already asking for SCTP_FUTURE_ASSOC, which RFC 6458 §9.5 erratum
+// 6114 makes the point of writing out, and a reader of this package should not
+// have to know that 0 is a name.
+const (
+	// SCTP_FUTURE_ASSOC affects only associations created after the call.
+	SCTP_FUTURE_ASSOC = 0
+	// SCTP_CURRENT_ASSOC affects only associations that already exist; future
+	// ones keep the previous default.
+	SCTP_CURRENT_ASSOC = 1
+	// SCTP_ALL_ASSOC affects both.
+	SCTP_ALL_ASSOC = 2
+)
 
 // AssocValue mirrors struct sctp_assoc_value, the association-id-and-value
 // pair several socket options take.
@@ -1810,14 +1911,14 @@ func (c *SCTPConn) SubscribedEvents() (int, error) {
 
 func (c *SCTPConn) SetDefaultSentParam(info *SndRcvInfo) error {
 	optlen := unsafe.Sizeof(*info)
-	_, _, err := setsockopt(c.fd(), SCTP_DEFAULT_SENT_PARAM, uintptr(unsafe.Pointer(info)), uintptr(optlen))
+	_, _, err := setsockopt(c.fd(), SCTP_DEFAULT_SEND_PARAM, uintptr(unsafe.Pointer(info)), uintptr(optlen))
 	return err
 }
 
 func (c *SCTPConn) GetDefaultSentParam() (*SndRcvInfo, error) {
 	info := &SndRcvInfo{}
 	optlen := unsafe.Sizeof(*info)
-	_, _, err := getsockopt(c.fd(), SCTP_DEFAULT_SENT_PARAM, uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(&optlen)))
+	_, _, err := getsockopt(c.fd(), SCTP_DEFAULT_SEND_PARAM, uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(&optlen)))
 	return info, err
 }
 
@@ -3093,8 +3194,15 @@ type streamValue struct {
 // SetStreamSchedulerValue sets a per-stream parameter for the scheduler in
 // force (SCTP_STREAM_SCHEDULER_VALUE).
 //
-// Under SCTPSchedPrio the value is the stream's priority, lowest served first.
-// Under the other schedulers it is ignored.
+// Two schedulers use it. Under SCTPSchedPrio it is the stream's priority, lowest
+// served first; under SCTPSchedWFQ it is the stream's weight, and a stream
+// weighted n times another gets n times the capacity.
+//
+// Under SCTPSchedFCFS, SCTPSchedRR and SCTPSchedFC the call still succeeds and
+// the value is discarded — measured: written as 7, it reads back as 0. So a
+// caller who sets a priority without also selecting a scheduler that has one
+// gets no error and no effect, which is why this says which schedulers those
+// are rather than "the others ignore it".
 func (c *SCTPConn) SetStreamSchedulerValue(streamID, value uint16) error {
 	sv := streamValue{StreamID: streamID, StreamValue: value}
 	_, _, err := setsockopt(c.fd(), SCTP_STREAM_SCHEDULER_VALUE,

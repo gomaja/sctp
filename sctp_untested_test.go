@@ -144,6 +144,94 @@ func TestSackTimerLayoutAndRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSackTimerZeroFieldMeansUnchanged pins RFC 6458 §8.1.19's rule that a zero
+// field is "leave this alone" rather than "set this to zero".
+//
+// TestSackTimerLayoutAndRoundTrip sets both fields to non-zero values, so it
+// passes whether or not the rule holds. The rule is the reason the two fields
+// cannot be driven to an arbitrary state, and a caller who reads SetSackTimer as
+// an ordinary setter will conclude they asked for no delay and got it.
+func TestSackTimerZeroFieldMeansUnchanged(t *testing.T) {
+	client, _ := eorPair(t)
+
+	get := func(what string) SackTimer {
+		t.Helper()
+		got, err := client.GetSackTimer()
+		if err != nil {
+			t.Fatalf("GetSackTimer %s: %v", what, err)
+		}
+		return *got
+	}
+	set := func(delay, freq uint32) {
+		t.Helper()
+		if err := client.SetSackTimer(&SackTimer{
+			SackDelay: delay, SackFrequency: freq,
+		}); err != nil {
+			t.Fatalf("SetSackTimer(%d, %d): %v", delay, freq, err)
+		}
+	}
+
+	// A known state neither field's default could be confused with.
+	set(137, 5)
+	if got := get("after the baseline"); got.SackDelay != 137 || got.SackFrequency != 5 {
+		t.Fatalf("baseline read back %+v, want delay=137 freq=5; the rest of "+
+			"this test cannot tell 'unchanged' from 'never took'", got)
+	}
+
+	set(0, 9)
+	got := get("after delay=0")
+	if got.SackDelay != 137 {
+		t.Errorf("SackDelay = %d after setting the field to 0, want the "+
+			"previous 137 left in place — RFC 6458 §8.1.19 makes a zero field "+
+			"mean unchanged, which is why there is no way to ask for no delay",
+			got.SackDelay)
+	}
+	if got.SackFrequency != 9 {
+		t.Errorf("SackFrequency = %d, want 9; the non-zero field of the same "+
+			"call must still be applied", got.SackFrequency)
+	}
+
+	set(211, 0)
+	got = get("after freq=0")
+	if got.SackFrequency != 9 {
+		t.Errorf("SackFrequency = %d after setting the field to 0, want the "+
+			"previous 9 left in place", got.SackFrequency)
+	}
+	if got.SackDelay != 211 {
+		t.Errorf("SackDelay = %d, want 211", got.SackDelay)
+	}
+
+	// Both zero is accepted and changes nothing, so an empty struct is a no-op
+	// rather than a reset to the kernel defaults.
+	set(0, 0)
+	if got = get("after 0/0"); got.SackDelay != 211 || got.SackFrequency != 9 {
+		t.Errorf("a zeroed SackTimer changed the settings to %+v, want "+
+			"delay=211 freq=9 untouched", got)
+	}
+
+	// SackFrequency == 1 disables delayed acknowledgement, and that path does
+	// not follow the rule above: it clears the delay instead of preserving it.
+	// Documented because it is the one case where a zero field is not ignored.
+	set(0, 1)
+	if got = get("after freq=1"); got.SackDelay != 0 {
+		t.Errorf("SackDelay = %d after disabling delayed acks with "+
+			"SackFrequency=1, want 0 — disabling the algorithm clears the "+
+			"timer rather than leaving the previous 211 in place", got.SackDelay)
+	}
+
+	// An out-of-range delay is refused rather than clamped, so a caller cannot
+	// end up with a silently different timer than the one they asked for.
+	err := client.SetSackTimer(&SackTimer{SackDelay: 100000, SackFrequency: 2})
+	if err == nil {
+		back := get("after an out-of-range delay")
+		t.Errorf("SetSackTimer(100000) succeeded and read back %d; RFC 9260 "+
+			"§6.2 caps the delay at 500ms and the kernel is expected to "+
+			"reject the value, not clamp it", back.SackDelay)
+	} else if !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("SetSackTimer(100000) = %v, want EINVAL", err)
+	}
+}
+
 // TestNoDelayRoundTrips covers SCTP_NODELAY, which had no test despite being
 // the option most callers reach for first.
 func TestNoDelayRoundTrips(t *testing.T) {
@@ -339,4 +427,70 @@ func TestGetReadBufferReportsTheBuffer(t *testing.T) {
 		t.Errorf("read buffer %d -> %d after asking for %d; the getter is not "+
 			"reporting the socket's value", before, after, before*2)
 	}
+}
+
+// TestBindxFamilyRulesFollowV6Only pins RFC 6458 erratum 4921, which clarifies
+// §9.1: an IPv6 socket takes IPv6 addresses, and IPv4-mapped IPv6 addresses are
+// how an IPv4 address reaches one.
+//
+// The erratum is held for document update rather than verified, so it describes
+// what implementations do rather than mandating anything new. Measured here
+// instead of assumed: on Linux the deciding factor is IPV6_V6ONLY, and the same
+// IPv4 literal is rejected or accepted depending on it. That is worth pinning
+// because the package sets IPV6_V6ONLY itself, from favoriteAddrFamily, so a
+// change there silently moves which addresses callers may bind.
+func TestBindxFamilyRulesFollowV6Only(t *testing.T) {
+	bindOn := func(t *testing.T, family int, v6only bool, ips ...string) error {
+		t.Helper()
+		fd, err := syscall.Socket(family,
+			syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_SCTP)
+		if err != nil {
+			t.Skipf("cannot create an SCTP socket in family %d: %v", family, err)
+		}
+		defer func() { _ = syscall.Close(fd) }()
+
+		if family == syscall.AF_INET6 {
+			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IPV6,
+				syscall.IPV6_V6ONLY, boolint(v6only)); err != nil {
+				t.Skipf("IPV6_V6ONLY: %v", err)
+			}
+		}
+		addrs := make([]net.IPAddr, 0, len(ips))
+		for _, s := range ips {
+			addrs = append(addrs, net.IPAddr{IP: net.ParseIP(s)})
+		}
+		return SCTPBind(fd, &SCTPAddr{IPAddrs: addrs}, SCTP_BINDX_ADD_ADDR)
+	}
+
+	t.Run("an IPv6 socket takes IPv6 addresses", func(t *testing.T) {
+		if err := bindOn(t, syscall.AF_INET6, true, "::1"); err != nil {
+			t.Errorf("bind ::1 on a v6only socket: %v", err)
+		}
+	})
+
+	t.Run("v6only rejects a bare IPv4 address", func(t *testing.T) {
+		err := bindOn(t, syscall.AF_INET6, true, "127.0.0.1")
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Errorf("bind 127.0.0.1 on a v6only socket gave %v, want EINVAL — "+
+				"this is the rule erratum 4921 spells out", err)
+		}
+	})
+
+	t.Run("without v6only the mapped form is accepted", func(t *testing.T) {
+		// Both spellings, because the caller may write either and the kernel
+		// maps the bare one on the way in.
+		for _, ip := range []string{"127.0.0.1", "::ffff:127.0.0.1"} {
+			if err := bindOn(t, syscall.AF_INET6, false, ip); err != nil {
+				t.Errorf("bind %s on a dual-stack socket: %v; the IPv4-mapped "+
+					"path erratum 4921 describes is not working", ip, err)
+			}
+		}
+	})
+
+	t.Run("an IPv4 socket rejects an IPv6 address", func(t *testing.T) {
+		err := bindOn(t, syscall.AF_INET, false, "::1")
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Errorf("bind ::1 on an AF_INET socket gave %v, want EINVAL", err)
+		}
+	})
 }

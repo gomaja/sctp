@@ -564,3 +564,157 @@ func TestReconfigurationEventsDecodeFromKernelBytes(t *testing.T) {
 		}
 	})
 }
+
+// TestStreamChangeReportsAddedStreamsNotTheNewWidth pins what the counts in an
+// SCTP_STREAM_CHANGE_EVENT mean.
+//
+// RFC 6525 §6.1.3 defines strchange_outstrms as "the number of streams that the
+// endpoint is allowed to use outbound" — the width after the change. Linux
+// reports the number the request added instead. The divergence is pinned from
+// both directions: against SCTP_STATUS, and against a send on a stream the
+// event's count says should not exist.
+//
+// This package documented the RFC's reading, so a caller following it would have
+// refused to use streams it had. It gets its own association because the counts
+// are per request: sharing a connection with another AddStreams leaves a second
+// event queued, and the assertions then read whichever arrives first.
+func TestStreamChangeReportsAddedStreamsNotTheNewWidth(t *testing.T) {
+	client, server := reconfPair(t)
+
+	const addOut = 3
+	for _, c := range []*SCTPConn{client, server} {
+		if err := c.SubscribeEvent(SCTP_STREAM_CHANGE_EVENT, true); err != nil {
+			t.Fatalf("SubscribeEvent: %v", err)
+		}
+		if err := c.SetEnableStreamReset(SCTPEnableResetStreamReq |
+			SCTPEnableResetAssocReq | SCTPEnableChangeAssocReq); err != nil {
+			t.Fatalf("SetEnableStreamReset: %v", err)
+		}
+	}
+
+	before, err := client.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	// Outbound only. Asking for inbound streams as well produces a second
+	// request, and so a second event, which is what makes the counts ambiguous.
+	if err := client.AddStreams(0, addOut); err != nil {
+		t.Skipf("AddStreams: %v", err)
+	}
+	note := awaitNotification(t, client, SCTP_STREAM_CHANGE_EVENT, 5*time.Second)
+	if note == nil {
+		t.Fatal("no SCTP_STREAM_CHANGE_EVENT arrived")
+	}
+	sc, ok := note.(*StreamChange)
+	if !ok {
+		t.Fatalf("got %T, want *StreamChange", note)
+	}
+	if sc.Flags()&(SCTP_STREAM_CHANGE_DENIED|SCTP_STREAM_CHANGE_FAILED) != 0 {
+		t.Fatalf("peer refused the request (flags %#x); both sides permit "+
+			"SCTPEnableChangeAssocReq, so this should have been granted",
+			sc.Flags())
+	}
+
+	after, err := client.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus after AddStreams: %v", err)
+	}
+	if after.Ostreams != before.Ostreams+addOut {
+		t.Fatalf("association went from %d to %d outbound streams, want %d; "+
+			"without the widening there is nothing to compare the event against",
+			before.Ostreams, after.Ostreams, before.Ostreams+addOut)
+	}
+	if sc.OutboundStreams != addOut {
+		t.Errorf("StreamChange.OutboundStreams = %d, want %d — the event "+
+			"carries the streams the request added", sc.OutboundStreams, addOut)
+	}
+	if sc.OutboundStreams == after.Ostreams {
+		t.Errorf("StreamChange.OutboundStreams and GetStatus both report %d: "+
+			"they agree, so the kernel has started reporting the width RFC "+
+			"6525 §6.1.3 asks for and the documentation on StreamChange is "+
+			"now wrong in the other direction", after.Ostreams)
+	}
+
+	// The assertion the old documentation could not survive: a stream at or
+	// above OutboundStreams is usable, because the field is not a bound.
+	sid := before.Ostreams + 1
+	if sid < sc.OutboundStreams {
+		t.Fatalf("stream %d is below the reported count %d, so this assertion "+
+			"proves nothing", sid, sc.OutboundStreams)
+	}
+	if _, err := client.SCTPWrite([]byte("past the reported count"),
+		&SndRcvInfo{Stream: sid}); err != nil {
+		t.Errorf("write to stream %d failed (%v) while the association has %d "+
+			"outbound streams; StreamChange.OutboundStreams was %d, which is "+
+			"not the limit", sid, err, after.Ostreams, sc.OutboundStreams)
+	}
+}
+
+// TestStreamChangeReportsDeniedWhenThePeerRefuses drives the SCTP_STREAM_CHANGE
+// flags from the kernel rather than from a hand-built buffer.
+//
+// Every other test of these flags builds the event in the test, which proves the
+// decoder agrees with the test's idea of the layout. This one makes a real peer
+// refuse: AddStreams reports success either way, because it returns as soon as
+// the request is away, so the flag is the only thing that distinguishes streams
+// granted from streams refused.
+//
+// The refusal is arranged by leaving SCTPEnableChangeAssocReq out of the
+// *peer's* mask. That direction was measured; the requesting side's mask governs
+// what it may ask for, not what it may be told.
+func TestStreamChangeReportsDeniedWhenThePeerRefuses(t *testing.T) {
+	client, server := reconfPair(t)
+
+	if err := client.SubscribeEvent(SCTP_STREAM_CHANGE_EVENT, true); err != nil {
+		t.Fatalf("SubscribeEvent: %v", err)
+	}
+	if err := client.SetEnableStreamReset(SCTPEnableResetStreamReq |
+		SCTPEnableResetAssocReq | SCTPEnableChangeAssocReq); err != nil {
+		t.Fatalf("SetEnableStreamReset on the client: %v", err)
+	}
+	// Everything except SCTPEnableChangeAssocReq, so the refusal is specific to
+	// adding streams and not a peer that refuses reconfiguration wholesale.
+	if err := server.SetEnableStreamReset(SCTPEnableResetStreamReq |
+		SCTPEnableResetAssocReq); err != nil {
+		t.Fatalf("SetEnableStreamReset on the server: %v", err)
+	}
+
+	before, err := client.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus: %v", err)
+	}
+	if err := client.AddStreams(0, 3); err != nil {
+		t.Skipf("AddStreams: %v", err)
+	}
+
+	note := awaitNotification(t, client, SCTP_STREAM_CHANGE_EVENT, 5*time.Second)
+	if note == nil {
+		t.Fatal("no SCTP_STREAM_CHANGE_EVENT arrived; the refusal is only " +
+			"observable through the event")
+	}
+	sc, ok := note.(*StreamChange)
+	if !ok {
+		t.Fatalf("got %T, want *StreamChange", note)
+	}
+	if sc.Flags()&SCTP_STREAM_CHANGE_DENIED == 0 {
+		t.Errorf("flags = %#x, want SCTP_STREAM_CHANGE_DENIED (%#x) set; a "+
+			"peer without SCTPEnableChangeAssocReq is expected to deny",
+			sc.Flags(), SCTP_STREAM_CHANGE_DENIED)
+	}
+	if sc.Flags()&SCTP_STREAM_CHANGE_FAILED != 0 {
+		t.Errorf("flags = %#x has FAILED set as well as DENIED; RFC 6525 "+
+			"§6.1.3 makes them mutually exclusive", sc.Flags())
+	}
+
+	// The counts are reported whether or not the request was granted, so a
+	// caller that reads them without checking the flags concludes it received
+	// streams the peer refused.
+	after, err := client.GetStatus()
+	if err != nil {
+		t.Fatalf("GetStatus after the denial: %v", err)
+	}
+	if after.Ostreams != before.Ostreams {
+		t.Errorf("outbound streams went from %d to %d despite the denial",
+			before.Ostreams, after.Ostreams)
+	}
+}

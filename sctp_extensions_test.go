@@ -453,6 +453,45 @@ func TestOptionNumbersMatchHeader(t *testing.T) {
 		{"SCTP_SOCKOPT_CONNECTX3", SCTP_SOCKOPT_CONNECTX3, 111},
 		{"SCTP_SOCKOPT_BINDX_ADD", SCTP_SOCKOPT_BINDX_ADD, 100},
 		{"SCTP_SOCKOPT_BINDX_REM", SCTP_SOCKOPT_BINDX_REM, 101},
+
+		// Options 0 to 16 come from a single iota run, and none of them were
+		// pinned. That is the one block where the numbers are computed rather
+		// than written down, so inserting or removing a member silently
+		// renumbers every option below it — the failure the comment above
+		// describes, with no edit to the constant that breaks.
+		{"SCTP_RTOINFO", SCTP_RTOINFO, 0},
+		{"SCTP_ASSOCINFO", SCTP_ASSOCINFO, 1},
+		{"SCTP_INITMSG", SCTP_INITMSG, 2},
+		{"SCTP_NODELAY", SCTP_NODELAY, 3},
+		{"SCTP_AUTOCLOSE", SCTP_AUTOCLOSE, 4},
+		{"SCTP_SET_PEER_PRIMARY_ADDR", SCTP_SET_PEER_PRIMARY_ADDR, 5},
+		{"SCTP_PRIMARY_ADDR", SCTP_PRIMARY_ADDR, 6},
+		{"SCTP_ADAPTATION_LAYER", SCTP_ADAPTATION_LAYER, 7},
+		{"SCTP_DISABLE_FRAGMENTS", SCTP_DISABLE_FRAGMENTS, 8},
+		{"SCTP_PEER_ADDR_PARAMS", SCTP_PEER_ADDR_PARAMS, 9},
+		{"SCTP_DEFAULT_SEND_PARAM", SCTP_DEFAULT_SEND_PARAM, 10},
+		// The name this package shipped for option 10 before it was corrected.
+		// Pinned so the alias cannot drift away from what it aliases.
+		{"SCTP_DEFAULT_SENT_PARAM", SCTP_DEFAULT_SENT_PARAM, 10},
+		{"SCTP_EVENTS", SCTP_EVENTS, 11},
+		{"SCTP_I_WANT_MAPPED_V4_ADDR", SCTP_I_WANT_MAPPED_V4_ADDR, 12},
+		{"SCTP_MAXSEG", SCTP_MAXSEG, 13},
+		{"SCTP_STATUS", SCTP_STATUS, 14},
+		{"SCTP_GET_PEER_ADDR_INFO", SCTP_GET_PEER_ADDR_INFO, 15},
+		{"SCTP_DELAYED_ACK_TIME", SCTP_DELAYED_ACK_TIME, 16},
+		{"SCTP_DELAYED_ACK", SCTP_DELAYED_ACK, 16},
+		{"SCTP_DELAYED_SACK", SCTP_DELAYED_SACK, 16},
+
+		// Not socket options: these are the flag argument to SCTPBind, which
+		// uses them only to choose between SCTP_SOCKOPT_BINDX_ADD and
+		// SCTP_SOCKOPT_BINDX_REM. Their values never reach the kernel, so a
+		// caller passing the named constants cannot tell what they are —
+		// mutation confirmed that changing SCTP_BINDX_ADD_ADDR to 0x04 leaves
+		// the suite green. They are pinned for the caller who passes a literal
+		// 1 or 2 because that is what linux/sctp.h says, which is the only way
+		// the numbers are load-bearing.
+		{"SCTP_BINDX_ADD_ADDR", SCTP_BINDX_ADD_ADDR, 0x01},
+		{"SCTP_BINDX_REM_ADDR", SCTP_BINDX_REM_ADDR, 0x02},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d per linux/sctp.h",
@@ -503,6 +542,26 @@ func TestOptionNumbersMatchHeader(t *testing.T) {
 		{"SCTP_EXPOSE_POTENTIALLY_FAILED_STATE", SCTP_EXPOSE_POTENTIALLY_FAILED_STATE},
 		{"SCTP_REMOTE_UDP_ENCAPS_PORT", SCTP_REMOTE_UDP_ENCAPS_PORT},
 		{"SCTP_PLPMTUD_PROBE_INTERVAL", SCTP_PLPMTUD_PROBE_INTERVAL},
+		// The iota block, for the same reason it was added above: a duplicate
+		// here would be produced by an edit to the run rather than by a
+		// copy-paste, and shows up as two names for one number.
+		{"SCTP_RTOINFO", SCTP_RTOINFO},
+		{"SCTP_ASSOCINFO", SCTP_ASSOCINFO},
+		{"SCTP_INITMSG", SCTP_INITMSG},
+		{"SCTP_NODELAY", SCTP_NODELAY},
+		{"SCTP_AUTOCLOSE", SCTP_AUTOCLOSE},
+		{"SCTP_SET_PEER_PRIMARY_ADDR", SCTP_SET_PEER_PRIMARY_ADDR},
+		{"SCTP_PRIMARY_ADDR", SCTP_PRIMARY_ADDR},
+		{"SCTP_ADAPTATION_LAYER", SCTP_ADAPTATION_LAYER},
+		{"SCTP_DISABLE_FRAGMENTS", SCTP_DISABLE_FRAGMENTS},
+		{"SCTP_PEER_ADDR_PARAMS", SCTP_PEER_ADDR_PARAMS},
+		{"SCTP_DEFAULT_SEND_PARAM", SCTP_DEFAULT_SEND_PARAM},
+		{"SCTP_EVENTS", SCTP_EVENTS},
+		{"SCTP_I_WANT_MAPPED_V4_ADDR", SCTP_I_WANT_MAPPED_V4_ADDR},
+		{"SCTP_MAXSEG", SCTP_MAXSEG},
+		{"SCTP_STATUS", SCTP_STATUS},
+		{"SCTP_GET_PEER_ADDR_INFO", SCTP_GET_PEER_ADDR_INFO},
+		{"SCTP_DELAYED_ACK_TIME", SCTP_DELAYED_ACK_TIME},
 	} {
 		if prev, dup := seen[tc.got]; dup {
 			t.Errorf("%s and %s are both %d", tc.name, prev, tc.got)
@@ -532,6 +591,58 @@ func TestOptionNumbersMatchHeader(t *testing.T) {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d per enum sctp_cmsg_type",
 				tc.name, tc.got, tc.want)
+		}
+	}
+}
+
+// TestAssocIDAndSinfoConstantsMatchHeader pins the two groups of constants that
+// are not socket options and so were outside TestOptionNumbersMatchHeader.
+//
+// Neither is reachable through a round trip: the special association
+// identifiers are ignored on the one-to-one sockets this package creates, and
+// SCTP_NOTIFICATION is never set by the kernel in a sinfo_flags field. A wrong
+// value in either would therefore never surface at run time — which is the only
+// reason to assert them at all.
+func TestAssocIDAndSinfoConstantsMatchHeader(t *testing.T) {
+	// RFC 6458 §7.2. Linux spells these in the same header as the options.
+	for _, tc := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"SCTP_FUTURE_ASSOC", SCTP_FUTURE_ASSOC, 0},
+		{"SCTP_CURRENT_ASSOC", SCTP_CURRENT_ASSOC, 1},
+		{"SCTP_ALL_ASSOC", SCTP_ALL_ASSOC, 2},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %d, want %d per linux/sctp.h",
+				tc.name, tc.got, tc.want)
+		}
+	}
+
+	// enum sctp_sinfo_flags defines SCTP_NOTIFICATION as MSG_NOTIFICATION, so
+	// the two cannot drift apart without one of them being wrong.
+	if SCTP_NOTIFICATION != MSG_NOTIFICATION {
+		t.Errorf("SCTP_NOTIFICATION = %#x but MSG_NOTIFICATION = %#x; the "+
+			"kernel defines the first as the second",
+			SCTP_NOTIFICATION, MSG_NOTIFICATION)
+	}
+	// It shares the field with the send flags, so it must not collide with one.
+	for _, tc := range []struct {
+		name string
+		got  int
+	}{
+		{"SCTP_UNORDERED", SCTP_UNORDERED},
+		{"SCTP_ADDR_OVER", SCTP_ADDR_OVER},
+		{"SCTP_ABORT", SCTP_ABORT},
+		{"SCTP_SACK_IMMEDIATELY", SCTP_SACK_IMMEDIATELY},
+		{"SCTP_SENDALL", SCTP_SENDALL},
+		{"SCTP_PR_SCTP_ALL", SCTP_PR_SCTP_ALL},
+		{"SCTP_EOF", SCTP_EOF},
+	} {
+		if tc.got&SCTP_NOTIFICATION != 0 {
+			t.Errorf("%s (%#x) overlaps SCTP_NOTIFICATION (%#x) in the same "+
+				"flags word", tc.name, tc.got, SCTP_NOTIFICATION)
 		}
 	}
 }
@@ -774,7 +885,7 @@ func TestEnableStreamResetRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAddStreams covers RFC 6525 §6.5, and exists because the first probe of
+// TestAddStreams covers RFC 6525 §6.3.4, and exists because the first probe of
 // this option concluded it was unusable.
 //
 // That conclusion was wrong: the probe had set SCTP_RECONFIG_SUPPORTED after
@@ -992,7 +1103,7 @@ func TestAuthEnabledRoundTrip(t *testing.T) {
 		t.Fatalf("HmacIdent: %v", err)
 	}
 	if len(idents) == 0 {
-		t.Fatal("HmacIdent returned no algorithms; RFC 4895 §3.1.1 makes " +
+		t.Fatal("HmacIdent returned no algorithms; RFC 4895 §3.3 makes " +
 			"SHA-1 mandatory to implement")
 	}
 	// SHA-1 is mandatory, so it must appear. This also catches a decoder that

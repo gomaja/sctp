@@ -224,7 +224,7 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 
 	t.Run("AddStreamsReq", func(t *testing.T) {
 		var as AddStreamsReq
-		// struct sctp_add_streams, RFC 6525 §6.5.
+		// struct sctp_add_streams, RFC 6525 §6.3.4.
 		assertSize(t, "AddStreamsReq", unsafe.Sizeof(as), 8)
 		assertOffset(t, "AssocID", unsafe.Offsetof(as.AssocID), 0)
 		assertOffset(t, "InStreams", unsafe.Offsetof(as.InStreams), 4)
@@ -252,7 +252,9 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 
 	t.Run("AuthKeyID", func(t *testing.T) {
 		var id AuthKeyID
-		// struct sctp_authkeyid, RFC 4895 §6.5. The C declaration is a
+		// struct sctp_authkeyid, RFC 6458 §8.1.18 — a sockets API struct, so it
+		// is defined by RFC 6458 and not by RFC 4895, which the AUTH options
+		// otherwise implement. §8.3.4 and §8.3.5 reuse it. The C declaration is a
 		// sctp_assoc_t plus a __u16, which is 6 bytes, but the kernel returns
 		// and expects 8 — measured with testdata/optprobe. Go's alignment gives
 		// 8 with or without the struct's explicit pad, so this pins the size

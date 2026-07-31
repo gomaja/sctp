@@ -22,6 +22,7 @@ import (
 	"errors"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -288,6 +289,107 @@ func TestStreamSchedulerRoundTrips(t *testing.T) {
 	}
 	if v != priority {
 		t.Errorf("stream %d priority = %d, want %d", stream, v, priority)
+	}
+}
+
+// TestEveryStreamSchedulerIsSelectable checks each constant against the running
+// kernel, and checks that the set stops where the constants stop.
+//
+// TestStreamSchedulerRoundTrips exercises two of the five. The other three were
+// declared from the header, and a constant naming a scheduler the kernel does
+// not have is worse than no constant: SetStreamScheduler does not validate, so
+// the mistake surfaces as an EINVAL from a setsockopt the caller did not write.
+//
+// The upper bound is the half that ages. SCTPSchedFC and SCTPSchedWFQ postdate
+// the header this package was originally written against, and the way to notice
+// the kernel growing a sixth is for this to start passing where it should fail.
+func TestEveryStreamSchedulerIsSelectable(t *testing.T) {
+	client, _ := eorPair(t)
+
+	for _, tc := range []struct {
+		name  string
+		sched uint32
+	}{
+		{"SCTPSchedFCFS", SCTPSchedFCFS},
+		{"SCTPSchedPrio", SCTPSchedPrio},
+		{"SCTPSchedRR", SCTPSchedRR},
+		{"SCTPSchedFC", SCTPSchedFC},
+		{"SCTPSchedWFQ", SCTPSchedWFQ},
+	} {
+		if err := client.SetStreamScheduler(tc.sched); err != nil {
+			t.Errorf("SetStreamScheduler(%s = %d): %v; the constant names a "+
+				"scheduler this kernel does not implement",
+				tc.name, tc.sched, err)
+			continue
+		}
+		got, err := client.StreamScheduler()
+		if err != nil {
+			t.Fatalf("StreamScheduler after %s: %v", tc.name, err)
+		}
+		if got != tc.sched {
+			t.Errorf("selected %s (%d), reads back %d", tc.name, tc.sched, got)
+		}
+	}
+
+	// One past the end. If this starts being accepted the kernel has added a
+	// scheduler and the constants above are no longer the whole set.
+	if err := client.SetStreamScheduler(SCTPSchedWFQ + 1); err == nil {
+		t.Errorf("SetStreamScheduler(%d) succeeded; the kernel has grown a "+
+			"scheduler past SCTPSchedWFQ and this package does not name it",
+			SCTPSchedWFQ+1)
+	} else if !errors.Is(err, syscall.EINVAL) {
+		t.Errorf("SetStreamScheduler(%d) = %v, want EINVAL", SCTPSchedWFQ+1, err)
+	}
+}
+
+// TestOnlyPrioAndWFQKeepAStreamValue pins which schedulers actually store the
+// per-stream value, because the ones that do not accept the call anyway.
+//
+// SetStreamSchedulerValue returns nil under all five, so nothing tells a caller
+// who sets a priority while the default scheduler is in force that the value was
+// thrown away. Its documentation used to say the value was ignored by everything
+// except SCTPSchedPrio, which stopped being true when the kernel gained
+// weighted fair queueing.
+func TestOnlyPrioAndWFQKeepAStreamValue(t *testing.T) {
+	const stream, value = 1, 7
+
+	for _, tc := range []struct {
+		name  string
+		sched uint32
+		keeps bool
+	}{
+		{"SCTPSchedFCFS", SCTPSchedFCFS, false},
+		{"SCTPSchedPrio", SCTPSchedPrio, true},
+		{"SCTPSchedRR", SCTPSchedRR, false},
+		{"SCTPSchedFC", SCTPSchedFC, false},
+		{"SCTPSchedWFQ", SCTPSchedWFQ, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A fresh association each time: the value set under a previous
+			// scheduler would otherwise still be there to read back.
+			client, _ := eorPair(t)
+
+			if err := client.SetStreamScheduler(tc.sched); err != nil {
+				t.Fatalf("SetStreamScheduler: %v", err)
+			}
+			if err := client.SetStreamSchedulerValue(stream, value); err != nil {
+				t.Fatalf("SetStreamSchedulerValue: %v; every scheduler accepts "+
+					"the call, so an error here is the news", err)
+			}
+			got, err := client.GetStreamSchedulerValue(stream)
+			if err != nil {
+				t.Fatalf("GetStreamSchedulerValue: %v", err)
+			}
+			switch {
+			case tc.keeps && got != value:
+				t.Errorf("value reads back %d, want %d; this scheduler is "+
+					"documented as using the per-stream value", got, value)
+			case !tc.keeps && got != 0:
+				t.Errorf("value reads back %d, want 0; this scheduler is "+
+					"documented as discarding it, so the documentation on "+
+					"SetStreamSchedulerValue needs revisiting", got)
+			}
+		})
 	}
 }
 
@@ -789,5 +891,158 @@ func TestExposePotentiallyFailedHasNoLockedState(t *testing.T) {
 	}
 	if !errors.Is(err, syscall.EINVAL) {
 		t.Errorf("out-of-range level = %v, want EINVAL", err)
+	}
+}
+
+// schedulerOrder runs a fixed burst on two streams under one scheduler and
+// returns the order the receiver saw them in.
+//
+// The receiver deliberately does not read during the burst, so the send queue
+// backs up and the scheduler has a choice to make. Without that every scheduler
+// transmits in submission order and the comparison below proves nothing.
+func schedulerOrder(t *testing.T, sched uint32, weights map[uint16]uint16) []uint16 {
+	t.Helper()
+	client, server := eorPair(t)
+
+	if err := client.SetStreamScheduler(sched); err != nil {
+		t.Fatalf("SetStreamScheduler(%d): %v", sched, err)
+	}
+	for sid, w := range weights {
+		if err := client.SetStreamSchedulerValue(sid, w); err != nil {
+			t.Fatalf("SetStreamSchedulerValue(%d, %d): %v", sid, w, err)
+		}
+	}
+	if err := server.SubscribeEvents(SCTP_EVENT_DATA_IO); err != nil {
+		t.Fatalf("SubscribeEvents: %v", err)
+	}
+
+	// A small send buffer so the queue forms in kilobytes rather than
+	// megabytes, and a deadline so a full buffer ends the burst.
+	rc, err := client.SyscallConn()
+	if err != nil {
+		t.Fatalf("SyscallConn: %v", err)
+	}
+	if err := rc.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET,
+			syscall.SO_SNDBUF, 65536)
+	}); err != nil {
+		t.Fatalf("SO_SNDBUF: %v", err)
+	}
+	if err := client.SetWriteDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+
+	payload := make([]byte, 1200)
+	sent := 0
+	for i := 0; i < 400; i++ {
+		if _, err := client.SCTPWrite(payload, &SndRcvInfo{Stream: uint16(i % 2)}); err != nil {
+			break
+		}
+		sent++
+	}
+	if sent < 40 {
+		t.Skipf("only %d messages were queued; the send buffer never backed "+
+			"up, so the scheduler had nothing to choose between", sent)
+	}
+
+	order := make([]uint16, 0, sent)
+	buf := make([]byte, 8192)
+	for len(order) < sent {
+		if err := server.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		_, info, err := server.SCTPRead(buf)
+		if err != nil {
+			break
+		}
+		if info == nil {
+			t.Fatal("no SndRcvInfo on a read; the stream id is what this test " +
+				"is built on")
+		}
+		order = append(order, info.Stream)
+	}
+	return order
+}
+
+// longestRun is the longest stretch of one stream id in a delivery order.
+//
+// Only the head of the order is meaningful. Once the burst stops the queue
+// drains and whatever is left of one stream goes out together, so every
+// scheduler ends in a long run: measured over the whole sequence FCFS reaches 27
+// and looks weighted. Over the head, where the queue is still deep enough for
+// the scheduler to be choosing, FCFS is 1.
+func longestRun(order []uint16) int {
+	best, run := 0, 0
+	for i, sid := range order {
+		if i > 0 && sid == order[i-1] {
+			run++
+		} else {
+			run = 1
+		}
+		if run > best {
+			best = run
+		}
+	}
+	return best
+}
+
+// beforeDrain is the part of a delivery order taken while the send queue is
+// still deep, which is the only part where the scheduler is choosing.
+func beforeDrain(order []uint16) []uint16 {
+	if len(order) > 60 {
+		return order[:60]
+	}
+	return order
+}
+
+// TestWFQReordersRelativeToFCFS is the one assertion in the suite that would
+// notice SCTPSchedWFQ becoming a no-op.
+//
+// Every other scheduler test sets the option and reads it back, which passes
+// whether or not the kernel consults the value — a scheduler stored and never
+// used is indistinguishable from inside the process. This sends the same burst
+// twice and compares the order it comes out in.
+//
+// The assertion is relative rather than absolute on purpose. How many messages
+// queue before the send buffer fills depends on the host, so "WFQ produces runs
+// of at least N" would be a threshold tuned to one machine. "WFQ groups a
+// stream more than FCFS does" holds wherever the scheduler is consulted at all.
+//
+// Confirmed on the wire as well: under FCFS the DATA chunks leave strictly
+// alternating, and under WFQ weighted 10:1 they leave in runs. See the round
+// seven notes in testdata/README.md.
+//
+// No Go-side mutation isolates this test — breaking the constant or dropping
+// the weight fails the two round-trip tests first. That is the honest position
+// rather than a gap: what it guards against is the kernel accepting the option
+// and not consulting it, which no edit to this package can simulate.
+func TestWFQReordersRelativeToFCFS(t *testing.T) {
+	fcfs := schedulerOrder(t, SCTPSchedFCFS, nil)
+	wfq := schedulerOrder(t, SCTPSchedWFQ, map[uint16]uint16{0: 10, 1: 1})
+
+	if len(fcfs) < 40 || len(wfq) < 40 {
+		t.Skipf("too few messages delivered to compare orders (%d and %d)",
+			len(fcfs), len(wfq))
+	}
+
+	fcfsRun, wfqRun := longestRun(beforeDrain(fcfs)), longestRun(beforeDrain(wfq))
+	t.Logf("longest same-stream run over the head: FCFS %d of %d messages, "+
+		"WFQ %d of %d", fcfsRun, len(fcfs), wfqRun, len(wfq))
+
+	if wfqRun <= fcfsRun {
+		t.Errorf("WFQ weighted 10:1 grouped a stream into runs of at most %d, "+
+			"FCFS reached %d; the weights are not reaching the scheduler, so "+
+			"SCTPSchedWFQ is being stored and never consulted",
+			wfqRun, fcfsRun)
+	}
+
+	// FCFS alternates strictly while the queue is deep, so anything above 1 in
+	// the head means the burst was not backing the send buffer up and the
+	// comparison above is measuring drain order rather than scheduling.
+	if fcfsRun > 2 {
+		t.Errorf("FCFS produced runs of %d in the first %d messages; it "+
+			"transmits in the order messages were handed over, so the send "+
+			"queue cannot have been deep and this is no longer comparing "+
+			"schedulers", fcfsRun, len(beforeDrain(fcfs)))
 	}
 }

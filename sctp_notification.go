@@ -448,15 +448,33 @@ func (n *AssocReset) Length() uint32             { return n.length }
 const assocResetSize = 20
 
 // StreamChange is SCTP_STREAM_CHANGE_EVENT (RFC 6525 §6.1.3), reporting the
-// stream counts in force after an AddStreams request.
+// outcome of an AddStreams request.
+//
+// The counts are the streams the request added, not the totals the association
+// ended up with. RFC 6525 §6.1.3 says the opposite — strchange_outstrms is "the
+// number of streams that the endpoint is allowed to use outbound" — but Linux
+// passes the request's own stream count into the event and never the new width.
+// Measured on 6.12: from an association with 5 outbound streams, AddStreams(0,
+// 3) produced OutboundStreams == 3, while SCTP_STATUS reported 8 and a send on
+// stream 7 was accepted.
+//
+// So this event answers "did it work", and GetStatus answers "how wide is the
+// association now". Check Flags before believing either: on a denied request —
+// forced by clearing SCTPEnableChangeAssocReq on the peer — the counts are
+// reported unchanged, with only SCTP_STREAM_CHANGE_DENIED to say the streams
+// were never granted.
 type StreamChange struct {
-	typ            uint16
-	flags          uint16
-	length         uint32
-	AssocID        SCTPAssocID
+	typ     uint16
+	flags   uint16
+	length  uint32
+	AssocID SCTPAssocID
+	// InboundStreams is the number of inbound streams the request added. It is
+	// 0 on the requesting side, since granting inbound streams is the peer's
+	// half of the exchange.
 	InboundStreams uint16
-	// OutboundStreams is the count that matters to a sender: writing to a
-	// stream at or above it fails, whatever AddStreams reported.
+	// OutboundStreams is the number of outbound streams the request added, and
+	// zero if none were. It is not the width of the association: use GetStatus
+	// for that.
 	OutboundStreams uint16
 }
 

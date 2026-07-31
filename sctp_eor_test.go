@@ -293,3 +293,49 @@ func TestWrappedConnZeroesInfoWhenAbsent(t *testing.T) {
 		}
 	}
 }
+
+// TestEverySendIsACompleteRecord pins the claim that this package cannot send a
+// partial record, which is what makes MSG_EOR a receive-side signal only.
+//
+// RFC 6458 §8.1.26 defines SCTP_EXPLICIT_EOR, and erratum 6111 adds the SCTP_EOR
+// flag that terminates a record built from several sends. Linux implements
+// neither — there is no such socket option and no such sinfo flag — so MSG_MORE
+// is the only remaining candidate, and it does not coalesce: the first send is
+// delivered as a whole record with MSG_EOR already set.
+//
+// Without this, the documentation on SCTP_EOR is a claim no test can falsify. If
+// Linux ever honours MSG_MORE here, the first read below returns 8 bytes and
+// this fails, which is the point.
+func TestEverySendIsACompleteRecord(t *testing.T) {
+	client, server := eorPair(t)
+
+	// syscall.Sendmsg rather than SCTPWrite: the package deliberately offers no
+	// way to pass MSG_MORE, so the flag has to be applied under it.
+	if err := syscall.Sendmsg(client.fd(), []byte("AAAA"), nil, nil,
+		syscall.MSG_MORE); err != nil {
+		t.Skipf("sendmsg with MSG_MORE: %v", err)
+	}
+	if _, err := client.Write([]byte("BBBB")); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+
+	if err := server.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 64)
+	n, _, flags, err := server.SCTPReadFlags(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if n != 4 || string(buf[:n]) != "AAAA" {
+		t.Errorf("first read returned %d bytes %q, want 4 bytes \"AAAA\"; "+
+			"MSG_MORE has started coalescing sends into one record, so this "+
+			"package can build a partial record after all and the note on "+
+			"SCTP_EOR is out of date", n, buf[:n])
+	}
+	if flags&MSG_EOR == 0 {
+		t.Errorf("first read came back without MSG_EOR (flags %#x); the send "+
+			"was held open, which is the explicit-EOR behaviour Linux is not "+
+			"supposed to have", flags)
+	}
+}

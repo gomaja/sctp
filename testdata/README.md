@@ -2404,3 +2404,400 @@ which carries neither `ip` nor `iptables`; only the `sctp-test` image built from
 `testdata/Dockerfile` does. The tell was a failure with no `--- FAIL` line
 anywhere in the log — the same signature as a suite killed by contention, and
 worth recognising, because both look like "the tests failed" and neither is.
+
+## Round seven: the current RFC corpus, and its errata
+
+The package cites ten RFCs. This round checked each one's *current* status —
+what obsoletes it, what updates it, and what errata have been filed against it —
+rather than assuming the citations written months ago still point at live text.
+
+The corpus was downloaded and grepped rather than recalled, and the errata came
+from `errata.rfc-editor.org`, which is where `www.rfc-editor.org/errata/rfcNNNN`
+redirects.
+
+### The base specification is already current
+
+RFC 9260 (June 2022) obsoletes RFC 4960, and also RFC 4460, RFC 6096, RFC 7053
+and RFC 8540. The package already cites 9260 throughout; the only two mentions
+of 4960 left are the two that say "which obsoleted RFC 4960", which is the
+correct way to mention it. Nothing to do.
+
+RFC 6458 is Informational, not Standards Track, and nothing obsoletes or updates
+it. It is still the sockets API specification.
+
+### RFC 6458 errata, and what each one meant here
+
+Six verified, four held for document update, four rejected. Taken one at a time
+against the code:
+
+| Erratum | Status | Subject | Disposition |
+| --- | --- | --- | --- |
+| 6111 | verified | `SCTP_EOR` missing from the sndinfo flags | not implementable on Linux — documented |
+| 6115 | verified | `SCTP_BOUND` is not an association state | already correct, and then some |
+| 6112 | verified | `SCTP_CANT_START_ASSOC` → `SCTP_CANT_STR_ASSOC` | already correct |
+| 6980 | verified | `SCTP_MAX_SEG` → `SCTP_MAXSEG` | already correct |
+| 7547, 7548 | verified | `info_type` → `infotype` | `sctp_recvv`/`sctp_sendv` are not bound |
+| 4921 | held | IPv6 sockets need IPv6 addresses | behaviour confirmed, now pinned |
+| 6116 | held | `SCTP_ADDR_CONFIRMED` missing from §6.1.2 | already declared, at 5 |
+| 6113 | held | `sac_error` is also set on `SCTP_CANT_STR_ASSOC` | already documented that way |
+| 6114 | held | write `SCTP_FUTURE_ASSOC`, not `0` | **acted on**, see below |
+
+Erratum 6115 is worth a note. It removes `SCTP_BOUND` from the association
+states of §8.2.1. Linux goes further than the correction: `enum
+sctp_sstat_state` has no `SCTP_BOUND` *or* `SCTP_LISTEN`, and it starts at
+`SCTP_EMPTY = 0`, so `SCTP_ESTABLISHED` is 4 and not the 5 the corrected RFC
+list implies. The package already had the kernel's numbering and a comment
+explaining it. An implementation that applied the erratum faithfully to the
+RFC's list would still be wrong on Linux — the erratum narrows the gap without
+closing it.
+
+RFC 9260's own five verified errata are all protocol-level (T1-init versus
+T1-cookie, `a_rwnd < 1500` handling, verification tag ordering). They constrain
+the stack, not a sockets binding. RFC 6525, 7496 and 7829 have no errata at all;
+RFC 4895 has one, an unused reference to RFC 1321.
+
+### Three citations that pointed at nothing
+
+Every `RFC NNNN §X.Y` in the tree was checked against the section headings of
+the actual document. 68 unique citations, 65 of which resolve. The three that
+did not:
+
+- `§3.1.1` of RFC 4895 — that document's §3.1 has no subsections. The claim
+  being cited, that SHA-1 is mandatory to implement, is in **§3.3**, under
+  Table 2.
+- `§6.5` of RFC 4895 — §6 there stops at 6.3. `struct sctp_authkeyid` is a
+  sockets API struct and is not in RFC 4895 at all; it is **RFC 6458 §8.1.18**,
+  reused by §8.3.4 and §8.3.5.
+- `§6.5` of RFC 6525 — §6 there stops at 6.3. `SCTP_ADD_STREAMS` is **§6.3.4**,
+  which `sctp.go` already cited correctly; only the two test files were wrong.
+
+Written that way round on purpose: the checker scans Markdown too, and spelling
+them in the usual form would make this paragraph fail it forever.
+
+All three were in test files, which is why the earlier citation pass missed
+them: it had been run over the package sources. The checker is now in
+`~/sctp-harnesses/rfc/` and covers the whole tree.
+
+### `SCTP_DEFAULT_SENT_PARAM`
+
+Option 10 is `SCTP_DEFAULT_SEND_PARAM` in `linux/sctp.h` and in RFC 6458
+§8.1.31. This package has always spelled it `SENT`, including on the two lines
+that pass it to `setsockopt` and `getsockopt`. The value was right, so nothing
+failed; the name was simply not the one anybody would grep for.
+
+`SCTP_DEFAULT_SEND_PARAM` is now the constant and `SCTP_DEFAULT_SENT_PARAM` an
+alias, so no caller breaks.
+
+Finding it exposed something larger. `TestOptionNumbersMatchHeader` pinned every
+option from 21 upwards but not options 0 to 16, which are the ones produced by a
+single `iota` run — the only block where the numbers are computed rather than
+written down, and so the only one where inserting a member silently renumbers
+everything below it. Mutation confirms the exposure: adding one member to that
+run breaks five tests now, and broke none of them before the table was extended.
+
+### `SCTP_EOR`, and why it cannot be honoured
+
+Erratum 6111 adds `SCTP_EOR` to the sndinfo flags: with `SCTP_EXPLICIT_EOR`
+(§8.1.26) enabled, a record is built from several sends and terminated by
+setting that flag. Linux implements neither half. There is no
+`SCTP_EXPLICIT_EOR` socket option in the uapi header — the option numbers run
+0-37 and 100-133 with no gap for it — and no `SCTP_EOR` in `enum
+sctp_sinfo_flags`.
+
+`MSG_MORE` is the obvious candidate for an equivalent, so it was measured rather
+than reasoned about: a `sendmsg` with `MSG_MORE` followed by a plain one
+produced **two** records, and the first arrived with `MSG_EOR` already set. So
+every send through this package is a complete record and `MSG_EOR` is a
+receive-side signal only. That is now stated where the flags are declared, since
+the flag block describes itself as mirroring the kernel enum and a reader would
+otherwise wonder where `SCTP_EOR` went.
+
+### `SCTP_NOTIFICATION` is in the enum and never in the field
+
+The same flags block was missing `SCTP_NOTIFICATION`, the last member of `enum
+sctp_sinfo_flags`. Adding it needed a caveat, which was measured: with
+`sctp_data_io_event` on, a data message arrives carrying an `SCTP_SNDRCV` cmsg
+whose `sinfo_flags` is 0, and a notification arrives with **no `SCTP_SNDRCV`
+cmsg at all** — `msg_flags` is `0x8080`, `MSG_EOR|MSG_NOTIFICATION`, and that is
+the only signal. So the bit exists and nothing ever sets it. It is declared with
+that written down, the same treatment `SCTP_PR_SCTP_ALL` already gets.
+
+### The delayed SACK timer sets one field or neither
+
+`SetSackTimer` carried the one doc comment in the package that was still the
+upstream one-liner. RFC 6458 §8.1.19 says a zero `sack_delay` or `sack_freq`
+leaves that value unchanged, which makes the struct unlike every other setter
+here. Measured on 6.12, from the default 200/2:
+
+```
+set 137/5 -> 137/5    both taken
+set   0/9 -> 137/9    SackDelay ignored, previous value kept
+set 211/0 -> 211/9    SackFrequency ignored, previous value kept
+set   0/0 -> 211/9    accepted, and a complete no-op
+set   0/1 -> 0/1      the exception: freq 1 disables the algorithm and
+                      clears the delay rather than preserving it
+set 100000/2 -> EINVAL
+```
+
+The consequence for a caller is that there is no way to ask for no delay, and a
+zeroed `SackTimer` is a no-op rather than a reset.
+`TestSackTimerLayoutAndRoundTrip` sets both fields to non-zero values, so it
+passes whether or not any of this holds; `TestSackTimerZeroFieldMeansUnchanged`
+is the one that fails if it stops.
+
+The last line is the useful one for a caller: an out-of-range delay is refused,
+not clamped, so an absurd value fails at the call instead of quietly becoming
+something else. RFC 9260 §6.2 is where the 500 ms ceiling comes from.
+
+### `StreamChange` reported the wrong thing, and said so in its documentation
+
+RFC 6525 §6.1.3 defines `strchange_outstrms` as "the number of streams that the
+endpoint is allowed to use outbound" — the width of the association after the
+change. Linux passes the *request's* stream count into the event instead. From
+an association with 5 outbound streams, `AddStreams(0, 3)`:
+
+```
+SCTP_STREAM_CHANGE_EVENT   flags=0  instrms=0  outstrms=3
+SCTP_STATUS afterwards     instrms=5 outstrms=8
+send on stream 7           accepted
+```
+
+The event says 3, the association is 8 wide, and stream 7 works. The package
+documented the RFC's reading:
+
+> OutboundStreams is the count that matters to a sender: writing to a stream at
+> or above it fails, whatever AddStreams reported.
+
+Both halves are false. A caller following that comment would have refused to use
+five streams it had. What makes this one worth recording is that the package
+already *knew*: `TestReconfigurationEventsDecodeFromKernelBytes` pins `outbound
+== 3` after `AddStreams(1, 3)` and its comment says "the kernel reports the
+outbound streams it added". The test and the exported documentation had
+contradicted each other, and only the documentation was reachable by a caller.
+
+`TestStreamChangeReportsAddedStreamsNotTheNewWidth` now pins the divergence from
+both ends — against `SCTP_STATUS`, and against a send on a stream the event's
+count says should not exist. It needs its own association: `AddStreams` with
+both counts non-zero produces two requests and so two events, and sharing a
+connection means the assertions read whichever arrives first. That is exactly
+how the first draft of it failed.
+
+`TestStreamChangeReportsDeniedWhenThePeerRefuses` covers the other half. Every
+existing test of the `DENIED`/`FAILED` flags builds the event in the test, so it
+proves the decoder agrees with the test. This one makes a real peer refuse, by
+leaving `SCTPEnableChangeAssocReq` out of the *peer's* mask — that direction was
+measured; the requesting side's mask governs what it may ask, not what it may be
+told. `AddStreams` returns success either way, so the flag is the only thing
+between "streams granted" and "streams refused".
+
+### Two stream schedulers the package was behind on
+
+Diffing the header the image carries (Debian bookworm, 6.1) against the current
+upstream `include/uapi/linux/sctp.h` turned up one substantive change:
+
+```
+< 	SCTP_SS_MAX = SCTP_SS_RR
+> 	SCTP_SS_FC,
+> 	SCTP_SS_WFQ,
+> 	SCTP_SS_MAX = SCTP_SS_WFQ
+```
+
+`enum sctp_sched_type` has grown Fair Capacity and Weighted Fair Queueing, which
+are RFC 8260 §3.5 and §3.6. The package stopped at round-robin and its comment
+said "the set Linux implements is smaller than the one the RFC lists" — true
+when written, and by now understating what is available.
+
+Measured against the running kernel rather than trusted from the header, since
+the header and the kernel are different versions here:
+
+```
+0 FCFS  accepted   1 PRIO  accepted   2 RR  accepted
+3 FC    accepted   4 WFQ   accepted   5 EINVAL   6 EINVAL
+```
+
+So five of RFC 8260's six are implemented; §3.3's round-robin-per-packet is the
+one Linux does not have, and it gets no constant. `SetStreamScheduler` passes
+the value straight through without validating, so the gap was not a hard blocker
+— a caller could always pass a bare 4 — but nothing in the package said 4 was a
+thing, or what it meant.
+
+`TestEveryStreamSchedulerIsSelectable` selects each of the five against a live
+kernel and checks that `SCTPSchedWFQ + 1` is still refused. That upper bound is
+the half that ages: the way to find out the kernel has added a sixth is for that
+assertion to start failing.
+
+Adding WFQ made a second doc comment wrong. `SetStreamSchedulerValue` said the
+value is the priority under `SCTPSchedPrio` and "under the other schedulers it
+is ignored", which was accurate until the kernel gained a scheduler whose weight
+travels through the same option. Measured, writing 7 to stream 1 under each:
+
+```
+FCFS  accepted, reads back 0     PRIO  accepted, reads back 7
+RR    accepted, reads back 0     FC    accepted, reads back 0
+                                 WFQ   accepted, reads back 7
+```
+
+Note the first column. The three that do not use the value do not reject it
+either — `SetStreamSchedulerValue` returns nil and the value is discarded, so a
+caller who sets a priority without also selecting `SCTPSchedPrio` gets no error
+and no effect. `TestOnlyPrioAndWFQKeepAStreamValue` pins both halves, on a fresh
+association per scheduler so a value left over from the previous one cannot be
+mistaken for a value the current one kept.
+
+### RFC 9653, and the rest of the corpus
+
+RFC 9653 (Zero Checksum for SCTP, September 2024) is the only SCTP RFC published
+since this package's citations were written. It adds a Zero Checksum Acceptable
+parameter (0x8001) and an IANA "Error Detection Method" registry. Linux exposes
+none of it: the current upstream `include/uapi/linux/sctp.h` has no
+`SCTP_ZERO_CHECKSUM` option and no error-detection-method field, and the option
+numbers still stop at `SCTP_PLPMTUD_PROBE_INTERVAL = 133`. There is nothing to
+bind. It is recorded here so the next audit does not re-derive it.
+
+Every error cause the package declares was re-checked against the IANA SCTP
+Parameters registry: 1-13 from RFC 9260, 0xa0-0xa4 from RFC 5061, 0x105 from RFC
+4895, plus Linux's own 0x0e which IANA still lists as unassigned. All present,
+all correct, including the three ASCONF causes that are easy to omit. The HMAC
+identifiers (1 SHA-1, 3 SHA-256, with 2 reserved) match Table 2.
+
+### Erratum 4921, measured rather than waved through
+
+The IPv6 row above started life as "already covered by the resolver", which was
+a guess. What the erratum actually clarifies about §9.1 is that an IPv6 socket
+takes IPv6 addresses and that IPv4-mapped is how an IPv4 address reaches one. On
+Linux the deciding factor is `IPV6_V6ONLY`, and `SCTPBind` inherits whatever
+`favoriteAddrFamily` set:
+
+```
+AF_INET  + 127.0.0.1                        ok
+AF_INET6 + ::1               (v6only=1)     ok
+AF_INET6 + 127.0.0.1         (v6only=1)     EINVAL
+AF_INET6 + 127.0.0.1         (v6only=0)     ok
+AF_INET6 + ::ffff:127.0.0.1  (v6only=0)     ok
+AF_INET  + ::1                              EINVAL
+AF_INET6 + ::1,127.0.0.1     (v6only=0)     ok
+```
+
+Which is the erratum's clarification exactly. `TestBindxFamilyRulesFollowV6Only`
+pins it, because the package chooses `IPV6_V6ONLY` itself and a change there
+silently moves which addresses a caller may bind.
+
+### On the wire
+
+Everything above is measured through a socket option or a notification, which
+says a struct was populated. Three of these changes are protocol behaviour, and a
+scheduler that is stored and never consulted looks identical from inside the
+process. So each was run again under `tshark`, driven through the package's own
+API rather than a hand-built packet, with the feature off as well as on. The
+harness is in `~/sctp-harnesses/rfc/wire/`, out of the repository like the
+others.
+
+Filters were built from values looked up first, not guessed: DATA is chunk type
+0 and SACK is 3 (RFC 9260 §3.3), RE-CONFIG is 130 and the Add Outgoing Streams
+and Re-configuration Response parameters are 17 and 16 (RFC 6525, IANA), and
+Result 1 is Performed with 2 Denied (RFC 6525 Table 3).
+
+**SCTPSchedWFQ reaches the wire.** The same burst — 400 messages alternating
+between stream 0 and stream 1, receiver not reading so the send queue backs up —
+under two schedulers:
+
+```
+FCFS  0 1 0 1 0 1 0 1 0 1 0 1 0 1 0 1 ...   stream0=45 stream1=49
+WFQ   0 1 0 0 0 0 0 0 0 0 0 0 1 0 0 0 ...   stream0=58 stream1=36
+      (weights 10:1)
+```
+
+Identical submitted counts, identical 94 DATA chunks, and the only variable is
+the scheduler. Reproduced bit-for-bit across three runs.
+
+**SackFrequency reaches the wire.** 40 DATA chunks each way: `SackFrequency` 1
+produced 40 SACKs, and 20 produced 3. The capture also confirms on a live
+association what the option round trip had only implied — with frequency 1 the
+delay reads back as 0, because disabling the algorithm clears the timer.
+
+**SCTP_STREAM_CHANGE_DENIED is a real refusal, not a local flag.** With the peer
+missing `SCTPEnableChangeAssocReq`:
+
+| | peer permits | peer refuses |
+| --- | --- | --- |
+| event flags | `0x0` | `0x4` |
+| `GetStatus` outbound streams | 10 → 13 | 10 → 10 |
+| RE-CONFIG response on the wire | `Result: Performed (1)` | `Result: Denied (2)` |
+| write to stream 11 | accepted | EINVAL |
+| DATA chunks on stream 11 | 1 | none |
+
+The last two rows are the pre-fix comparison. The documentation this round
+replaced said a write to a stream at or above `OutboundStreams` fails; the event
+reported 3, and a DATA chunk for stream `0x000b` is in the capture. The refusal
+case emits no DATA chunk at all, so the harness can tell the two apart rather
+than always passing.
+
+### Two mistakes the capture caught in the harness itself
+
+Worth recording because both produced a confident wrong number rather than an
+error.
+
+The first count of DATA chunks per stream came back `stream0=0 stream1=0` from a
+capture full of them: `tshark` prints the stream id as `0x0000`, and joins every
+occurrence within a packet with commas, so counting lines undercounts by the
+bundling factor and matching `^0$` against `0x0000` matches nothing.
+
+The second was worse. Counting SACKs through `sctp.cumulative_tsn_ack` reported
+0 SACKs for a capture containing 40 — that field does not exist, the real one is
+`sctp.sack_cumulative_tsn_ack`, and a non-existent field yields no output rather
+than an error. It reads exactly like a kernel that had stopped acknowledging.
+Both are now counted from `sctp.chunk_type` against the verified constants, and
+every case prints a census of all chunk types so a zero for the type under test
+can be told from an empty capture.
+
+### The in-process counterpart, and the guard that stopped it lying
+
+`TestWFQReordersRelativeToFCFS` sends the same burst twice and compares the
+delivery order, so the suite has something that would notice the scheduler being
+ignored. Its first version compared the longest same-stream run over the whole
+sequence and failed its own sanity guard: FCFS came out at 27, which is not what
+strict submission order looks like.
+
+The guard was right and the first explanation was wrong. It is not receive-side
+reordering — the head of the in-process order is `0 1 0 1 0 1`, matching the
+capture exactly. It is the tail: once the burst stops the queue drains and
+whatever is left of one stream is delivered together, so every scheduler ends in
+a long run. Measured over the head, where the queue is still deep, FCFS is 1 and
+WFQ is 24.
+
+The assertion is relative — WFQ groups more than FCFS — rather than a threshold,
+since how many messages queue before the buffer fills is a property of the host.
+Five runs gave FCFS 1 and WFQ 24 every time. Shortening the write deadline from
+five seconds to one took it from 12.4s to 2.0s with the same numbers, because
+the burst fills the buffer in milliseconds and spent the rest of the deadline
+blocked.
+
+No Go-side mutation isolates that test: breaking the constant or zeroing the
+weight fails the two round-trip tests first. What it guards against is the
+kernel accepting the option and not acting on it, which no edit to this package
+can simulate.
+
+### Fifteen mutations, and one that had to be made catchable first
+
+Every assertion added this round was mutated and watched to fail: the `iota`
+shift, all three special association identifiers, `SCTP_NOTIFICATION`'s value,
+the `SackTimer` field order, `SetSackTimer`'s option number, the swapped
+`StreamChange` counts, a `Flags()` that returns 0, `MSG_EOR`'s value, the two
+new stream scheduler numbers, the `sctp_stream_value` field order, and two
+against the WFQ ordering test.
+
+The `bindx` one is the interesting one. Changing `SCTP_BINDX_ADD_ADDR` from 1 to
+4 left the suite green, and that turned out to be correct rather than a hole:
+`SCTPBind` uses the flag only to pick between `SCTP_SOCKOPT_BINDX_ADD` and
+`SCTP_SOCKOPT_BINDX_REM`, comparing it against the same constants that define
+it. The value never reaches the kernel, so no caller using the named constants
+can observe it.
+
+It is load-bearing for exactly one caller: the one who passes a literal 1 or 2,
+because that is what `linux/sctp.h` says. Both are now in the option table,
+which makes the mutation catchable — fifteen for fifteen.
+
+A first attempt at that mutation used 2 rather than 4 and produced a compile
+error, since it collided with `SCTP_BINDX_REM_ADDR` in the same switch. A
+mutation that does not build tests nothing, and the harness reports it as such
+rather than counting it either way.
