@@ -1805,3 +1805,117 @@ carries the same build tag as the file that uses it.
 
 The lesson from the Windows break stands: a "lint is clean" claim has to name the
 platform, and the detector for portability is compilation, not `U1000`.
+
+## Reviewing the fixes
+
+The three commits above were then reviewed as adversarially as the code they
+fixed. That found two wrong constants — one inherited, one introduced by the
+review's own subject — and both had passing tests.
+
+### `SCTP_EOF` selected a partial reliability policy
+
+The per-message send flags were an `iota` block:
+
+```go
+SCTP_UNORDERED = 1 << iota
+SCTP_ADDR_OVER
+SCTP_ABORT
+SCTP_SACK_IMMEDIATELY
+SCTP_EOF
+```
+
+The kernel's sequence is not contiguous. Bits 4 and 5 are `SCTP_PR_SCTP_MASK`,
+carrying the partial reliability policy, and `SCTP_EOF` is not an SCTP bit at all
+— it is `MSG_FIN`, `0x200`, confirmed from `bits/socket.h`. As the fifth `iota`,
+`SCTP_EOF` came out as `1<<4`, which is exactly `SCTP_PR_SCTP_TTL`.
+
+So a caller ending an association by setting `SCTP_EOF` on their last message
+selected a PR-SCTP policy instead. No graceful shutdown, no error, and a lifetime
+applied to the message they most wanted delivered.
+
+`SCTP_SENDALL` and `SCTP_PR_SCTP_ALL` were missing outright. The block is written
+out now, with the policy bits called out as a hole rather than left to be
+absorbed by the next value added.
+
+### The PF exposure levels were off by one
+
+This one was introduced two commits earlier, by the work that added the option.
+
+The kernel's enum, from `include/net/sctp/constants.h`, is:
+
+```c
+SCTP_PF_EXPOSE_UNSET,    /* 0 */
+SCTP_PF_EXPOSE_DISABLE,  /* 1 */
+SCTP_PF_EXPOSE_ENABLE,   /* 2 */
+```
+
+Zero is not "off"; it means "nobody has said", and the socket follows
+`net.sctp.pf_expose`. Read as the off/on/locked shape most of these options have
+— which is what happened — "exposed" lands on 1, the value that *disables*
+exposure. `SetExposePotentiallyFailed(SCTPPFStateExposed)` turned PF reporting
+off, the opposite of the only reason to call it.
+
+The round-trip test could not have caught it. It set a value and read the same
+value back, which holds whatever the value means. Both constant blocks are now
+pinned to their kernel numbers, which is the assertion a round trip cannot make.
+
+### The same mistake, three commits after fixing it
+
+Adding `SOCK_CLOEXEC` to `PeelOff` broke the darwin and Windows builds
+immediately: `syscall.SOCK_CLOEXEC` is not defined there, and `PeelOff` was in
+`sctp.go`, which has no build tag.
+
+That is precisely the defect the first of these commits existed to fix, repeated
+by the same hand, inside a function whose change was about close-on-exec. It was
+caught in seconds by `go build` rather than by a consumer, which is the entire
+argument for `TestCrossCompiles` and for keeping the platform partition honest.
+`PeelOff` now lives in `sctp_linux.go` with a stub alongside the others.
+
+### Big-endian, measured rather than argued
+
+The cause byte-order work was verified on a little-endian host by aborting a live
+association. The other half was reasoning: that reading the two `__u16` fields
+big-endian is right on either kind of host, because the bytes in the buffer are
+the network representation, while the `__u32` field needs a native read followed
+by an `ntohs` because its promotion happened in host arithmetic.
+
+That is now measured. `docker run --platform linux/s390x` gives a real big-endian
+Go toolchain under emulation, and every pure decoder test passes there —
+including the one asserting `spc_error` stays host order. The socket-backed tests
+cannot run: the emulated environment has no SCTP, and `ListenSCTP` fails with
+`EPROTONOSUPPORT`. Worth knowing as a standing capability: layout and byte-order
+work can be checked on big-endian without hardware, protocol behaviour cannot.
+
+### Two things left as they are, deliberately
+
+`SendFailed.Info.PPID` and `SendFailedEvent.Info.PPID` hold network byte order,
+while `SCTPRead` hands back the same struct with the field converted. The same
+field means different things depending on where it came from.
+
+That is documented rather than changed. `SndRcvInfo.PPID` has always said it
+holds what the kernel delivered and that `SCTPRead` converts, so the notification
+path is consistent with the type's contract even though the asymmetry is a trap.
+A test pins it, so converging on `SCTPRead`'s convention later is a deliberate
+change rather than a silent one under callers who already compensate.
+
+`ParseNotification` does not compare the length in the header against the bytes
+present. That is intentional and documented on the type: the kernel truncates a
+notification to whatever buffer the caller passed, so the declared length
+routinely exceeds what arrived, and treating the difference as an error would
+reject every short read rather than the malformed ones. The bounds that matter
+are on the buffer, and those are checked.
+
+### Where the option surface actually stands
+
+Re-running the header sweep the right way — against constants reached by a
+wrapper rather than merely declared — leaves nothing bindable unbound. What
+remains is one-to-many territory: `SCTP_GET_ASSOC_ID_LIST`, the
+`SCTP_DSTADDRV4`/`V6` and `SCTP_INIT` ancillary types, and the
+`CURRENT`/`FUTURE`/`ALL_ASSOC` identifiers, none of which applies to a
+one-to-one socket. Plus `SCTP_SENDMSG_CONNECT`, which this kernel answers with
+`ENOPROTOOPT`.
+
+The last two that did apply are bound now: RFC 6951 UDP encapsulation, which is
+what lets an association cross a middlebox that drops IP protocol 132, and
+RFC 8899 PLPMTUD, which finds a path's MTU without trusting ICMP. Both round-trip
+against a live association.
