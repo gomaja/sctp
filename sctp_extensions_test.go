@@ -422,11 +422,92 @@ func TestOptionNumbersMatchHeader(t *testing.T) {
 		{"SCTP_PEER_AUTH_CHUNKS", SCTP_PEER_AUTH_CHUNKS, 26},
 		{"SCTP_LOCAL_AUTH_CHUNKS", SCTP_LOCAL_AUTH_CHUNKS, 27},
 		{"SCTP_AUTH_DEACTIVATE_KEY", SCTP_AUTH_DEACTIVATE_KEY, 35},
+		// The table used to stop at SCTP_ADD_STREAMS, leaving everything from
+		// here on covered only by set/get round trips through the same
+		// constant — which cannot fail whatever the number is. Mutation
+		// confirmed it: swapping SCTP_ASCONF_SUPPORTED with SCTP_AUTH_SUPPORTED
+		// left the complete suite green, while a live probe showed
+		// SetAuthSupported(true) reading back 1 through the wrong option with
+		// SCTP_AUTH_SUPPORTED still 0 and ASCONF switched on instead. An
+		// application asking for AUTH would silently get dynamic address
+		// reconfiguration.
+		{"SCTP_RECVRCVINFO", SCTP_RECVRCVINFO, 32},
+		{"SCTP_RECVNXTINFO", SCTP_RECVNXTINFO, 33},
+		{"SCTP_REUSE_PORT", SCTP_REUSE_PORT, 36},
+		{"SCTP_STREAM_SCHEDULER", SCTP_STREAM_SCHEDULER, 123},
+		{"SCTP_STREAM_SCHEDULER_VALUE", SCTP_STREAM_SCHEDULER_VALUE, 124},
+		{"SCTP_INTERLEAVING_SUPPORTED", SCTP_INTERLEAVING_SUPPORTED, 125},
+		{"SCTP_EVENT", SCTP_EVENT, 127},
+		{"SCTP_ASCONF_SUPPORTED", SCTP_ASCONF_SUPPORTED, 128},
+		{"SCTP_AUTH_SUPPORTED", SCTP_AUTH_SUPPORTED, 129},
+		{"SCTP_ECN_SUPPORTED", SCTP_ECN_SUPPORTED, 130},
+		{"SCTP_EXPOSE_POTENTIALLY_FAILED_STATE", SCTP_EXPOSE_POTENTIALLY_FAILED_STATE, 131},
+		{"SCTP_EXPOSE_PF_STATE", SCTP_EXPOSE_PF_STATE, 131},
+		{"SCTP_REMOTE_UDP_ENCAPS_PORT", SCTP_REMOTE_UDP_ENCAPS_PORT, 132},
+		{"SCTP_PLPMTUD_PROBE_INTERVAL", SCTP_PLPMTUD_PROBE_INTERVAL, 133},
+		{"SCTP_SOCKOPT_PEELOFF", SCTP_SOCKOPT_PEELOFF, 102},
+		{"SCTP_SOCKOPT_PEELOFF_FLAGS", SCTP_SOCKOPT_PEELOFF_FLAGS, 122},
+		{"SCTP_GET_PEER_ADDRS", SCTP_GET_PEER_ADDRS, 108},
+		{"SCTP_GET_LOCAL_ADDRS", SCTP_GET_LOCAL_ADDRS, 109},
+		{"SCTP_SOCKOPT_CONNECTX", SCTP_SOCKOPT_CONNECTX, 110},
+		{"SCTP_SOCKOPT_CONNECTX3", SCTP_SOCKOPT_CONNECTX3, 111},
+		{"SCTP_SOCKOPT_BINDX_ADD", SCTP_SOCKOPT_BINDX_ADD, 100},
+		{"SCTP_SOCKOPT_BINDX_REM", SCTP_SOCKOPT_BINDX_REM, 101},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d per linux/sctp.h",
 				tc.name, tc.got, tc.want)
 		}
+	}
+
+	// No two options may share a number. A copy-paste that duplicates one is
+	// the mistake the table above cannot catch on its own, since each row is
+	// checked in isolation.
+	seen := map[uintptr]string{}
+	for _, tc := range []struct {
+		name string
+		got  uintptr
+	}{
+		{"SCTP_AUTH_CHUNK", SCTP_AUTH_CHUNK},
+		{"SCTP_HMAC_IDENT", SCTP_HMAC_IDENT},
+		{"SCTP_AUTH_KEY", SCTP_AUTH_KEY},
+		{"SCTP_AUTH_ACTIVE_KEY", SCTP_AUTH_ACTIVE_KEY},
+		{"SCTP_AUTH_DELETE_KEY", SCTP_AUTH_DELETE_KEY},
+		{"SCTP_PEER_AUTH_CHUNKS", SCTP_PEER_AUTH_CHUNKS},
+		{"SCTP_LOCAL_AUTH_CHUNKS", SCTP_LOCAL_AUTH_CHUNKS},
+		{"SCTP_AUTO_ASCONF", SCTP_AUTO_ASCONF},
+		{"SCTP_PEER_ADDR_THLDS", SCTP_PEER_ADDR_THLDS},
+		{"SCTP_RECVRCVINFO", SCTP_RECVRCVINFO},
+		{"SCTP_RECVNXTINFO", SCTP_RECVNXTINFO},
+		{"SCTP_DEFAULT_SNDINFO", SCTP_DEFAULT_SNDINFO},
+		{"SCTP_AUTH_DEACTIVATE_KEY", SCTP_AUTH_DEACTIVATE_KEY},
+		{"SCTP_REUSE_PORT", SCTP_REUSE_PORT},
+		{"SCTP_PEER_ADDR_THLDS_V2", SCTP_PEER_ADDR_THLDS_V2},
+		{"SCTP_GET_ASSOC_STATS", SCTP_GET_ASSOC_STATS},
+		{"SCTP_PR_SUPPORTED", SCTP_PR_SUPPORTED},
+		{"SCTP_DEFAULT_PRINFO", SCTP_DEFAULT_PRINFO},
+		{"SCTP_PR_ASSOC_STATUS", SCTP_PR_ASSOC_STATUS},
+		{"SCTP_PR_STREAM_STATUS", SCTP_PR_STREAM_STATUS},
+		{"SCTP_RECONFIG_SUPPORTED", SCTP_RECONFIG_SUPPORTED},
+		{"SCTP_ENABLE_STREAM_RESET", SCTP_ENABLE_STREAM_RESET},
+		{"SCTP_RESET_STREAMS", SCTP_RESET_STREAMS},
+		{"SCTP_RESET_ASSOC", SCTP_RESET_ASSOC},
+		{"SCTP_ADD_STREAMS", SCTP_ADD_STREAMS},
+		{"SCTP_STREAM_SCHEDULER", SCTP_STREAM_SCHEDULER},
+		{"SCTP_STREAM_SCHEDULER_VALUE", SCTP_STREAM_SCHEDULER_VALUE},
+		{"SCTP_INTERLEAVING_SUPPORTED", SCTP_INTERLEAVING_SUPPORTED},
+		{"SCTP_EVENT", SCTP_EVENT},
+		{"SCTP_ASCONF_SUPPORTED", SCTP_ASCONF_SUPPORTED},
+		{"SCTP_AUTH_SUPPORTED", SCTP_AUTH_SUPPORTED},
+		{"SCTP_ECN_SUPPORTED", SCTP_ECN_SUPPORTED},
+		{"SCTP_EXPOSE_POTENTIALLY_FAILED_STATE", SCTP_EXPOSE_POTENTIALLY_FAILED_STATE},
+		{"SCTP_REMOTE_UDP_ENCAPS_PORT", SCTP_REMOTE_UDP_ENCAPS_PORT},
+		{"SCTP_PLPMTUD_PROBE_INTERVAL", SCTP_PLPMTUD_PROBE_INTERVAL},
+	} {
+		if prev, dup := seen[tc.got]; dup {
+			t.Errorf("%s and %s are both %d", tc.name, prev, tc.got)
+		}
+		seen[tc.got] = tc.name
 	}
 
 	// The ancillary data types are positional in enum sctp_cmsg_type, so an
@@ -486,6 +567,22 @@ func TestPrStreamStatusNeedsAssociation(t *testing.T) {
 		t.Errorf("fresh association reports abandoned unsent=%d sent=%d, "+
 			"want 0/0 — a non-zero count suggests a layout mismatch",
 			st.AbandonedUnsent, st.AbandonedSent)
+	}
+
+	// The stream id must reach the kernel. Querying stream 0 cannot show that:
+	// zero is also what an ignored field leaves behind, so dropping sid from
+	// the request survives. Ask about a stream that is not the first.
+	const sid = 3
+	st3, err := conn.GetPrStreamStatus(sid, SCTPPrPolicyTTL)
+	if err != nil {
+		t.Fatalf("GetPrStreamStatus(%d): %v", sid, err)
+	}
+	if st3.SID != sid {
+		t.Errorf("GetPrStreamStatus(%d) came back describing stream %d; the "+
+			"stream id is not being carried into the request", sid, st3.SID)
+	}
+	if st3.Policy != SCTPPrPolicyTTL {
+		t.Errorf("GetPrStreamStatus policy = %d, want %d", st3.Policy, SCTPPrPolicyTTL)
 	}
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_SCTP)
@@ -924,12 +1021,55 @@ func TestAuthEnabledRoundTrip(t *testing.T) {
 		t.Errorf("AuthActiveKey = %d, want 0", got)
 	}
 
-	if _, err := conn.LocalAuthChunks(); err != nil {
+	// These used to be checked for err == nil only, which a stub returning
+	// (nil, nil) satisfies just as well as a working decoder. Ask for a
+	// specific chunk type and require it back: DATA is chunk type 0, and
+	// SetAuthChunk is what puts it in the local list.
+	if err := conn.SetAuthChunk(0); err != nil {
+		t.Fatalf("SetAuthChunk(0): %v", err)
+	}
+	local, err := conn.LocalAuthChunks()
+	if err != nil {
 		t.Fatalf("LocalAuthChunks: %v", err)
 	}
-	// PeerAuthChunks needs the association, which sockoptConn provides.
+	found := false
+	for _, ct := range local {
+		if ct == 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("LocalAuthChunks = %v, want it to contain the chunk type 0 that "+
+			"SetAuthChunk(0) just added", local)
+	}
+
+	// PeerAuthChunks needs the association, which sockoptConn provides. Its
+	// contents depend on what the peer asked for, so the assertion here is that
+	// the call decodes rather than what it decodes to.
 	if _, err := conn.PeerAuthChunks(); err != nil {
 		t.Fatalf("PeerAuthChunks: %v", err)
+	}
+
+	// HmacIdent likewise: set a specific two-element list and require exactly
+	// it back, in order. Returning a hard-coded []uint16{SCTPAuthHmacIDSHA1}
+	// satisfied the old assertion.
+	if err := conn.SetHmacIdent(SCTPAuthHmacIDSHA256, SCTPAuthHmacIDSHA1); err != nil {
+		t.Fatalf("SetHmacIdent: %v", err)
+	}
+	idents, herr := conn.HmacIdent()
+	if herr != nil {
+		t.Fatalf("HmacIdent: %v", herr)
+	}
+	want := []uint16{SCTPAuthHmacIDSHA256, SCTPAuthHmacIDSHA1}
+	if len(idents) != len(want) {
+		t.Fatalf("HmacIdent = %v, want %v", idents, want)
+	}
+	for i := range want {
+		if idents[i] != want[i] {
+			t.Errorf("HmacIdent = %v, want %v: the order is the preference order, "+
+				"so a reversed list selects a different algorithm", idents, want)
+			break
+		}
 	}
 }
 

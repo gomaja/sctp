@@ -27,14 +27,28 @@ Platforms
 
 SCTP exists on `linux` only, and this package's implementation additionally
 excludes `linux/386`, where the `syscall` package does not define the socket
-option syscalls it needs. Everywhere else the package still compiles and every
-entry point returns `ErrUnsupported`, which wraps `errors.ErrUnsupported`:
+option syscalls it needs. On every other target with a real `syscall` package —
+the BSDs, darwin, windows, solaris, illumos, aix, android — the package still
+compiles, and the entry points that need a socket return `ErrUnsupported`, which
+wraps `errors.ErrUnsupported`:
 
 ```go
 if errors.Is(err, errors.ErrUnsupported) {
         // no SCTP on this platform
 }
 ```
+
+Two qualifications, both measured rather than assumed.
+
+`plan9`, `js/wasm` and `wasip1/wasm` do **not** compile: their `syscall`
+packages have no `RawSockaddrInet4`, which address marshalling needs. They have
+no sockets to speak of either, so this is a statement of scope rather than a
+plan.
+
+And not every entry point is socket-bound. `ResolveSCTPAddr` and the deadline
+setters are pure Go, compile everywhere, and do their ordinary job — so the
+`errors.Is` gate above never trips for them. It applies to the calls that would
+have to reach the kernel.
 
 `TestCrossCompiles` builds the package for each target this promise covers, so a
 non-portable symbol in shared code fails a test rather than a consumer's build.

@@ -158,46 +158,68 @@ func TestStructLayoutsMatchKernel(t *testing.T) {
 		assertOffset(t, "AbandonedSent", unsafe.Offsetof(p.AbandonedSent), 16)
 	})
 
-	t.Run("PeerAddrThlds", func(t *testing.T) {
-		var th PeerAddrThlds
-		// struct sctp_paddrthlds, RFC 7829 §7.2. 144 because spt_address is a
-		// sockaddr_storage (128 bytes) at offset 8 — not 4. The storage type
-		// contains a long, so C pads to 8-byte alignment after the assoc id,
-		// and the Go struct needs an explicit pad to match. Reading it at 4
-		// would shift every subsequent field and return garbage without any
-		// error.
-		assertSize(t, "PeerAddrThlds", unsafe.Sizeof(th), 144)
-		assertOffset(t, "AssocID", unsafe.Offsetof(th.AssocID), 0)
-		assertOffset(t, "Address", unsafe.Offsetof(th.Address), 8)
-		assertOffset(t, "PathMaxRxt", unsafe.Offsetof(th.PathMaxRxt), 136)
-		assertOffset(t, "PathPfThld", unsafe.Offsetof(th.PathPfThld), 138)
-	})
-
-	t.Run("PeerAddrThldsV2", func(t *testing.T) {
-		var th PeerAddrThldsV2
-		// struct sctp_paddrthlds_v2, a Linux extension with a third threshold.
-		// Same sockaddr_storage alignment as PeerAddrThlds — address at 8 — and
-		// 144 bytes, rounded up from the 142 the fields occupy.
-		assertSize(t, "PeerAddrThldsV2", unsafe.Sizeof(th), 144)
-		assertOffset(t, "AssocID", unsafe.Offsetof(th.AssocID), 0)
-		assertOffset(t, "Address", unsafe.Offsetof(th.Address), 8)
-		assertOffset(t, "PathMaxRxt", unsafe.Offsetof(th.PathMaxRxt), 136)
-		assertOffset(t, "PathPfThld", unsafe.Offsetof(th.PathPfThld), 138)
-		assertOffset(t, "PathCpThld", unsafe.Offsetof(th.PathCpThld), 140)
-	})
+	// PeerAddrThlds, PeerAddrThldsV2, UDPEncaps, ProbeInterval and the address
+	// half of AssocStats are not checked here. Their C layout depends on the
+	// word size — the sockaddr_storage they hold is not inside a packed struct,
+	// so it keeps the alignment of the unsigned long within it — and a
+	// unsafe.Offsetof assertion against the Go struct would only ever describe
+	// the host this runs on. They are marshalled through explicit offsets
+	// instead, and pinned by TestSockaddrStorageOptionLayouts, which asserts
+	// the numbers for the target it is compiled for.
 
 	t.Run("AssocStats", func(t *testing.T) {
+		// struct sctp_assoc_stats. Linux-specific, no RFC counterpart. The
+		// counters are the part with a fixed layout: 256 bytes overall and
+		// sas_maxrto at 136 on both word sizes, with only sas_obs_rto_ipaddr
+		// moving between them — at 8 on a 64-bit kernel and 4 on a 32-bit one,
+		// the difference absorbed by padding in front of the counters. So the
+		// size is identical either way and no length check can tell them apart.
+		assertSize(t, "AssocStats counters", assocStatsCounters, 136)
+		assertSize(t, "AssocStats", assocStatsSize, 256)
+
+		// Drive the decoder with a buffer laid out the way the kernel lays one
+		// out, giving every counter a distinct value so a shifted read shows up
+		// as the neighbouring field rather than as a plausible number.
+		b := make([]byte, assocStatsSize)
+		nativeEndian.PutUint32(b[0:], 0x11223344)
+		for i := 0; i < 128; i++ {
+			b[int(ssAddrOffset)+i] = byte(i)
+		}
+		for i := 0; i < 15; i++ {
+			nativeEndian.PutUint64(b[assocStatsCounters+8*i:], uint64(0xA000+i))
+		}
+
 		var s AssocStats
-		// struct sctp_assoc_stats. Linux-specific, no RFC counterpart. Same
-		// 8-byte alignment of the sockaddr_storage as PeerAddrThlds, so
-		// sas_obs_rto_ipaddr sits at 8 and the counters begin at 136.
-		assertSize(t, "AssocStats", unsafe.Sizeof(s), 256)
-		assertOffset(t, "AssocID", unsafe.Offsetof(s.AssocID), 0)
-		assertOffset(t, "ObsRtoIPAddr", unsafe.Offsetof(s.ObsRtoIPAddr), 8)
-		assertOffset(t, "MaxRto", unsafe.Offsetof(s.MaxRto), 136)
-		assertOffset(t, "ISacks", unsafe.Offsetof(s.ISacks), 144)
-		assertOffset(t, "OPackets", unsafe.Offsetof(s.OPackets), 160)
-		assertOffset(t, "ICtrlChunks", unsafe.Offsetof(s.ICtrlChunks), 248)
+		s.unmarshal(b)
+
+		if s.AssocID != 0x11223344 {
+			t.Errorf("AssocID = %#x, want 0x11223344", s.AssocID)
+		}
+		if s.ObsRtoIPAddr[0] != 0 || s.ObsRtoIPAddr[127] != 127 {
+			t.Errorf("ObsRtoIPAddr was not read from offset %d: first=%d last=%d",
+				ssAddrOffset, s.ObsRtoIPAddr[0], s.ObsRtoIPAddr[127])
+		}
+		for _, tc := range []struct {
+			name string
+			got  uint64
+			idx  int
+		}{
+			{"MaxRto", s.MaxRto, 0},
+			{"ISacks", s.ISacks, 1}, {"OSacks", s.OSacks, 2},
+			{"OPackets", s.OPackets, 3}, {"IPackets", s.IPackets, 4},
+			{"RtxChunks", s.RtxChunks, 5},
+			{"OutOfSeqTsns", s.OutOfSeqTsns, 6},
+			{"IDupChunks", s.IDupChunks, 7},
+			{"GapCnt", s.GapCnt, 8},
+			{"OUodChunks", s.OUodChunks, 9}, {"IUodChunks", s.IUodChunks, 10},
+			{"OOdChunks", s.OOdChunks, 11}, {"IOdChunks", s.IOdChunks, 12},
+			{"OCtrlChunks", s.OCtrlChunks, 13}, {"ICtrlChunks", s.ICtrlChunks, 14},
+		} {
+			if want := uint64(0xA000 + tc.idx); tc.got != want {
+				t.Errorf("%s = %#x, want %#x (counter %d at offset %d)",
+					tc.name, tc.got, want, tc.idx, assocStatsCounters+8*tc.idx)
+			}
+		}
 	})
 
 	t.Run("AddStreamsReq", func(t *testing.T) {

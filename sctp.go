@@ -25,8 +25,14 @@
 // # Platforms
 //
 // SCTP exists on Linux only, and this package's implementation additionally
-// excludes linux/386. Everywhere else the package still compiles and every
-// entry point returns ErrUnsupported, which wraps errors.ErrUnsupported.
+// excludes linux/386. On every other target with a real syscall package the
+// package still compiles, and the entry points that need a socket return
+// ErrUnsupported, which wraps errors.ErrUnsupported.
+//
+// Two qualifications: plan9, js/wasm and wasip1/wasm do not compile, their
+// syscall packages having no RawSockaddrInet4; and the entry points that never
+// touch the kernel — ResolveSCTPAddr and the deadline setters — work normally
+// everywhere rather than reporting ErrUnsupported.
 //
 // # Reading
 //
@@ -155,20 +161,22 @@ const (
 	SCTP_REUSE_PORT = 36
 
 	// SCTP_DEFAULT_SNDINFO carries struct sctp_sndinfo and is the replacement
-	// RFC 6458 §8.1.31 gives for SCTP_DEFAULT_SEND_PARAM, which §8.1.31 marks
+	// RFC 6458 §8.1.31 gives for SCTP_DEFAULT_SEND_PARAM, which §8.1.13 marks
 	// deprecated along with the struct sctp_sndrcvinfo it takes.
 	SCTP_DEFAULT_SNDINFO = 34
 
 	// SCTP_AUTO_ASCONF makes the kernel announce local address changes to the
-	// peer with ASCONF chunks (RFC 6458 §8.1.21).
+	// peer with ASCONF chunks (RFC 6458 §8.1.23).
 	SCTP_AUTO_ASCONF = 30
 
 	// SCTP_PEER_ADDR_THLDS carries struct sctp_paddrthlds and sets the
 	// per-path failure and Potentially Failed thresholds (RFC 7829 §7.2).
 	SCTP_PEER_ADDR_THLDS = 31
-	// SCTP_PEER_ADDR_THLDS_V2 is the same option with a third threshold added,
-	// governing when a path stops being probed while in the Potentially Failed
-	// state. Linux-specific; RFC 7829 describes only the first two.
+	// SCTP_PEER_ADDR_THLDS_V2 is the same option with a third threshold added:
+	// the consecutive-error count at which the primary path is switched
+	// (RFC 7829 §5). The option number is Linux's back-compatibility device —
+	// the threshold itself is RFC 7829 §7.2's spt_pathcpthld, the third member
+	// of struct sctp_paddrthlds. See PeerAddrThldsV2.PathCpThld.
 	SCTP_PEER_ADDR_THLDS_V2 = 37
 
 	// SCTP_GET_ASSOC_STATS reads struct sctp_assoc_stats, the per-association
@@ -183,10 +191,10 @@ const (
 	SCTP_DEFAULT_PRINFO = 114
 	// SCTP_PR_STREAM_STATUS reads struct sctp_prstatus, the count of messages
 	// abandoned on one stream under the partial reliability policy
-	// (RFC 7496 §4.4).
+	// (RFC 7496 §4.3).
 	SCTP_PR_STREAM_STATUS = 116
 	// SCTP_PR_ASSOC_STATUS reads the same struct sctp_prstatus totalled across
-	// every stream of the association (RFC 7496 §4.3).
+	// every stream of the association (RFC 7496 §4.4).
 	SCTP_PR_ASSOC_STATUS = 115
 
 	// SCTP_RECONFIG_SUPPORTED negotiates stream reconfiguration
@@ -196,7 +204,7 @@ const (
 	// permitted (RFC 6525 §6.3).
 	SCTP_ENABLE_STREAM_RESET = 118
 	// SCTP_ADD_STREAMS asks the peer to widen the association's stream count
-	// (RFC 6525 §6.5).
+	// (RFC 6525 §6.3.4).
 	SCTP_ADD_STREAMS = 121
 	// SCTP_RESET_STREAMS restarts the sequence numbering of some or all
 	// streams (RFC 6525 §6.3.2).
@@ -206,28 +214,28 @@ const (
 	SCTP_RESET_ASSOC = 120
 
 	// SCTP_HMAC_IDENT carries struct sctp_hmacalgo, the ordered list of HMAC
-	// algorithms this endpoint offers (RFC 4895 §6.2).
+	// algorithms this endpoint offers (RFC 6458 §8.1.17).
 	SCTP_HMAC_IDENT = 22
 	// SCTP_AUTH_ACTIVE_KEY carries struct sctp_authkeyid and selects the key
-	// used for outbound AUTH chunks (RFC 4895 §6.5).
+	// used for outbound AUTH chunks (RFC 6458 §8.1.18).
 	SCTP_AUTH_ACTIVE_KEY = 24
 	// SCTP_AUTH_CHUNK adds one chunk type to the set this endpoint requires
-	// the peer to authenticate (RFC 4895 §6.1). Set only.
+	// the peer to authenticate (RFC 6458 §8.3.2). Set only.
 	SCTP_AUTH_CHUNK = 21
 	// SCTP_AUTH_KEY installs a shared key, carrying struct sctp_authkey with
-	// the key bytes appended (RFC 4895 §6.3). Set only.
+	// the key bytes appended (RFC 6458 §8.3.3). Set only.
 	SCTP_AUTH_KEY = 23
-	// SCTP_AUTH_DELETE_KEY removes a shared key (RFC 4895 §6.8). Set only.
+	// SCTP_AUTH_DELETE_KEY removes a shared key (RFC 6458 §8.3.5). Set only.
 	SCTP_AUTH_DELETE_KEY = 25
 	// SCTP_AUTH_DEACTIVATE_KEY stops a shared key being used for new packets
 	// while leaving it able to verify what is already in flight
-	// (RFC 4895 §6.9). Set only.
+	// (RFC 6458 §8.3.4). Set only.
 	SCTP_AUTH_DEACTIVATE_KEY = 35
 	// SCTP_PEER_AUTH_CHUNKS reads the chunk types the peer requires to be
-	// authenticated (RFC 4895 §6.6). Read only.
+	// authenticated (RFC 6458 §8.2.3). Read only.
 	SCTP_PEER_AUTH_CHUNKS = 26
 	// SCTP_LOCAL_AUTH_CHUNKS reads the chunk types this endpoint requires to
-	// be authenticated (RFC 4895 §6.7). Read only.
+	// be authenticated (RFC 6458 §8.2.4). Read only.
 	SCTP_LOCAL_AUTH_CHUNKS = 27
 
 	// SCTP_STREAM_SCHEDULER selects the order outbound streams are served in
@@ -256,11 +264,58 @@ const (
 	// SCTP_EXPOSE_PF_STATE is the kernel's shorter spelling of the same option.
 	SCTP_EXPOSE_PF_STATE = SCTP_EXPOSE_POTENTIALLY_FAILED_STATE
 	// SCTP_REMOTE_UDP_ENCAPS_PORT sets the peer's UDP encapsulation port
-	// (RFC 6951, updated by RFC 9899).
+	// (RFC 6951, updated by RFC 8899).
 	SCTP_REMOTE_UDP_ENCAPS_PORT = 132
 	// SCTP_PLPMTUD_PROBE_INTERVAL sets the packetization-layer path MTU
 	// discovery probe interval (RFC 8899).
 	SCTP_PLPMTUD_PROBE_INTERVAL = 133
+)
+
+// Layout of the option structs that embed a struct sockaddr_storage without
+// being declared packed.
+//
+// Most of the SCTP option structs carrying an address are
+// __attribute__((packed, aligned(4))), so their layout is the same on every
+// architecture — PeerAddrParams and PeerAddrinfo are of that kind. Four are
+// not: sctp_udpencaps, sctp_probeinterval, sctp_paddrthlds and
+// sctp_paddrthlds_v2. There the sockaddr_storage keeps its natural alignment,
+// which comes from the unsigned long inside it and so follows the word size:
+//
+//	                       linux/amd64        linux/arm, linux/mips
+//	sockaddr_storage       align 8            align 4
+//	sctp_udpencaps         144, addr@8        136, addr@4
+//	sctp_probeinterval     144, addr@8        136, addr@4
+//	sctp_paddrthlds        144, addr@8        136, addr@4
+//	sctp_paddrthlds_v2     144, addr@8        140, addr@4
+//	(sctp_paddrparams)     156, addr@4        156, addr@4
+//
+// Measured with a C probe compiled for both word sizes. This matters because
+// the package's implementation is tagged linux && !386, so linux/arm and
+// linux/mips build the real setsockopt path. sctp_setsockopt_encap_port and
+// sctp_setsockopt_probe_interval both begin by rejecting any optlen that is not
+// exactly sizeof, so a hard-coded 144 is refused outright on a 32-bit kernel —
+// and the getters only check that the length is at least sizeof, so 144 is
+// accepted there, the kernel reads the address from the wrong offset and writes
+// back 136 bytes, leaving the trailing field holding whatever the caller passed
+// in. That one is silent.
+//
+// So the offsets are derived rather than written down. Alignment of unsigned
+// long equals the pointer size on every Linux ABI Go targets, which makes
+// unsafe.Sizeof(uintptr(0)) the right source and keeps this a compile-time
+// constant with no build tags to keep in step.
+const (
+	ssAlign = unsafe.Sizeof(uintptr(0))
+	// ssAddrOffset is where the sockaddr_storage starts, after a uint32
+	// association id rounded up to that alignment.
+	ssAddrOffset = (4 + ssAlign - 1) &^ (ssAlign - 1)
+	// ssTailOffset is the first byte after the address.
+	ssTailOffset = ssAddrOffset + 128
+
+	// Total sizes, each rounded up to the struct's own alignment.
+	udpEncapsSize       = (ssTailOffset + 2 + ssAlign - 1) &^ (ssAlign - 1)
+	probeIntervalSize   = (ssTailOffset + 4 + ssAlign - 1) &^ (ssAlign - 1)
+	peerAddrThldsSize   = (ssTailOffset + 4 + ssAlign - 1) &^ (ssAlign - 1)
+	peerAddrThldsV2Size = (ssTailOffset + 6 + ssAlign - 1) &^ (ssAlign - 1)
 )
 
 // UDPEncaps mirrors struct sctp_udpencaps (RFC 6951), naming the UDP port to
@@ -271,34 +326,48 @@ const (
 // the local side to receive; this option is the remote half.
 type UDPEncaps struct {
 	AssocID SCTPAssocID
-	// struct sockaddr_storage contains a long, so C aligns it to 8 and leaves
-	// four pad bytes here — the same trap as PeerAddrThlds.
-	_ uint32
 	// Address selects the peer address. A zeroed address applies to the
 	// association as a whole.
 	Address [128]byte
 	// Port is the peer's UDP port. Zero disables encapsulation.
 	Port uint16
-	// The struct's 8-byte alignment rounds its size from 138 up to 144. Go
-	// would stop short, and the kernel rejects an undersized option.
-	_ [6]byte
+}
+
+func (e *UDPEncaps) marshal() []byte {
+	b := make([]byte, udpEncapsSize)
+	nativeEndian.PutUint32(b[0:], uint32(e.AssocID))
+	copy(b[ssAddrOffset:ssAddrOffset+128], e.Address[:])
+	nativeEndian.PutUint16(b[ssTailOffset:], e.Port)
+	return b
+}
+
+func (e *UDPEncaps) unmarshal(b []byte) {
+	e.AssocID = SCTPAssocID(nativeEndian.Uint32(b[0:]))
+	copy(e.Address[:], b[ssAddrOffset:ssAddrOffset+128])
+	e.Port = nativeEndian.Uint16(b[ssTailOffset:])
 }
 
 // SetRemoteUDPEncapsPort sets the UDP port SCTP is encapsulated in for a peer
 // address (SCTP_REMOTE_UDP_ENCAPS_PORT).
 func (c *SCTPConn) SetRemoteUDPEncapsPort(e *UDPEncaps) error {
+	b := e.marshal()
 	_, _, err := setsockopt(c.fd(), SCTP_REMOTE_UDP_ENCAPS_PORT,
-		uintptr(unsafe.Pointer(e)), unsafe.Sizeof(*e))
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return err
 }
 
 // GetRemoteUDPEncapsPort reads the peer's UDP encapsulation port. Set Address
 // on the value passed in to name a path.
 func (c *SCTPConn) GetRemoteUDPEncapsPort(e *UDPEncaps) error {
-	optlen := unsafe.Sizeof(*e)
+	b := e.marshal()
+	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_REMOTE_UDP_ENCAPS_PORT,
-		uintptr(unsafe.Pointer(e)), uintptr(unsafe.Pointer(&optlen)))
-	return err
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return err
+	}
+	e.unmarshal(b)
+	return nil
 }
 
 // ProbeInterval mirrors struct sctp_probeinterval (RFC 8899), the
@@ -308,29 +377,46 @@ func (c *SCTPConn) GetRemoteUDPEncapsPort(e *UDPEncaps) error {
 // filtered. Zero disables it, which is the default.
 type ProbeInterval struct {
 	AssocID SCTPAssocID
-	_       uint32
 	// Address selects the path; a zeroed address applies to the association.
 	Address [128]byte
 	// Interval is the probe period in milliseconds. Zero turns PLPMTUD off.
 	Interval uint32
-	// Trailing padding, as in UDPEncaps.
-	_ uint32
+}
+
+func (p *ProbeInterval) marshal() []byte {
+	b := make([]byte, probeIntervalSize)
+	nativeEndian.PutUint32(b[0:], uint32(p.AssocID))
+	copy(b[ssAddrOffset:ssAddrOffset+128], p.Address[:])
+	nativeEndian.PutUint32(b[ssTailOffset:], p.Interval)
+	return b
+}
+
+func (p *ProbeInterval) unmarshal(b []byte) {
+	p.AssocID = SCTPAssocID(nativeEndian.Uint32(b[0:]))
+	copy(p.Address[:], b[ssAddrOffset:ssAddrOffset+128])
+	p.Interval = nativeEndian.Uint32(b[ssTailOffset:])
 }
 
 // SetProbeInterval sets the PLPMTUD probe interval
 // (SCTP_PLPMTUD_PROBE_INTERVAL).
 func (c *SCTPConn) SetProbeInterval(p *ProbeInterval) error {
+	b := p.marshal()
 	_, _, err := setsockopt(c.fd(), SCTP_PLPMTUD_PROBE_INTERVAL,
-		uintptr(unsafe.Pointer(p)), unsafe.Sizeof(*p))
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return err
 }
 
 // GetProbeInterval reads the PLPMTUD probe interval.
 func (c *SCTPConn) GetProbeInterval(p *ProbeInterval) error {
-	optlen := unsafe.Sizeof(*p)
+	b := p.marshal()
+	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_PLPMTUD_PROBE_INTERVAL,
-		uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&optlen)))
-	return err
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return err
+	}
+	p.unmarshal(b)
+	return nil
 }
 
 // Stream schedulers for SetStreamScheduler, from the kernel's
@@ -356,11 +442,24 @@ const (
 // "exposed" on the value that disables it — a round-trip test still passes,
 // because the number written is the number read back.
 const (
-	// SCTPPFStateUnset leaves the decision to net.sctp.pf_expose, which
-	// defaults to disabled. This is the state of a socket nobody has asked.
+	// SCTPPFStateUnset leaves the decision to net.sctp.pf_expose, whose own
+	// default is this same value — measured, and the sysctl's floor is 0. This
+	// is the state of a socket nobody has asked.
+	//
+	// It is not the same as SCTPPFStateDisabled: at this level GetPeerAddrInfo
+	// does report SCTP_PF for a potentially-failed path. Only the notification
+	// is withheld.
 	SCTPPFStateUnset = 0
-	// SCTPPFStateDisabled suppresses the PF state. GetPeerAddrInfo reports a
-	// potentially-failed path as SCTP_ACTIVE and no notification is delivered.
+	// SCTPPFStateDisabled suppresses the PF state, and does so by refusing the
+	// question rather than by answering it differently: GetPeerAddrInfo on a
+	// path that is in the PF state returns EACCES. The SCTP_UNKNOWN to
+	// SCTP_ACTIVE fixup in the kernel happens after that check and rewrites only
+	// SCTP_UNKNOWN, so a PF path is never reported as active.
+	//
+	// That makes this the level least likely to do what a caller wants: polling
+	// path health under it starts failing at exactly the moment a path degrades,
+	// and GetPeerAddrInfo is the only way to see a secondary path at all.
+	// GetStatus is not gated, so the primary path's state stays readable.
 	SCTPPFStateDisabled = 1
 	// SCTPPFStateEnabled reports the PF state through both
 	// SCTP_PEER_ADDR_CHANGE and GetPeerAddrInfo. This is what a caller wants
@@ -420,7 +519,7 @@ const (
 	SCTPEnableChangeAssocReq = 0x04
 )
 
-// HMAC algorithm identifiers for SetHmacIdent (RFC 4895 §3.1.1 and the IANA
+// HMAC algorithm identifiers for SetHmacIdent (RFC 4895 §3.3 Table 2 and the IANA
 // registry it establishes). SHA-1 is mandatory to implement; SHA-256 is
 // optional. Note that 2 is not assigned — the registry skips it — so these are
 // not contiguous.
@@ -645,7 +744,13 @@ const (
 	// SCTP_SENDALL sends the message on every association of a one-to-many
 	// socket.
 	SCTP_SENDALL = 1 << 6
-	// SCTP_PR_SCTP_ALL applies the partial reliability policy to every stream.
+	// SCTP_PR_SCTP_ALL is not a send flag, despite living in this word. It has
+	// no effect on any send path — the kernel's only two uses of it are in
+	// sctp_getsockopt_pr_streamstatus and sctp_getsockopt_pr_assocstatus, where
+	// it asks for the counters aggregated over every PR policy rather than one
+	// (RFC 7496 §4.3 and §4.4). Setting it in SndInfo.Flags or SndRcvInfo.Flags does
+	// nothing. It is declared here because it occupies a bit in the same field;
+	// pass it to GetPrStreamStatus or GetPrAssocStatus, not to a send.
 	SCTP_PR_SCTP_ALL = 1 << 7
 
 	// SCTP_EOF starts a graceful shutdown once the message is delivered. It is
@@ -716,11 +821,6 @@ type PrStatus struct {
 // Failed state.
 type PeerAddrThlds struct {
 	AssocID SCTPAssocID
-	// struct sockaddr_storage contains a long, so C aligns it to 8 and leaves
-	// four pad bytes here. Go would place a [128]byte at offset 4 and shift
-	// every following field, so the pad is explicit. Measured with
-	// testdata/optprobe; TestStructLayoutsMatchKernel pins it.
-	_ uint32
 	// Address selects the path. A zeroed address applies to the association as
 	// a whole, which is the useful form on the single-homed sockets this
 	// package usually creates.
@@ -731,17 +831,28 @@ type PeerAddrThlds struct {
 	// PathPfThld is the count at which a path enters the Potentially Failed
 	// state, ahead of outright failure. It must not exceed PathMaxRxt.
 	PathPfThld uint16
-	// The struct's 8-byte alignment rounds its size up from 140 to 144. Go
-	// would stop at 140, and the four-byte-short option length is rejected.
-	_ uint32
+}
+
+func (t *PeerAddrThlds) marshal() []byte {
+	b := make([]byte, peerAddrThldsSize)
+	nativeEndian.PutUint32(b[0:], uint32(t.AssocID))
+	copy(b[ssAddrOffset:ssAddrOffset+128], t.Address[:])
+	nativeEndian.PutUint16(b[ssTailOffset:], t.PathMaxRxt)
+	nativeEndian.PutUint16(b[ssTailOffset+2:], t.PathPfThld)
+	return b
+}
+
+func (t *PeerAddrThlds) unmarshal(b []byte) {
+	t.AssocID = SCTPAssocID(nativeEndian.Uint32(b[0:]))
+	copy(t.Address[:], b[ssAddrOffset:ssAddrOffset+128])
+	t.PathMaxRxt = nativeEndian.Uint16(b[ssTailOffset:])
+	t.PathPfThld = nativeEndian.Uint16(b[ssTailOffset+2:])
 }
 
 // PeerAddrThldsV2 mirrors struct sctp_paddrthlds_v2, the Linux extension of
 // PeerAddrThlds with a third threshold. RFC 7829 defines only the first two.
 type PeerAddrThldsV2 struct {
 	AssocID SCTPAssocID
-	// Four pad bytes before the sockaddr_storage, as in PeerAddrThlds.
-	_ uint32
 	// Address selects the path; a zeroed address applies to the association.
 	Address [128]byte
 	// PathMaxRxt is the retransmission count at which a path is declared
@@ -750,14 +861,41 @@ type PeerAddrThldsV2 struct {
 	// PathPfThld is the count at which a path enters the Potentially Failed
 	// state.
 	PathPfThld uint16
-	// PathCpThld is the count at which the stack stops probing a path that is
-	// in the Potentially Failed state. The kernel default is 0xffff, meaning
-	// probing continues indefinitely.
+	// PathCpThld is the consecutive-error count on the primary path at which
+	// the stack makes the current active path primary instead — RFC 7829 §5
+	// Primary Path Switchover, which the kernel calls ps_retrans and exposes as
+	// net.sctp.ps_retrans.
+	//
+	// It is not a probing control. The kernel reads this value in exactly one
+	// place, where it calls sctp_assoc_set_primary; nothing consults it when
+	// deciding whether to keep heartbeating a path. The default of 0xffff
+	// therefore means switchover is disabled, not that probing is unbounded —
+	// the kernel's own comment on the default reads "Disable of Primary Path
+	// Switchover by default".
+	//
+	// Measured on a two-homed association with one path blackholed: with
+	// PathCpThld=3 the primary moved after 3 consecutive errors, well before
+	// PathMaxRxt=5 was reached, and heartbeats to the dead path carried on for
+	// thirty seconds afterwards.
 	PathCpThld uint16
-	// The struct's 8-byte alignment rounds its size up from 142 to 144. Go
-	// produces that with or without this pad, so as in DefaultPrInfo it records
-	// the C layout rather than causing the size; verified both ways.
-	_ uint16
+}
+
+func (t *PeerAddrThldsV2) marshal() []byte {
+	b := make([]byte, peerAddrThldsV2Size)
+	nativeEndian.PutUint32(b[0:], uint32(t.AssocID))
+	copy(b[ssAddrOffset:ssAddrOffset+128], t.Address[:])
+	nativeEndian.PutUint16(b[ssTailOffset:], t.PathMaxRxt)
+	nativeEndian.PutUint16(b[ssTailOffset+2:], t.PathPfThld)
+	nativeEndian.PutUint16(b[ssTailOffset+4:], t.PathCpThld)
+	return b
+}
+
+func (t *PeerAddrThldsV2) unmarshal(b []byte) {
+	t.AssocID = SCTPAssocID(nativeEndian.Uint32(b[0:]))
+	copy(t.Address[:], b[ssAddrOffset:ssAddrOffset+128])
+	t.PathMaxRxt = nativeEndian.Uint16(b[ssTailOffset:])
+	t.PathPfThld = nativeEndian.Uint16(b[ssTailOffset+2:])
+	t.PathCpThld = nativeEndian.Uint16(b[ssTailOffset+4:])
 }
 
 // AssocStats mirrors struct sctp_assoc_stats, the per-association counters
@@ -765,9 +903,16 @@ type PeerAddrThldsV2 struct {
 // the field set is the kernel's own.
 type AssocStats struct {
 	AssocID SCTPAssocID
-	// Four pad bytes before the sockaddr_storage, as in PeerAddrThlds.
-	_ uint32
 	// ObsRtoIPAddr is the path on which MaxRto was observed.
+	//
+	// This one is worth reading carefully. struct sctp_assoc_stats is 256 bytes
+	// on every architecture and its counters begin at 136 on every
+	// architecture, but the sockaddr_storage in front of them does not: it sits
+	// at offset 8 on a 64-bit kernel and at offset 4 on a 32-bit one, with the
+	// slack absorbed by padding before the counters. So the size check every
+	// getsockopt performs cannot see the difference, and neither can a test
+	// that only looks at the numbers — which is why this is unmarshalled from
+	// an offset rather than being read straight off a mirrored struct.
 	ObsRtoIPAddr [128]byte
 	// MaxRto is the largest retransmission timeout observed since the last
 	// read. Reading resets it.
@@ -792,7 +937,7 @@ type AssocStats struct {
 	OCtrlChunks, ICtrlChunks uint64
 }
 
-// AddStreamsReq mirrors struct sctp_add_streams (RFC 6525 §6.5), the request to
+// AddStreamsReq mirrors struct sctp_add_streams (RFC 6525 §6.3.4), the request to
 // widen an association's stream count. The AddStreams method wraps it; this type
 // is exported so the layout can be pinned by the layout test.
 type AddStreamsReq struct {
@@ -822,7 +967,7 @@ type AuthInfo struct {
 	KeyNumber uint16
 }
 
-// AuthKeyID mirrors struct sctp_authkeyid (RFC 4895 §6.5), naming one of the
+// AuthKeyID mirrors struct sctp_authkeyid (RFC 6458 §8.1.18), naming one of the
 // endpoint's shared keys.
 type AuthKeyID struct {
 	AssocID   SCTPAssocID
@@ -1414,6 +1559,14 @@ func NewSCTPConn(fd int, handler NotificationHandler) *SCTPConn {
 }
 
 func (c *SCTPConn) Write(b []byte) (int, error) {
+	// net.Conn's Write reports (0, nil) for an empty buffer. The kernel refuses
+	// a zero-length SCTP message with EINVAL — confirmed against it directly,
+	// so it is not an artefact of this binding — which is a fine answer for
+	// SCTPWrite and SCTPWriteInfo, where the caller asked for a message. It is
+	// the wrong answer here, where the caller asked for the net.Conn contract.
+	if len(b) == 0 {
+		return 0, nil
+	}
 	return c.SCTPWrite(b, nil)
 }
 
@@ -1891,7 +2044,7 @@ func (c *SCTPConn) SetReusePort(on bool) error {
 // SetDefaultSndInfo sets the send parameters applied to messages written without
 // their own (RFC 6458 §8.1.31).
 //
-// This is the replacement for SetDefaultSentParam: RFC 6458 §8.1.31 deprecates
+// This is the replacement for SetDefaultSentParam: RFC 6458 §8.1.13 deprecates
 // SCTP_DEFAULT_SEND_PARAM along with the struct sctp_sndrcvinfo it carries.
 // Prefer this for new code; the two write the same underlying defaults.
 //
@@ -1922,13 +2075,22 @@ func (c *SCTPConn) GetDefaultSndInfo() (*SndInfo, error) {
 }
 
 // SetAutoAsconf enables or disables announcing local address changes to the peer
-// with ASCONF chunks (RFC 6458 §8.1.21).
+// with ASCONF chunks (RFC 6458 §8.1.23).
 //
-// The option needs a bound socket: on a fresh unbound descriptor the kernel
-// rejects it with EINVAL, which was measured. That is the opposite of
-// SetReusePort, which must be set *before* bind — so a connection from DialSCTP
-// or AcceptSCTP is the right place for this one and the wrong place for that
-// one.
+// Enabling it needs a socket bound to the wildcard address, not merely a bound
+// socket. The kernel's gate is
+//
+//	if (!sctp_is_ep_boundall(sk) && *val)
+//		return -EINVAL;
+//
+// so a socket bound to a specific address is refused exactly like an unbound
+// one — measured as bound 127.0.0.1 set(1) → EINVAL, bound 0.0.0.0 set(1) → OK.
+// Disabling it is always allowed, since the gate only guards a non-zero value.
+//
+// That rules out the obvious place to call it. A listener bound to named
+// addresses, which is the ordinary multi-homing case, cannot enable this at
+// all; it has to be a wildcard bind. Contrast SetReusePort, which must be set
+// before bind.
 func (c *SCTPConn) SetAutoAsconf(on bool) error {
 	return setsockoptInt(c.fd(), SCTP_AUTO_ASCONF, on)
 }
@@ -2006,7 +2168,7 @@ func (c *SCTPConn) GetDefaultPrInfo() (*DefaultPrInfo, error) {
 }
 
 // GetPrStreamStatus reports how many messages were abandoned on one stream under
-// the given partial reliability policy (RFC 7496 §4.4).
+// the given partial reliability policy (RFC 7496 §4.3).
 //
 // It needs an established association; on a socket without one the kernel
 // returns EINVAL.
@@ -2022,7 +2184,7 @@ func (c *SCTPConn) GetPrStreamStatus(sid uint16, policy uint16) (*PrStatus, erro
 }
 
 // GetPrAssocStatus reports how many messages were abandoned across the whole
-// association under the given partial reliability policy (RFC 7496 §4.3).
+// association under the given partial reliability policy (RFC 7496 §4.4).
 //
 // This is the association-wide total; GetPrStreamStatus reports one stream. Both
 // need an established association.
@@ -2091,7 +2253,7 @@ func (c *SCTPConn) EnableStreamReset() (uint32, error) {
 }
 
 // AddStreams asks the peer to widen the association, adding inStreams inbound
-// and outStreams outbound streams (RFC 6525 §6.5).
+// and outStreams outbound streams (RFC 6525 §6.3.4).
 //
 // This needs the reconfiguration extension negotiated — SetReconfigSupported on
 // both ends before connecting — and SCTPEnableChangeAssocReq present in the mask
@@ -2178,12 +2340,12 @@ func (c *SCTPConn) ResetAssoc() error {
 }
 
 // SetAuthChunk adds one chunk type to the set this endpoint requires the peer to
-// authenticate (RFC 4895 §6.1).
+// authenticate (RFC 6458 §8.3.2).
 //
 // The option is additive and set-only: each call adds a type, and there is no
 // way to remove one or to read the set back other than LocalAuthChunks.
 //
-// RFC 4895 §6.1 says this must be set before the association is established. The
+// RFC 4895 §6.1 says the shared key must be established before it is used. The
 // kernel does not enforce that — a call on a connected socket succeeds — but the
 // requirement stands, because the set is advertised in the INIT and a later
 // addition cannot be communicated to the peer.
@@ -2197,16 +2359,19 @@ func (c *SCTPConn) SetAuthChunk(chunkType uint8) error {
 	return err
 }
 
-// SetAuthKey installs a shared key for authenticating chunks (RFC 4895 §6.3).
+// SetAuthKey installs a shared key for authenticating chunks (RFC 6458 §8.3.3).
 //
 // keyNumber names the key for SetAuthActiveKey, DeleteAuthKey and
 // DeactivateAuthKey. Key 0 is the null key every association starts with;
 // overwriting it is permitted.
 //
 // The key may not be empty: the kernel rejects a zero-length key with EINVAL
-// rather than treating it as a deletion. The upper bound measured here is 8192
-// bytes, and the kernel validates the length against the option size, so a
-// mismatch cannot make it read past the buffer.
+// rather than treating it as a deletion. The upper bound is what the length
+// field can express — sca_keylength is a __u16, and sctp_setsockopt_auth_key
+// clamps optlen to USHRT_MAX + sizeof(*authkey) for that reason — which is the
+// same 65535 the guard below applies. An earlier version of this comment
+// claimed 8192; no such bound exists. The kernel also validates the length
+// against the option size, so a mismatch cannot make it read past the buffer.
 //
 // See SetAuthActiveKey about net.sctp.auth_enable.
 func (c *SCTPConn) SetAuthKey(keyNumber uint16, key []byte) error {
@@ -2241,7 +2406,7 @@ func buildAuthKey(keyNumber uint16, key []byte) []byte {
 	return buf
 }
 
-// DeleteAuthKey removes a shared key (RFC 4895 §6.8).
+// DeleteAuthKey removes a shared key (RFC 6458 §8.3.5).
 //
 // The active key cannot be deleted — the kernel reports EINVAL — so select
 // another with SetAuthActiveKey first, or deactivate this one. A key still needed
@@ -2253,7 +2418,7 @@ func (c *SCTPConn) DeleteAuthKey(keyNumber uint16) error {
 }
 
 // DeactivateAuthKey stops a shared key being used for new packets while leaving
-// it able to verify packets already in flight (RFC 4895 §6.9).
+// it able to verify packets already in flight (RFC 6458 §8.3.4).
 //
 // This is the safe half of key rollover: deactivate, let the peer's in-flight
 // packets drain, then delete.
@@ -2272,7 +2437,7 @@ func (c *SCTPConn) authKeyOp(optname uintptr, keyNumber uint16) error {
 }
 
 // SetHmacIdent sets the HMAC algorithms this endpoint offers, most preferred
-// first (RFC 4895 §6.2).
+// first (RFC 6458 §8.1.17).
 //
 // The kernel validates the identifiers and reports EOPNOTSUPP for one it does not
 // implement — identifier 2 is unassigned in the IANA registry and is refused,
@@ -2314,46 +2479,52 @@ func buildHmacAlgo(idents []uint16) []byte {
 // which is the form to use on the single-homed sockets this package usually
 // creates.
 func (c *SCTPConn) SetPeerAddrThlds(th *PeerAddrThlds) error {
-	optlen := unsafe.Sizeof(*th)
+	b := th.marshal()
 	_, _, err := setsockopt(c.fd(), SCTP_PEER_ADDR_THLDS,
-		uintptr(unsafe.Pointer(th)), optlen)
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return err
 }
 
 // GetPeerAddrThlds reports the current per-path retransmission thresholds.
 func (c *SCTPConn) GetPeerAddrThlds() (*PeerAddrThlds, error) {
 	th := &PeerAddrThlds{}
-	optlen := unsafe.Sizeof(*th)
+	b := th.marshal()
+	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_THLDS,
-		uintptr(unsafe.Pointer(th)), uintptr(unsafe.Pointer(&optlen)))
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
 		return nil, err
 	}
+	th.unmarshal(b)
 	return th, nil
 }
 
-// SetPeerAddrThldsV2 sets the per-path thresholds including the probe cutoff that
-// SetPeerAddrThlds cannot reach.
+// SetPeerAddrThldsV2 sets the per-path thresholds including the primary path
+// switchover threshold that SetPeerAddrThlds cannot reach.
 //
-// This is a Linux extension of the RFC 7829 option: PathCpThld bounds how long a
-// path in the Potentially Failed state keeps being probed. The kernel default is
-// 0xffff, which means indefinitely.
+// This is a Linux extension of the RFC 7829 option in the sense that the option
+// number is Linux's back-compatibility device; the third threshold itself is
+// RFC 7829 §7.2's spt_pathcpthld. See PeerAddrThldsV2.PathCpThld for what it
+// does — it moves the primary path, and does not govern probing.
 func (c *SCTPConn) SetPeerAddrThldsV2(th *PeerAddrThldsV2) error {
-	optlen := unsafe.Sizeof(*th)
+	b := th.marshal()
 	_, _, err := setsockopt(c.fd(), SCTP_PEER_ADDR_THLDS_V2,
-		uintptr(unsafe.Pointer(th)), optlen)
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return err
 }
 
-// GetPeerAddrThldsV2 reports the per-path thresholds including the probe cutoff.
+// GetPeerAddrThldsV2 reports the per-path thresholds including the switchover
+// threshold.
 func (c *SCTPConn) GetPeerAddrThldsV2() (*PeerAddrThldsV2, error) {
 	th := &PeerAddrThldsV2{}
-	optlen := unsafe.Sizeof(*th)
+	b := th.marshal()
+	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_THLDS_V2,
-		uintptr(unsafe.Pointer(th)), uintptr(unsafe.Pointer(&optlen)))
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
 		return nil, err
 	}
+	th.unmarshal(b)
 	return th, nil
 }
 
@@ -2365,18 +2536,46 @@ func (c *SCTPConn) GetPeerAddrThldsV2() (*PeerAddrThldsV2, error) {
 // Reading resets AssocStats.MaxRto, so the value is the maximum observed since
 // the previous call rather than since the association began.
 func (c *SCTPConn) GetAssocStats() (*AssocStats, error) {
-	st := &AssocStats{}
-	optlen := unsafe.Sizeof(*st)
+	b := make([]byte, assocStatsSize)
+	nativeEndian.PutUint32(b[0:], 0) // the association id is the lookup key
+	optlen := uintptr(len(b))
 	_, _, err := getsockopt(c.fd(), SCTP_GET_ASSOC_STATS,
-		uintptr(unsafe.Pointer(st)), uintptr(unsafe.Pointer(&optlen)))
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
 		return nil, err
 	}
+	st := &AssocStats{}
+	st.unmarshal(b)
 	return st, nil
 }
 
+// assocStatsSize is sizeof(struct sctp_assoc_stats), which is 256 on every
+// architecture, and assocStatsCounters is where sas_maxrto begins — also fixed
+// at 136 everywhere. Only the address between them moves; see
+// AssocStats.ObsRtoIPAddr.
+const (
+	assocStatsSize     = 256
+	assocStatsCounters = 136
+)
+
+func (s *AssocStats) unmarshal(b []byte) {
+	s.AssocID = SCTPAssocID(nativeEndian.Uint32(b[0:]))
+	copy(s.ObsRtoIPAddr[:], b[ssAddrOffset:ssAddrOffset+128])
+	u := func(i int) uint64 { return nativeEndian.Uint64(b[assocStatsCounters+8*i:]) }
+	s.MaxRto = u(0)
+	s.ISacks, s.OSacks = u(1), u(2)
+	s.OPackets, s.IPackets = u(3), u(4)
+	s.RtxChunks = u(5)
+	s.OutOfSeqTsns = u(6)
+	s.IDupChunks = u(7)
+	s.GapCnt = u(8)
+	s.OUodChunks, s.IUodChunks = u(9), u(10)
+	s.OOdChunks, s.IOdChunks = u(11), u(12)
+	s.OCtrlChunks, s.ICtrlChunks = u(13), u(14)
+}
+
 // SetAuthActiveKey selects which shared key signs outbound AUTH chunks
-// (RFC 4895 §6.5).
+// (RFC 6458 §8.1.18).
 //
 // The whole SCTP_AUTH_* family needs AUTH negotiated on the socket, and on a
 // stock kernel it is not. With it off every one of these calls fails with
@@ -2411,7 +2610,7 @@ func (c *SCTPConn) AuthActiveKey() (uint16, error) {
 }
 
 // HmacIdent reports the HMAC algorithms this endpoint offers, in preference
-// order (RFC 4895 §6.2).
+// order (RFC 6458 §8.1.17).
 //
 // See SetAuthActiveKey about net.sctp.auth_enable.
 func (c *SCTPConn) HmacIdent() ([]uint16, error) {
@@ -2457,7 +2656,7 @@ func parseHmacIdents(buf []byte, optlen int) ([]uint16, error) {
 }
 
 // LocalAuthChunks reports the chunk types this endpoint requires the peer to
-// authenticate (RFC 4895 §6.7).
+// authenticate (RFC 6458 §8.2.4).
 //
 // See SetAuthActiveKey about net.sctp.auth_enable.
 func (c *SCTPConn) LocalAuthChunks() ([]uint8, error) {
@@ -2465,7 +2664,7 @@ func (c *SCTPConn) LocalAuthChunks() ([]uint8, error) {
 }
 
 // PeerAuthChunks reports the chunk types the peer requires this endpoint to
-// authenticate (RFC 4895 §6.6).
+// authenticate (RFC 6458 §8.2.3).
 //
 // It needs an established association: without one the kernel returns EINVAL,
 // since there is no peer to have told us anything. See SetAuthActiveKey about
@@ -2677,6 +2876,11 @@ func (c *SCTPConn) GetPeerAddrParams(p *PeerAddrParams) error {
 // time is, or what congestion window they have.
 //
 // Set Address on the value passed in to name the path; the rest is filled in.
+//
+// It returns EACCES for a path that is in the PF state when the association's
+// PF exposure level is SCTPPFStateDisabled — the kernel refuses the question
+// rather than answering it. That is the one combination where this call starts
+// failing precisely when a path degrades; see SCTPPFStateDisabled.
 func (c *SCTPConn) GetPeerAddrInfo(info *PeerAddrinfo) error {
 	optlen := unsafe.Sizeof(*info)
 	_, _, err := getsockopt(c.fd(), SCTP_GET_PEER_ADDR_INFO,
@@ -2685,7 +2889,7 @@ func (c *SCTPConn) GetPeerAddrInfo(info *PeerAddrinfo) error {
 }
 
 // SetAdaptationLayer announces an adaptation layer indication to the peer
-// (SCTP_ADAPTATION_LAYER, RFC 6458 §8.1.11).
+// (SCTP_ADAPTATION_LAYER, RFC 6458 §8.1.10).
 //
 // The value is opaque to SCTP and is carried in the INIT, so it must be set
 // before the association is established to reach the peer. The other direction
@@ -2709,7 +2913,7 @@ func (c *SCTPConn) GetAdaptationLayer() (uint32, error) {
 }
 
 // SetDisableFragments controls whether a message larger than the path MTU is
-// fragmented (SCTP_DISABLE_FRAGMENTS, RFC 6458 §8.1.5).
+// fragmented (SCTP_DISABLE_FRAGMENTS, RFC 6458 §8.1.11).
 //
 // With fragmentation off, a message that does not fit is refused with
 // EMSGSIZE rather than split. That is what a caller wants when the peer is a
@@ -2828,6 +3032,14 @@ func (c *SCTPConn) InterleavingSupported() (bool, error) {
 // rejects only a value above SCTPPFStateEnabled, with EINVAL, and has no locked
 // state. An earlier version of this comment said otherwise; that was not
 // measured, and the kernel has no such path.
+//
+// Only SCTPPFStateEnabled delivers SCTP_ADDR_POTENTIALLY_FAILED: the kernel
+// suppresses the notification at both other levels. The levels differ in what
+// GetPeerAddrInfo does, not in what it reports —
+//
+//	SCTPPFStateUnset     GetPeerAddrInfo reports SCTP_PF, no notification
+//	SCTPPFStateDisabled  GetPeerAddrInfo returns EACCES, no notification
+//	SCTPPFStateEnabled   GetPeerAddrInfo reports SCTP_PF, notification delivered
 func (c *SCTPConn) SetExposePotentiallyFailed(level uint32) error {
 	return setAssocValue(c.fd(), SCTP_EXPOSE_POTENTIALLY_FAILED_STATE, level)
 }
@@ -3124,7 +3336,18 @@ func (c *SCTPConn) SCTPGetPrimaryPeerAddr() (*SCTPAddr, error) {
 // see which path was primary but not say which one should be. addr must be one
 // the peer announced — GetPeerAddrs lists them — and the kernel rejects
 // anything else with EINVAL.
+//
+// addr must name exactly one address, and this returns EINVAL otherwise. The
+// option carries a single sockaddr, so a multi-address SCTPAddr used to be
+// accepted and silently applied to whichever address marshalled first: measured
+// on a two-homed association, passing the peer's full address returned nil and
+// moved the primary to a path the caller had not asked for. That shape is easy
+// to reach by accident, since RemoteAddr and SCTPRemoteAddr both return one
+// *SCTPAddr carrying every address the peer has.
 func (c *SCTPConn) SetPrimaryPeerAddr(addr *SCTPAddr) error {
+	if len(addr.IPAddrs) != 1 {
+		return syscall.EINVAL
+	}
 	param := sctpGetSetPrim{}
 	raw := addr.ToRawSockAddrBuf()
 	if len(raw) > len(param.addrs) {
@@ -3137,7 +3360,7 @@ func (c *SCTPConn) SetPrimaryPeerAddr(addr *SCTPAddr) error {
 }
 
 // SetPeerPrimaryAddr asks the peer to make addr its primary destination
-// (SCTP_SET_PEER_PRIMARY_ADDR, RFC 6458 §8.1.10).
+// (SCTP_SET_PEER_PRIMARY_ADDR, RFC 6458 §8.3.1).
 //
 // This is the other direction from SetPrimaryPeerAddr: that one chooses where
 // this endpoint sends, while this one asks the peer to change where it sends.
@@ -3145,7 +3368,13 @@ func (c *SCTPConn) SetPrimaryPeerAddr(addr *SCTPAddr) error {
 // see SetAsconfSupported, without which the kernel refuses with EPERM because
 // net.sctp.addip_enable defaults to 0. addr must be one of this endpoint's own
 // bound addresses.
+//
+// As with SetPrimaryPeerAddr, addr must name exactly one address; anything else
+// returns EINVAL rather than being narrowed to the first silently.
 func (c *SCTPConn) SetPeerPrimaryAddr(addr *SCTPAddr) error {
+	if len(addr.IPAddrs) != 1 {
+		return syscall.EINVAL
+	}
 	param := sctpGetSetPrim{}
 	raw := addr.ToRawSockAddrBuf()
 	if len(raw) > len(param.addrs) {

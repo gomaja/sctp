@@ -506,33 +506,207 @@ func TestSendFlagsMatchTheKernel(t *testing.T) {
 	}
 }
 
-// TestUDPEncapsAndProbeIntervalLayout pins the last two option structs.
+// TestSockaddrStorageOptionLayouts pins the four option structs whose layout
+// depends on the word size.
 //
-// Both put a sockaddr_storage after a 32-bit association id, which C aligns to
-// 8 — so there are four pad bytes Go would not insert, and the struct's own
-// 8-byte alignment rounds its size from 138 and 140 up to 144. Getting either
-// wrong means an undersized option length, which the kernel rejects outright.
-func TestUDPEncapsAndProbeIntervalLayout(t *testing.T) {
-	var e UDPEncaps
-	if got := unsafe.Sizeof(e); got != 144 {
-		t.Errorf("sizeof(UDPEncaps) = %d, kernel's sctp_udpencaps is 144", got)
+// Most of the SCTP option structs carrying an address are declared
+// packed, aligned(4), so they are identical everywhere. These four are not, and
+// their sockaddr_storage keeps its natural alignment — which comes from the
+// unsigned long inside it and so follows the pointer size. Measured with a C
+// probe compiled for both:
+//
+//	                      linux/amd64      linux/arm/v7
+//	sockaddr_storage      align 8          align 4
+//	sctp_udpencaps        144, addr@8      136, addr@4
+//	sctp_probeinterval    144, addr@8      136, addr@4
+//	sctp_paddrthlds       144, addr@8      136, addr@4
+//	sctp_paddrthlds_v2    144, addr@8      140, addr@4
+//
+// The previous version of this test asserted the 64-bit numbers unconditionally,
+// so it passed on the development host and could never see the 32-bit case —
+// while the package's implementation is tagged linux && !386 and so builds for
+// linux/arm and linux/mips. The setters demand an exact optlen and would be
+// refused there; the getters accept an oversized one and come back with the
+// address read from the wrong offset and the trailing field untouched, which is
+// silent.
+func TestSockaddrStorageOptionLayouts(t *testing.T) {
+	wantAddr := uintptr(8)
+	sizes := map[string]uintptr{
+		"sctp_udpencaps": 144, "sctp_probeinterval": 144,
+		"sctp_paddrthlds": 144, "sctp_paddrthlds_v2": 144,
 	}
-	if got := unsafe.Offsetof(e.Address); got != 8 {
-		t.Errorf("UDPEncaps.Address at %d, kernel has sue_address at 8", got)
-	}
-	if got := unsafe.Offsetof(e.Port); got != 136 {
-		t.Errorf("UDPEncaps.Port at %d, kernel has sue_port at 136", got)
+	if unsafe.Sizeof(uintptr(0)) == 4 {
+		wantAddr = 4
+		sizes = map[string]uintptr{
+			"sctp_udpencaps": 136, "sctp_probeinterval": 136,
+			"sctp_paddrthlds": 136, "sctp_paddrthlds_v2": 140,
+		}
 	}
 
-	var p ProbeInterval
-	if got := unsafe.Sizeof(p); got != 144 {
-		t.Errorf("sizeof(ProbeInterval) = %d, kernel's sctp_probeinterval is 144", got)
+	if ssAddrOffset != wantAddr {
+		t.Errorf("ssAddrOffset = %d, want %d on a %d-bit target",
+			ssAddrOffset, wantAddr, unsafe.Sizeof(uintptr(0))*8)
 	}
-	if got := unsafe.Offsetof(p.Address); got != 8 {
-		t.Errorf("ProbeInterval.Address at %d, kernel has spi_address at 8", got)
+	if ssTailOffset != wantAddr+128 {
+		t.Errorf("ssTailOffset = %d, want %d", ssTailOffset, wantAddr+128)
 	}
-	if got := unsafe.Offsetof(p.Interval); got != 136 {
-		t.Errorf("ProbeInterval.Interval at %d, kernel has spi_interval at 136", got)
+
+	for _, tc := range []struct {
+		name string
+		got  uintptr
+	}{
+		{"sctp_udpencaps", udpEncapsSize},
+		{"sctp_probeinterval", probeIntervalSize},
+		{"sctp_paddrthlds", peerAddrThldsSize},
+		{"sctp_paddrthlds_v2", peerAddrThldsV2Size},
+	} {
+		if want := sizes[tc.name]; tc.got != want {
+			t.Errorf("%s marshalled size = %d, kernel struct is %d on this target",
+				tc.name, tc.got, want)
+		}
+	}
+
+	// The marshalled buffers must be exactly those sizes: the setters pass
+	// len(b) as the option length, and every one of these options begins by
+	// rejecting an optlen that is not exactly sizeof.
+	for _, tc := range []struct {
+		name string
+		got  int
+	}{
+		{"sctp_udpencaps", len((&UDPEncaps{}).marshal())},
+		{"sctp_probeinterval", len((&ProbeInterval{}).marshal())},
+		{"sctp_paddrthlds", len((&PeerAddrThlds{}).marshal())},
+		{"sctp_paddrthlds_v2", len((&PeerAddrThldsV2{}).marshal())},
+	} {
+		if want := int(sizes[tc.name]); tc.got != want {
+			t.Errorf("%s marshal() produced %d bytes, want %d", tc.name, tc.got, want)
+		}
+	}
+}
+
+// TestSockaddrStorageLayoutFormula checks the arithmetic that derives the
+// offsets against the C measurements, for both word sizes at once.
+//
+// TestSockaddrStorageOptionLayouts can only ever assert the target it was
+// compiled for, so on a 64-bit host it cannot tell ssAlign = 8 from
+// ssAlign = unsafe.Sizeof(uintptr(0)) — mutation confirms exactly that: pinning
+// the alignment to 8 survives on amd64 and fails on arm. This recomputes the
+// same formula for both alignments so at least a mistake in the formula is
+// caught anywhere, and the numbers below are the C ones.
+func TestSockaddrStorageLayoutFormula(t *testing.T) {
+	// Measured with a C probe over <linux/sctp.h>, compiled for linux/amd64 and
+	// linux/arm/v7.
+	for _, tc := range []struct {
+		align, addr, tail          uintptr
+		udp, probe, thlds, thldsV2 uintptr
+	}{
+		{align: 4, addr: 4, tail: 132, udp: 136, probe: 136, thlds: 136, thldsV2: 140},
+		{align: 8, addr: 8, tail: 136, udp: 144, probe: 144, thlds: 144, thldsV2: 144},
+	} {
+		round := func(n uintptr) uintptr { return (n + tc.align - 1) &^ (tc.align - 1) }
+		addr := round(4)
+		tail := addr + 128
+		got := []struct {
+			name      string
+			got, want uintptr
+		}{
+			{"address offset", addr, tc.addr},
+			{"tail offset", tail, tc.tail},
+			{"sctp_udpencaps", round(tail + 2), tc.udp},
+			{"sctp_probeinterval", round(tail + 4), tc.probe},
+			{"sctp_paddrthlds", round(tail + 4), tc.thlds},
+			{"sctp_paddrthlds_v2", round(tail + 6), tc.thldsV2},
+		}
+		for _, g := range got {
+			if g.got != g.want {
+				t.Errorf("align %d: %s = %d, kernel has %d", tc.align, g.name, g.got, g.want)
+			}
+		}
+
+		// And the constants the package actually uses must agree with the row
+		// matching this build.
+		if tc.align != ssAlign {
+			continue
+		}
+		for _, g := range got {
+			switch g.name {
+			case "address offset":
+				if ssAddrOffset != g.want {
+					t.Errorf("ssAddrOffset = %d, want %d", ssAddrOffset, g.want)
+				}
+			case "sctp_udpencaps":
+				if udpEncapsSize != g.want {
+					t.Errorf("udpEncapsSize = %d, want %d", udpEncapsSize, g.want)
+				}
+			case "sctp_paddrthlds_v2":
+				if peerAddrThldsV2Size != g.want {
+					t.Errorf("peerAddrThldsV2Size = %d, want %d", peerAddrThldsV2Size, g.want)
+				}
+			}
+		}
+	}
+}
+
+// TestSockaddrStorageOptionsRoundTripThroughBytes checks each marshaller against
+// its own unmarshaller, with a distinct value per field.
+//
+// The offsets are derived rather than written down, so a mistake shifts every
+// field after the address at once — which a single-field check would miss on
+// whichever field happened to stay put.
+func TestSockaddrStorageOptionsRoundTripThroughBytes(t *testing.T) {
+	var addr [128]byte
+	for i := range addr {
+		addr[i] = byte(i)
+	}
+
+	t.Run("UDPEncaps", func(t *testing.T) {
+		in := UDPEncaps{AssocID: 0x11223344, Address: addr, Port: 0x5566}
+		var out UDPEncaps
+		out.unmarshal(in.marshal())
+		if out != in {
+			t.Errorf("round trip changed the value:\n got %+v\nwant %+v", out.Port, in.Port)
+		}
+	})
+	t.Run("ProbeInterval", func(t *testing.T) {
+		in := ProbeInterval{AssocID: 0x11223344, Address: addr, Interval: 0x55667788}
+		var out ProbeInterval
+		out.unmarshal(in.marshal())
+		if out != in {
+			t.Errorf("round trip changed the value: interval %#x, want %#x",
+				out.Interval, in.Interval)
+		}
+	})
+	t.Run("PeerAddrThlds", func(t *testing.T) {
+		in := PeerAddrThlds{AssocID: 0x11223344, Address: addr, PathMaxRxt: 0x5566, PathPfThld: 0x7788}
+		var out PeerAddrThlds
+		out.unmarshal(in.marshal())
+		if out != in {
+			t.Errorf("round trip changed the value: maxrxt %#x pf %#x, want %#x %#x",
+				out.PathMaxRxt, out.PathPfThld, in.PathMaxRxt, in.PathPfThld)
+		}
+	})
+	t.Run("PeerAddrThldsV2", func(t *testing.T) {
+		in := PeerAddrThldsV2{AssocID: 0x11223344, Address: addr,
+			PathMaxRxt: 0x5566, PathPfThld: 0x7788, PathCpThld: 0x99AA}
+		var out PeerAddrThldsV2
+		out.unmarshal(in.marshal())
+		if out != in {
+			t.Errorf("round trip changed the value: maxrxt %#x pf %#x cp %#x, want %#x %#x %#x",
+				out.PathMaxRxt, out.PathPfThld, out.PathCpThld,
+				in.PathMaxRxt, in.PathPfThld, in.PathCpThld)
+		}
+	})
+
+	// The address must land where the kernel expects it, not merely somewhere
+	// consistent — a round trip alone would pass with every offset wrong by the
+	// same amount.
+	b := (&UDPEncaps{Address: addr, Port: 0x5566}).marshal()
+	if b[ssAddrOffset] != 0 || b[ssAddrOffset+1] != 1 {
+		t.Errorf("address does not start at offset %d: bytes there are %#x %#x",
+			ssAddrOffset, b[ssAddrOffset], b[ssAddrOffset+1])
+	}
+	if nativeEndian.Uint16(b[ssTailOffset:]) != 0x5566 {
+		t.Errorf("port is not at offset %d", ssTailOffset)
 	}
 }
 
