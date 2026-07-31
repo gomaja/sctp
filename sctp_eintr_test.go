@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -375,13 +376,107 @@ func TestDialNeverReturnsAnUnestablishedAssociation(t *testing.T) {
 	}
 }
 
-// TestSCTPReadRetriesEINTRUnderLoad is the direct regression test for the
-// failure the scale probe produced: many concurrent associations, each doing a
-// blocking read, with signals delivered throughout.
+// TestSCTPReadRetriesEINTRDeterministically drives EINTR directly rather than
+// hoping for it.
+//
+// The load-based test below asserts that no read failed with EINTR across sixty
+// peers — but readFlags' own comment records that EINTR appears at a thousand
+// simultaneous peers and never at a hundred, so at sixty the count is zero
+// whether the retry is there or not. Measured: deleting the retry leaves that
+// test passing in 0.13s. It documents the scenario; it does not test the fix.
+//
+// This one makes the signal arrive on purpose. The reader is pinned to an OS
+// thread so its thread id is stable, then SIGURG — the same signal the runtime
+// uses for preemption — is delivered to that thread while it is blocked in
+// recvmsg.
+//
+// The read deadline is what makes this work. Go installs its handlers with
+// SA_RESTART, so an interrupted recvmsg would normally be restarted by the
+// kernel and never surface EINTR at all; a socket carrying SO_RCVTIMEO is the
+// exception, since restarting a call with a timeout would restart the timeout
+// with it. That is also the production shape: the deadline path is where an
+// interrupted read is observable.
+func TestSCTPReadRetriesEINTRDeterministically(t *testing.T) {
+	client, server := eorPair(t)
+
+	// Long enough that the deadline itself cannot end the read, short enough
+	// that a hung test still finishes.
+	if err := server.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	tidCh := make(chan int, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		tidCh <- syscall.Gettid()
+
+		buf := make([]byte, 64)
+		n, err := server.Read(buf)
+		if err == nil {
+			done <- result{n, nil}
+			return
+		}
+		done <- result{n, err}
+	}()
+
+	tid := <-tidCh
+	pid := syscall.Getpid()
+
+	// Give the reader time to reach recvmsg, then interrupt it repeatedly.
+	// Several signals rather than one: the first may land before the syscall
+	// is entered.
+	time.Sleep(200 * time.Millisecond)
+	for i := 0; i < 20; i++ {
+		if err := syscall.Tgkill(pid, tid, syscall.SIGURG); err != nil {
+			t.Fatalf("tgkill: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+		select {
+		case r := <-done:
+			t.Fatalf("read returned after %d signals with no data written: "+
+				"n=%d err=%v; an interrupted read must be retried, not reported",
+				i+1, r.n, r.err)
+		default:
+		}
+	}
+
+	// Still blocked, which is the point. Now let it complete.
+	const payload = "survived"
+	if _, err := client.Write([]byte(payload)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("read failed with %v after being signalled; EINTR must be "+
+				"retried inside the read path", r.err)
+		}
+		if r.n != len(payload) {
+			t.Errorf("read %d bytes, want %d", r.n, len(payload))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("read never completed after the peer wrote")
+	}
+}
+
+// TestSCTPReadRetriesEINTRUnderLoad is the scenario the failure was first seen
+// in: many concurrent associations, each doing a blocking read, with signals
+// delivered throughout.
 //
 // It is the closest in-process reproduction of a real server under load, where
 // the Go runtime's own preemption supplies the signals without any test having
-// to send them.
+// to send them — but sixty peers is well below the thousand at which that
+// actually happens, so it is a scenario test rather than a regression test.
+// TestSCTPReadRetriesEINTRDeterministically above is the one that fails when the
+// retry is removed.
 func TestSCTPReadRetriesEINTRUnderLoad(t *testing.T) {
 	if testing.Short() {
 		t.Skip("scale test; skipped under -short")

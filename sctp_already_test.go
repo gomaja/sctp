@@ -157,6 +157,14 @@ func TestSCTPConnectEALREADYOnBlockingSocket(t *testing.T) {
 // Detection is by measurement rather than by inspecting firewall rules: a single
 // non-blocking connect either reports EINPROGRESS, meaning the INIT went
 // unanswered, or ECONNREFUSED, meaning something replied.
+//
+// The immediate return is not enough on its own. A gateway that answers with an
+// ICMP unreachable a few milliseconds later still lets the connect report
+// EINPROGRESS first, so checking only that says "blackholed" for a peer that is
+// about to refuse — and the tests this guards then fail on a surprising errno
+// instead of skipping. Measured in Docker, where the gateway sends ICMP protocol
+// unreachable and the socket ends up with ENOPROTOOPT in SO_ERROR. So the reply
+// is given a moment to arrive and SO_ERROR is consulted before answering.
 func blackholeAvailable(t *testing.T) bool {
 	t.Helper()
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM,
@@ -168,8 +176,26 @@ func blackholeAvailable(t *testing.T) bool {
 	if err := syscall.SetNonblock(fd, true); err != nil {
 		t.Fatalf("SetNonblock: %v", err)
 	}
-	_, err = SCTPConnect(fd, unreachableAddr())
-	return errors.Is(err, syscall.EINPROGRESS)
+	if _, err = SCTPConnect(fd, unreachableAddr()); !errors.Is(err, syscall.EINPROGRESS) {
+		return false
+	}
+
+	// Poll SO_ERROR briefly. A blackholed address leaves it at zero for the
+	// whole retransmission window; a refusal lands within a few milliseconds.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		soerr, gerr := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_ERROR)
+		if gerr != nil {
+			return false
+		}
+		if soerr != 0 {
+			t.Logf("192.0.2.1 answered with errno %d (%v) rather than dropping "+
+				"the INIT", soerr, syscall.Errno(soerr))
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return true
 }
 
 // TestSCTPConnectEALREADYOnBlockingSocketMidHandshake is the test that gives the

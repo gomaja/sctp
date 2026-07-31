@@ -484,6 +484,9 @@ func (c *SCTPConn) SCTPWrite(b []byte, info *SndRcvInfo) (int, error) {
 const sendFlags = syscall.MSG_DONTWAIT | syscall.MSG_NOSIGNAL
 
 func (c *SCTPConn) sendmsg(b, cbuf []byte) (int, error) {
+	if c.fd() < 0 {
+		return 0, errClosed("write")
+	}
 	deadline := atomic.LoadInt64(&c.writeDeadline)
 	if deadline == 0 {
 		return syscall.SendmsgN(c.fd(), b, cbuf, nil, sendFlags)
@@ -787,6 +790,26 @@ func (c *SCTPConn) SCTPReadFlags(b []byte) (int, *SndRcvInfo, int, error) {
 // connection, and the second is a race as soon as two goroutines read.
 // Passing nil keeps the ordinary path from walking the control buffer twice.
 func (c *SCTPConn) readFlags(b []byte, nxt **NxtInfo) (int, *SndRcvInfo, int, error) {
+	// An empty buffer must not touch the stream. recvmsg substitutes a
+	// one-byte scratch iovec when the data buffer is empty and the control
+	// buffer is not — correct for a genuine control-only receive, and the
+	// control buffer here is never empty. So without this the kernel dequeued a
+	// payload byte into a package-local variable and reported n=1: Read
+	// returned more than len(b), which io.Reader forbids, and the byte was
+	// gone. Measured with eight bytes queued, Read(nil) returned 1 and the next
+	// read returned "BCDEFGH".
+	//
+	// It is not only Read(nil) that gets here. The ordinary framing loop reads
+	// into b[total:], which is empty the moment the buffer fills, so the next
+	// line — b[:total] — panicked on a slice grown past its own capacity.
+	if len(b) == 0 {
+		return 0, nil, 0, nil
+	}
+
+	if c.fd() < 0 {
+		return 0, nil, 0, errClosed("read")
+	}
+
 	// The control buffer is pooled rather than allocated per call. This is only
 	// safe because parseSndRcvInfo copies: it used to return a pointer into
 	// this buffer and byte-swap PPID in place, so reusing the buffer would have
@@ -867,6 +890,22 @@ func (c *SCTPConn) readFlags(b []byte, nxt **NxtInfo) (int, *SndRcvInfo, int, er
 			return n, info, recvflags, err
 		}
 	}
+}
+
+// errClosed is the error for an operation on a connection or listener whose
+// descriptor this package has already released.
+//
+// net documents errors.Is(err, net.ErrClosed) as the way to recognise this, and
+// the ordinary shutdown loop is written around it. Returning the kernel's bare
+// EBADF meant that test was always false, so the loop never matched and logged
+// the errno as an unexpected failure instead of exiting.
+//
+// It is reported from the descriptor being -1, which only this package's own
+// Close does. A descriptor closed by someone else between the check and the
+// syscall still surfaces as EBADF, which is the truthful answer for a socket
+// this package did not close.
+func errClosed(op string) error {
+	return &net.OpError{Op: op, Net: "sctp", Err: net.ErrClosed}
 }
 
 // oobPool holds the per-read control-message buffers.
@@ -1195,6 +1234,27 @@ func abortSctpSocket(fd int) error {
 	// send an ABORT chunk instead of SHUTDOWN when closing.
 	lerr := syscall.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER,
 		&syscall.Linger{Onoff: 1, Linger: 0})
+
+	// Closing the descriptor is not enough to end the association while another
+	// goroutine is parked in recvmsg. The blocked call holds a reference to the
+	// struct file, so close only unhooks the descriptor number and defers the
+	// final release; sctp_close never runs, the SO_LINGER ABORT is never put on
+	// the wire, and the association stays up — with Abort having returned nil
+	// in tens of microseconds. Measured: no ABORT chunk in seven seconds of
+	// capture, both ends still listed in /proc/net/sctp/assocs, and the parked
+	// reader still blocked. The graceful path never had this problem because it
+	// calls shutdown first.
+	//
+	// SHUT_RD rather than SHUT_RDWR: it sets RCV_SHUTDOWN and wakes the waiter
+	// without asking for a graceful teardown, so the ABORT is still what
+	// reaches the peer. sctp_shutdown only emits a SHUTDOWN chunk for
+	// SEND_SHUTDOWN.
+	//
+	// The error is deliberately dropped. A descriptor with no association —
+	// which is every socket this is called on that never connected — answers
+	// ENOTCONN, and that is not a reason to skip the close.
+	_ = syscall.Shutdown(fd, syscall.SHUT_RD)
+
 	if err := syscall.Close(fd); err != nil {
 		return err
 	}
@@ -1326,6 +1386,10 @@ func FileListener(file *os.File) (*SCTPListener, error) {
 	// listeners. Namely, its Accept methods will block until a connection is
 	// available.
 	if err := syscall.SetNonblock(int(r1), false); err != nil {
+		// The dup succeeded, so this owns r1 and must release it before
+		// reporting the failure. Returning without the close leaks a
+		// descriptor on the one path here that can fail after the dup.
+		_ = syscall.Close(int(r1))
 		return nil, os.NewSyscallError("fcntl", err)
 	}
 
@@ -1389,13 +1453,42 @@ func (ln *SCTPListener) AcceptSCTP() (*SCTPConn, error) {
 			}
 			return nil, err
 		}
+		// The accepted socket inherits the listener's receive timeout, which is
+		// how the accept deadline is implemented: sctp_copy_sock copies
+		// sk_rcvtimeo onto the socket the kernel creates for the association.
+		// So a listener polled with a short deadline — the ordinary idiom for
+		// noticing a shutdown flag between accepts — hands out connections that
+		// are already armed to time out, and the SCTPConn wrapping this
+		// descriptor records no deadline, so the read path's corrective
+		// applyTimeout never runs and the caller gets a bare EAGAIN rather than
+		// os.ErrDeadlineExceeded. Measured at 309ms against a 300ms accept
+		// window on a connection that never had a deadline of its own.
+		//
+		// Cleared unconditionally rather than only when a deadline is currently
+		// programmed: a concurrent SetDeadline can arm the listener between the
+		// check above and accept4 returning, and one setsockopt is not worth a
+		// race against the association setup that just completed.
+		if err := applyTimeout(fd, syscall.SO_RCVTIMEO, 0); err != nil {
+			_ = syscall.Close(fd)
+			return nil, err
+		}
 		return NewSCTPConn(fd, ln.notificationHandler), nil
 	}
 }
 
-// Accept waits for and returns the next connection connection to the listener.
+// Accept waits for and returns the next connection to the listener.
 func (ln *SCTPListener) Accept() (net.Conn, error) {
-	return ln.AcceptSCTP()
+	// Converted explicitly rather than returned straight through. A nil
+	// *SCTPConn assigned to a net.Conn keeps its type word, so the result
+	// compares unequal to nil and the idiomatic `if conn != nil` on an accept
+	// failure is true — after which any use of it panics in (*SCTPConn).fd.
+	// net.TCPListener.Accept does the same for the same reason, and an accept
+	// deadline expiring is enough to reach it.
+	c, err := ln.AcceptSCTP()
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // Close releases the listening socket.

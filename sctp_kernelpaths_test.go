@@ -262,8 +262,17 @@ func TestSetPeerPrimaryAddrNeedsAsconf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SCTPLocalAddr: %v", err)
 	}
+	// One address, not the whole set. The dialer binds the wildcard, so
+	// SCTPLocalAddr returns every address the host has — and the option names a
+	// single path, so passing all of them is rejected. This test used to do
+	// exactly that and reach the kernel anyway, because only the first sockaddr
+	// was ever read.
+	if len(local.IPAddrs) == 0 {
+		t.Fatal("no local addresses")
+	}
+	one := &SCTPAddr{IPAddrs: local.IPAddrs[:1], Port: local.Port}
 
-	err = client.SetPeerPrimaryAddr(local)
+	err = client.SetPeerPrimaryAddr(one)
 	if err == nil {
 		// Fine if the host has addip_enable on; the call is then meaningful.
 		t.Log("SetPeerPrimaryAddr succeeded; net.sctp.addip_enable is on here")
@@ -496,6 +505,16 @@ func TestReconfigurationEventsDecodeFromKernelBytes(t *testing.T) {
 	t.Run("stream change from AddStreams", func(t *testing.T) {
 		// Asymmetric counts, so a decoder that swapped the two fields shows.
 		const addIn, addOut = 1, 3
+		// What the requesting side is told. Measured: inbound=0, outbound=3
+		// after AddStreams(1, 3) — the kernel reports the outbound streams it
+		// added and leaves strchange_instrms at zero here, since the inbound
+		// side of the request is the peer's to grant.
+		//
+		// Both values matter. A decoder with the two fields swapped produces
+		// inbound=3, outbound=0, which the previous "outbound > inbound"
+		// assertion could not see: with instrms always 0 it reduced to
+		// "outbound > 0".
+		const wantIn, wantOut = 0, addOut
 		if err := client.AddStreams(addIn, addOut); err != nil {
 			t.Skipf("AddStreams: %v", err)
 		}
@@ -512,10 +531,14 @@ func TestReconfigurationEventsDecodeFromKernelBytes(t *testing.T) {
 				"what is under test", sc.Flags())
 			return
 		}
-		if sc.OutboundStreams <= sc.InboundStreams {
-			t.Errorf("outbound=%d inbound=%d after adding %d in and %d out; "+
-				"asymmetric counts came back the wrong way round",
-				sc.OutboundStreams, sc.InboundStreams, addIn, addOut)
+		// Exact values, not just an ordering. On the requesting side the
+		// kernel reports the counts it added, and strchange_instrms is 0
+		// there — so "outbound > inbound" reduces to "outbound > 0" and a
+		// decoder with the two fields swapped survives it.
+		if sc.InboundStreams != wantIn || sc.OutboundStreams != wantOut {
+			t.Errorf("stream change reports inbound=%d outbound=%d, want %d/%d "+
+				"after AddStreams(%d, %d)",
+				sc.InboundStreams, sc.OutboundStreams, wantIn, wantOut, addIn, addOut)
 		}
 	})
 

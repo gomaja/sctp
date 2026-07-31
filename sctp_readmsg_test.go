@@ -169,40 +169,54 @@ func TestReadMsgOneOverMax(t *testing.T) {
 	}
 }
 
-// TestReadMsgZeroLengthMessage verifies an empty SCTP message is delivered as
-// an empty message and not mistaken for EOF.
-func TestReadMsgZeroLengthMessage(t *testing.T) {
+// TestZeroLengthSendIsRefusedByTheKernel pins what actually happens when a
+// caller asks to send an empty message.
+//
+// This used to be TestReadMsgZeroLengthMessage, which set out to check that an
+// empty message is delivered as one rather than mistaken for EOF — and opened
+// with a guard that skipped when the write was refused. The write is always
+// refused: sctp_sendmsg rejects a zero-length message with EINVAL, so the body
+// had never run on Linux, in the documented harness or anywhere else. Unlike
+// the two AUTH skips, no second pass reached it either. A test that cannot run
+// is not coverage, so it now asserts the contract that exists.
+//
+// SCTPWrite and SCTPWriteInfo pass the kernel's answer through: a caller asking
+// for a zero-length SCTP message asked for something specific and is entitled to
+// be told it is not available. Conn.Write is the one held to the net.Conn
+// contract instead — see TestWriteWithZeroLengthBufferIsANoOp.
+func TestZeroLengthSendIsRefusedByTheKernel(t *testing.T) {
 	client, server := eorPair(t)
 
-	if _, err := client.SCTPWrite([]byte{}, nil); err != nil {
-		t.Skipf("zero-length write not accepted: %v", err)
+	for _, tc := range []struct {
+		name string
+		call func() (int, error)
+	}{
+		{"SCTPWrite empty slice", func() (int, error) { return client.SCTPWrite([]byte{}, nil) }},
+		{"SCTPWrite nil", func() (int, error) { return client.SCTPWrite(nil, nil) }},
+		{"SCTPWriteInfo empty slice", func() (int, error) {
+			return client.SCTPWriteInfo([]byte{}, nil, nil, nil)
+		}},
+	} {
+		n, err := tc.call()
+		if !errors.Is(err, syscall.EINVAL) {
+			t.Errorf("%s = (%d, %v), want EINVAL: the kernel refuses a "+
+				"zero-length message", tc.name, n, err)
+		}
+		if n != 0 {
+			t.Errorf("%s reported %d bytes sent", tc.name, n)
+		}
 	}
 
-	// Follow it with a real message; if the empty one is swallowed or
-	// misreported we still want the association to be usable.
+	// And the refusal must leave the association usable — a rejected send that
+	// disturbed the socket would be worse than the refusal.
 	want := []byte("after-empty")
 	if _, err := client.SCTPWrite(want, nil); err != nil {
-		t.Fatalf("write: %v", err)
+		t.Fatalf("write after the refused sends: %v", err)
 	}
-
 	got, _, err := server.ReadMsg(4096)
 	if err != nil {
-		t.Fatalf("first ReadMsg: %v", err)
+		t.Fatalf("ReadMsg: %v", err)
 	}
-	if len(got) == 0 {
-		// Empty message surfaced as such; the next read must return the
-		// following message intact.
-		next, _, err := server.ReadMsg(4096)
-		if err != nil {
-			t.Fatalf("second ReadMsg: %v", err)
-		}
-		if !bytes.Equal(next, want) {
-			t.Errorf("after empty message got %q, want %q", next, want)
-		}
-		return
-	}
-	// The kernel coalesced or dropped the empty message; the real message
-	// must still arrive uncorrupted.
 	if !bytes.Equal(got, want) {
 		t.Errorf("got %q, want %q", got, want)
 	}
