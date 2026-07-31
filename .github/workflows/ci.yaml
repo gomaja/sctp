@@ -69,11 +69,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
+      # Named individually rather than matched on "Layout". Two tests carry that
+      # word and open a socket anyway — TestSackTimerLayoutAndRoundTrip and
+      # TestResetStreamsWireLayout — and under qemu they fail with
+      # "protocol not available" for reasons that have nothing to do with the
+      # code. Everything below runs without a kernel.
       - name: Layout assertions under linux/arm
         run: |
           docker run --rm --platform linux/arm/v7 \
             -v "$PWD":/src -w /src golang:1.24-bookworm \
-            go test -run 'Layout|SockaddrStorage|Struct|NotificationSizes' -count=1 -v .
+            go test -count=1 -v -run '^(TestSockaddrStorageOptionLayouts|TestSockaddrStorageLayoutFormula|TestSockaddrStorageOptionsRoundTripThroughBytes|TestStructLayoutsMatchKernel|TestNotificationSizesMatchKernel|TestNxtInfoLayoutMatchesKernel|TestPeerAddrParamsLayoutMatchesKernel|TestPeerAddrParamsRoundTripsThroughItsPackedForm|TestRtoInfoLayoutMatchesKernel|TestAssocInfoLayoutMatchesKernel|TestAssocValueLayoutMatchesKernel|TestEventStructMatchesKernel|TestPollFdLayoutMatchesKernel|TestBuildSndRcvCmsgOffsetsMatchStruct|TestBuildersMatchKernelLayout|TestToBufSerialisesFixedSizeStructs|TestParseSndRcvInfoPrefersSndRcvOverRcvInfo|TestOptionNumbersMatchHeader)$' .
 
   # Nothing else executes sctp_unsupported.go. `go build` for a cross target
   # skips _test.go files, `go vet` type-checks without running, and every other

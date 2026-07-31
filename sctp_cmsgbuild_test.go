@@ -289,6 +289,87 @@ func TestParseSndRcvInfoDoesNotAliasInput(t *testing.T) {
 	}
 }
 
+// sctpCmsg wraps a payload in an IPPROTO_SCTP control message of the given
+// type, laid out the way the kernel lays one out.
+func sctpCmsg(typ int32, payload []byte) []byte {
+	hdrLen := syscall.CmsgLen(0)
+	buf := make([]byte, syscall.CmsgSpace(len(payload)))
+	hdr := (*syscall.Cmsghdr)(unsafe.Pointer(&buf[0]))
+	hdr.Level = syscall.IPPROTO_SCTP
+	hdr.Type = typ
+	hdr.SetLen(syscall.CmsgLen(len(payload)))
+	copy(buf[hdrLen:], payload)
+	return buf
+}
+
+// TestParseSndRcvInfoPrefersSndRcvOverRcvInfo pins the precedence the function
+// documents.
+//
+// parseSndRcvInfo accepts either SCTP_SNDRCV or SCTP_RCVINFO and says the first
+// wins when both arrive, so a caller who has enabled both keeps exactly the
+// bytes they had before. Nothing asserted it: the two conversion paths agree on
+// every field a receiver can see today — RcvInfo has no TTL, and the kernel
+// leaves sinfo_timetolive zero on receive — so reversing the precedence changes
+// nothing observable against a real socket, and the claim was unfalsifiable.
+//
+// A hand-built control buffer makes it falsifiable, by giving the two sources
+// different values for the same fields. That cannot come from a kernel, which
+// is exactly why it has to be built here.
+func TestParseSndRcvInfoPrefersSndRcvOverRcvInfo(t *testing.T) {
+	// Distinct values per source, so whichever wins is unambiguous.
+	const (
+		sndrcvStream, sndrcvPPID = 1, uint32(0x11111111)
+		rcvinfoStream            = 2
+	)
+	var rcvinfoPPID uint32 = 0x22222222
+
+	sndrcv := buildSndRcvCmsg(&SndRcvInfo{Stream: sndrcvStream, PPID: sndrcvPPID})
+
+	// SCTP_RCVINFO carries struct sctp_rcvinfo, whose field order differs from
+	// SndRcvInfo's — this is a conversion, not a reinterpretation.
+	ri := RcvInfo{SID: rcvinfoStream, PPID: rcvinfoPPID, TSN: 0x33333333}
+	rcvinfo := sctpCmsg(SCTP_CMSG_RCVINFO, toBuf(ri))
+
+	for _, tc := range []struct {
+		name string
+		buf  []byte
+	}{
+		{"SNDRCV first", append(append([]byte{}, sndrcv...), rcvinfo...)},
+		{"RCVINFO first", append(append([]byte{}, rcvinfo...), sndrcv...)},
+	} {
+		got, err := parseSndRcvInfo(tc.buf)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if got == nil {
+			t.Fatalf("%s: no info parsed from a buffer holding both", tc.name)
+		}
+		if got.Stream != sndrcvStream {
+			t.Errorf("%s: Stream = %d, want %d — SCTP_SNDRCV must win when both "+
+				"are present, whichever order they arrive in",
+				tc.name, got.Stream, sndrcvStream)
+		}
+		if got.PPID != ntohl(sndrcvPPID) {
+			t.Errorf("%s: PPID = %#x, want %#x", tc.name, got.PPID, ntohl(sndrcvPPID))
+		}
+		// SndRcvInfo carries no TSN from the SNDRCV path here, so a non-zero
+		// one would mean the RCVINFO branch supplied the result.
+		if got.TSN == 0x33333333 {
+			t.Errorf("%s: the result came from SCTP_RCVINFO", tc.name)
+		}
+	}
+
+	// And each source alone must still be decoded, or "prefers" has become
+	// "ignores".
+	only, err := parseSndRcvInfo(rcvinfo)
+	if err != nil {
+		t.Fatalf("RCVINFO alone: %v", err)
+	}
+	if only == nil || only.Stream != rcvinfoStream {
+		t.Errorf("RCVINFO alone gave %+v, want Stream %d", only, rcvinfoStream)
+	}
+}
+
 // TestSCTPReadInfoSurvivesLaterReads is the same property through the public API:
 // the info from one read must stay valid across subsequent reads.
 //

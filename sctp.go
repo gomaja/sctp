@@ -187,7 +187,7 @@ const (
 	// (RFC 7496 §4.5).
 	SCTP_PR_SUPPORTED = 113
 	// SCTP_DEFAULT_PRINFO carries struct sctp_default_prinfo, the default
-	// partial reliability policy and its lifetime (RFC 7496 §4.1).
+	// partial reliability policy and its lifetime (RFC 6458 §8.1.32).
 	SCTP_DEFAULT_PRINFO = 114
 	// SCTP_PR_STREAM_STATUS reads struct sctp_prstatus, the count of messages
 	// abandoned on one stream under the partial reliability policy
@@ -197,8 +197,10 @@ const (
 	// every stream of the association (RFC 7496 §4.4).
 	SCTP_PR_ASSOC_STATUS = 115
 
-	// SCTP_RECONFIG_SUPPORTED negotiates stream reconfiguration
-	// (RFC 6525 §6.1).
+	// SCTP_RECONFIG_SUPPORTED negotiates the stream reconfiguration extension
+	// for this socket. Linux-specific: RFC 6525 defines the extension and the
+	// four socket options in its §6.3, but nothing that negotiates support,
+	// and the name appears nowhere in it.
 	SCTP_RECONFIG_SUPPORTED = 117
 	// SCTP_ENABLE_STREAM_RESET selects which reconfiguration requests are
 	// permitted (RFC 6525 §6.3).
@@ -487,7 +489,7 @@ const (
 	SPP_DSCP              = 1 << 9
 )
 
-// Partial reliability policies for SetDefaultPrInfo (RFC 7496 §4.1). The value
+// Partial reliability policies for SetDefaultPrInfo (RFC 7496 §4.2). The value
 // accompanying each policy is interpreted differently, which is why they are not
 // interchangeable:
 //
@@ -785,7 +787,7 @@ type AssocValue struct {
 	AssocVal uint32
 }
 
-// DefaultPrInfo mirrors struct sctp_default_prinfo (RFC 7496 §4.1), the default
+// DefaultPrInfo mirrors struct sctp_default_prinfo (RFC 6458 §8.1.32), the default
 // partial reliability policy for messages that do not carry their own.
 type DefaultPrInfo struct {
 	AssocID SCTPAssocID
@@ -2139,7 +2141,7 @@ func (c *SCTPConn) PrSupported() (bool, error) {
 }
 
 // SetDefaultPrInfo sets the partial reliability policy applied to messages sent
-// without their own (RFC 7496 §4.1).
+// without their own (SCTP_DEFAULT_PRINFO, RFC 6458 §8.1.32).
 //
 // The meaning of Value depends on Policy; see the SCTPPrPolicy constants. A
 // policy outside that set is rejected by the kernel with EINVAL.
@@ -2202,10 +2204,14 @@ func (c *SCTPConn) GetPrAssocStatus(policy uint16) (*PrStatus, error) {
 }
 
 // SetReconfigSupported enables or disables the stream reconfiguration extension
-// (RFC 6525 §6.1).
+// of RFC 6525 for this socket.
 //
-// Set it before connecting. Like SetPrSupported it is carried in a struct
-// sctp_assoc_value rather than the plain int RFC 6525 describes.
+// The option is Linux's own. RFC 6525 defines the extension and its four socket
+// options in §6.3, but nothing that negotiates whether the extension is offered
+// at all — SCTP_RECONFIG_SUPPORTED appears nowhere in it.
+//
+// Set it before connecting. It is carried in a struct sctp_assoc_value rather
+// than a plain int, as SetPrSupported is.
 func (c *SCTPConn) SetReconfigSupported(on bool) error {
 	var v uint32
 	if on {

@@ -90,21 +90,39 @@ stops acknowledging.
 ## SO_REUSEADDR does not help here
 
 A reasonable guess is that `SO_REUSEADDR` would let the address be rebound
-while the old association is still lingering. Measured on SCTP, it changes
-nothing:
+while the old association is still lingering. It does not — but the reason is
+narrower than "it changes nothing", which is what this section used to say.
 
-```
-SO_REUSEADDR=0
-  two live listeners, same port : second bind REFUSED: address already in use
-  rebind after clean close      : rebind ALLOWED
-SO_REUSEADDR=1
-  two live listeners, same port : second bind REFUSED: address already in use
-  rebind after clean close      : rebind ALLOWED
+The kernel's test in `sctp_get_port_local` is
+
+```c
+reuse && (sk2->sk_reuse || sp2->reuse) && sk2->sk_state != SCTP_SS_LISTENING
 ```
 
-Unlike TCP there is no TIME_WAIT state to bypass, so rebinding after a clean
-close already works without it, and it does not override an address still held
-by a live association. Setting it makes no difference either way.
+so the flag has to be on **both** sockets, and the incumbent must not be
+listening. All four combinations, for each kind of incumbent:
+
+```
+incumbent is LISTENING:
+  incumbent reuse=0 | rebinder reuse=0 -> Address already in use
+  incumbent reuse=0 | rebinder reuse=1 -> Address already in use
+  incumbent reuse=1 | rebinder reuse=0 -> Address already in use
+  incumbent reuse=1 | rebinder reuse=1 -> Address already in use
+
+incumbent is BOUND but not listening:
+  incumbent reuse=0 | rebinder reuse=0 -> Address already in use
+  incumbent reuse=0 | rebinder reuse=1 -> Address already in use
+  incumbent reuse=1 | rebinder reuse=0 -> Address already in use
+  incumbent reuse=1 | rebinder reuse=1 -> ALLOWED
+```
+
+So there is exactly one cell where it makes a difference, and the wedged-address
+scenario is not it: the incumbent there is a listener or a live association, and
+this package never sets `SO_REUSEADDR` on anything, so the incumbent's flag is
+always clear — the case where reuse changes nothing.
+
+Unlike TCP there is no TIME_WAIT state to bypass either, so rebinding after a
+clean close already works without it.
 
 ## Reproducing it
 
