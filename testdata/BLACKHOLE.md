@@ -15,7 +15,8 @@ Two association parameters decide it, and their defaults are conservative:
 | `RtoInfo.Max` (`SCTP_RTOINFO`) | 60000 ms | Retransmissions back off exponentially up to this cap. |
 | `AssocInfo.AsocMaxRxt` (`SCTP_ASSOCINFO`) | 10 | Consecutive failed retransmissions before the association is declared failed. |
 
-`AsocMaxRxt` is `Association.Max.Retrans` from RFC 4960 section 8.2. Ten
+`AsocMaxRxt` is `Association.Max.Retrans` from RFC 9260 section 8.1 (RFC 9260
+obsoleted RFC 4960; section 8.2 is the per-path counter, not this one). Ten
 retransmissions backing off toward a sixty second ceiling is several minutes
 before anything is reported.
 

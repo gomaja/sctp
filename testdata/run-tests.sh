@@ -66,6 +66,36 @@ if [ "${have:-0}" -lt 3 ]; then
 fi
 
 go build ./...
-go vet ./... 2>&1 | grep -v 'non-test goroutine' || true
 
-exec go test "$@"
+# `go vet ... | grep -v ... || true` used to be here, which discarded vet's exit
+# status: the pipeline's status is grep's, and the `|| true` swallowed even
+# that, so `set -e` never saw a failure. The step ran and could not fail. Keep
+# the filter but take the status from vet itself.
+vet_out=$(go vet ./... 2>&1) || {
+    echo "$vet_out" | grep -v 'non-test goroutine' >&2
+    echo "go vet failed" >&2
+    exit 1
+}
+echo "$vet_out" | grep -v 'non-test goroutine' || true
+
+go test "$@"
+status=$?
+
+# Two AUTH tests assert the errno a caller gets on a stock kernel — EACCES, not
+# EOPNOTSUPP, which is the first surprise anyone using AUTH hits. They skip
+# when net.sctp.auth_enable is on, and the setup above turns it on for the other
+# seven, so in the documented harness they had never run once: the suite read
+# green with that contract entirely unexercised.
+#
+# So they get their own pass with the sysctl back at its default. Restore it
+# afterwards either way, or a second run in the same container inherits the
+# wrong value.
+if [ -w /proc/sys/net/sctp/auth_enable ]; then
+    echo "Second pass: the AUTH-disabled contract, with net.sctp.auth_enable=0."
+    sysctl -w net.sctp.auth_enable=0 >/dev/null 2>&1 || true
+    go test -run 'TestAuthDisabledReportsEACCES|TestAuthOptionsWithoutSysctl' \
+        -count=1 -v . || status=1
+    sysctl -w net.sctp.auth_enable=1 >/dev/null 2>&1 || true
+fi
+
+exit $status

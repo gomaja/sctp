@@ -1,6 +1,15 @@
+//go:build linux && !386
+// +build linux,!386
+
 // Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the GO_LICENSE file.
+
+// The build constraint above is the only addition to this file; the rest is
+// kept byte-identical to the standard library's net/ipsock.go. Its filename
+// alone constrained it to Linux, which is not the same thing: its only consumer
+// is sctp_linux.go, which is linux && !386, so on linux/386 every declaration
+// here compiled as dead code and every linter said so.
 
 package sctp
 

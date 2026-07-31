@@ -1536,3 +1536,272 @@ the *sender's* OUTPUT chain discards the packet before the capture point, so
 tshark records nothing and the harness reads as a clean pass for correct and
 broken code alike. The drop belongs on the receiver's INPUT, which is why this
 needs two containers rather than loopback.
+
+## The audit, and what it turned up
+
+Everything above was written while fixing something specific. This section is the
+other direction: a sweep over the whole package, asking what was still wrong.
+Most of it was, and had been from the start.
+
+### The package stopped building for Windows
+
+Upstream builds for `windows/amd64`. This fork did not, and had not for several
+commits.
+
+Two helpers had gone into `sctp.go`, which carries no build tag and is therefore
+compiled for every target: `isNonblocking`, which calls `syscall.SYS_FCNTL`, and
+`applyTimeout`, which calls `syscall.SetsockoptTimeval`. Neither is portable —
+`SYS_FCNTL` is not in the `syscall` package on Windows at all, and
+`SetsockoptTimeval` takes a `syscall.Handle` there rather than an `int`.
+
+This matters more than it looks. The whole point of `sctp_unsupported.go` is that
+a program importing this package and built for a platform without SCTP gets
+`ErrUnsupported` when it calls something, not a compiler error when it builds. A
+build failure cannot be handled and it breaks consumers who never touch SCTP on
+that platform.
+
+The suite stayed green throughout, because it only ever runs on one platform at a
+time. staticcheck did report the symptom — under `GOOS=darwin` it flags several
+`sctp.go` functions as unused, since their only callers are in the linux-tagged
+file — but it flags perfectly portable ones the same way, so the signal was
+indistinguishable from the noise. Commit `62e7e51` had claimed "staticcheck and
+golangci-lint now all report nothing", which was already false when it was
+written: 10 and 22 findings at that commit. A claim like that has to name the
+GOOS/GOARCH it covers or it cannot be checked.
+
+The detector for "does it build on platform X" is building it for platform X.
+`TestCrossCompiles` now does, for twelve targets picked one per axis — syscall
+package, word size, byte order — rather than for every target Go supports, since
+each one costs a full compile of the standard library and `linux/ppc64le` next to
+`linux/amd64` tests nothing new. Against the previous commit it fails on exactly
+the three Windows targets.
+
+`js/wasm`, `wasip1/wasm` and `plan9` are deliberately not in the list. Their
+`syscall` packages define neither `RawSockaddrInet4` nor `AF_INET`, which
+`SCTPAddr`'s exported encoding needs, and no version of this package has ever
+built for them.
+
+### Error causes were byte-swapped, and nothing could have noticed
+
+`AssocChange.Error`, `RemoteError.Error` and `SendFailed.Error` carry the RFC 9260
+§3.3.10 error cause — the answer to "why did this association fail". All three
+were decoded with `nativeEndian`. All three are network byte order.
+
+Measured on a live association rather than argued from source: aborting one side
+and reading the peer's `SCTP_ASSOC_CHANGE` reported cause **3072** where the
+actual cause is `SCTP_ERROR_USER_ABORT`, 12. `0x000c` byte-swapped is `0x0c00`.
+
+The kernel's own uapi header points the wrong way here. It says the field holds
+an `sctp_sn_error_t` — `SCTP_FAILED_THRESHOLD` and friends, a small host-order
+enum. That is true of `spc_error`, and `PeerAddrChange.Error` is correct as it
+stands. It is not true of `sac_error`: every value that reaches it comes from
+`SCTP_PERR()`, and every argument to that macro is an `enum sctp_error` member,
+each declared `cpu_to_be16`. `sctp_cmd_assoc_failed` takes the cause straight off
+the wire as a `__be16` and assigns it into a `__u16` without converting. Checked
+against `net/sctp/sm_statefuns.c`, `net/sctp/sm_sideeffect.c` and
+`include/linux/sctp.h` rather than inferred.
+
+So the two `__u16` fields are read big-endian, because the bytes in the buffer are
+the network representation on either kind of host. `ssf_error` needs a different
+rule: it is a `__u32` holding the same `be16` constant, widened by an ordinary
+integer promotion, and the promotion is host arithmetic — so on a little-endian
+host the swapped value sits in the low half of the word rather than the bytes
+being the network form. Reading it natively and then undoing the byte order is
+correct on both.
+
+The reason this survived is worth more than the fix. The existing unit test
+asserted `0x2222`, which is identical under a byte swap and could not have failed
+whichever way the field was read; the kernel-backed test only logged the value.
+Every new assertion here uses a byte-asymmetric cause. There is now also a test
+that fails if the correction is applied to `spc_error` too, since a blanket
+"notification error fields are network order" fix breaks the one field that is
+genuinely host order and nothing else would say so.
+
+The causes have names now. A bare number in a log is what let this last: 3072 in
+a log looks like a number, and `SCTP_ERROR_USER_ABORT` does not.
+
+### Accepted associations were not close-on-exec
+
+Every socket created in this package asks for `SOCK_CLOEXEC`. `accept4` asked for
+nothing, and that is the descriptor it matters most for, because it is a live
+association rather than an idle listener.
+
+A child forked while the server is running inherits every connection open at that
+moment. It can read and write them. And because it holds the descriptor, closing
+this side neither frees the port — a re-listen fails `EADDRINUSE` — nor sends the
+peer the reset it is owed: `Abort()` puts nothing on the wire while the child
+still has the fd. With `SOCK_CLOEXEC` set, the same abort resets the peer in
+2.9 ms.
+
+### `Dial` and `Listen` mutated the caller's address
+
+Both appended the wildcard address into `laddr.IPAddrs`, which is the caller's
+value, not a copy. Two things follow.
+
+It is a data race whenever one address is shared between goroutines, which is the
+ordinary way to run a client and a server against a fixed endpoint; the race
+detector fires on it. And it changes the value's meaning after the call returns:
+a `*SCTPAddr` that came back from a `"sctp6"` listen carries `[::]`, so reusing it
+for a `"sctp4"` dial fails with `EINVAL`.
+
+The same reasoning had already been applied to `*SndRcvInfo` in this document —
+"the old construction was a data race" — and simply had not been applied here.
+
+Only the `AF_INET6` arm is load-bearing: `ToRawSockAddrBuf` already encodes an
+empty address list as IPv4 zero, so the `AF_INET` arm produces the bytes it would
+have produced anyway. It is kept, because relying on that coupling from the bind
+path would be a trap for whoever edits either half next.
+
+### `ReadMsg` returned notifications as application data
+
+The guard was `recvflags&MSG_NOTIFICATION > 0 && c.notificationHandler != nil`, so
+with a nil handler a notification fell through to the data branch. `ReadMsg`
+discards the flags except for the `MSG_EOR` test, and the kernel sets `MSG_EOR` on
+notifications — so a `struct sctp_shutdown_event` came back as a finished message
+the peer appeared to have sent. 12 bytes of it, with `err == nil` and `info == nil`.
+
+There is no exported `SetNotificationHandler`, so a caller who dials normally and
+then calls `SubscribeEvents` cannot install one. And this document had been
+recommending `ReadMsg` as the framing-safe API for exactly the protocol shape it
+corrupts.
+
+The first test written for this passed with and without the fix, which is the part
+worth recording. It wrote a message and then generated an event: the message is
+delivered first, so `ReadMsg` returns before it ever reaches the notification.
+Aborting the association leaves the event alone at the head of the receive queue,
+which is the case that actually exercises the branch.
+
+### An unknown network string panicked
+
+`favoriteAddrFamily` is vendored from the standard library and picks an address
+family from the network name's last byte. The standard library only ever calls it
+with a name its own caller has already validated. This package called it with
+whatever arrived.
+
+So `ListenSCTP("")` and `DialSCTP("")` panicked with `index out of range [-1]` —
+the empty string has no last byte — and `ListenSCTP("tcp")` quietly created an
+SCTP socket, because `p` is neither `4` nor `6` and the default arm is reached.
+Both reproduced. One helper now validates the name and expands the empty one,
+which leaves the vendored file byte-identical to upstream apart from a build tag.
+
+### The read path reported deadlines that were never set
+
+`EAGAIN` was mapped to `os.ErrDeadlineExceeded` unconditionally. On a descriptor
+that is non-blocking for some other reason — one handed to `NewSCTPConn`, or one a
+`SocketConfig.Control` hook set `O_NONBLOCK` on — an ordinary empty read then
+reported a timeout nobody had asked for, and a caller treating that as "my
+deadline fired, retry" spins. `AcceptSCTP` and the write path already drew the
+distinction; the read path was the one that did not.
+
+### `PeelOff` could not have worked
+
+`sctp_peeloff_arg_t` is 8 bytes with `sd` at offset 4 — both members are 32 bits
+in the kernel. The Go struct declared `sd` as `int`, which is 64 bits on every
+target anyone runs this on, making the struct 16 bytes with `sd` at offset 8. The
+kernel wrote the new descriptor at 4; `PeelOff` read 8, which nothing had
+written. It returned an `SCTPConn` wrapping descriptor 0 — the process's standard
+input — and leaked the real one.
+
+Measured: kernel 8/`sd`@4 against Go 16/`sd`@8.
+
+It is correct on 32-bit, where Go's `int` is 32 bits, and it had no test on either.
+
+There is a second reason it could not have worked. `sctp_do_peeloff` refuses any
+socket that is not one-to-many, and every socket this package creates is
+one-to-one, so `PeelOff` returns `EINVAL` for every connection made through `Dial`
+or `Accept` here — reproduced. The method is usable through `NewSCTPConn` on a
+`SOCK_SEQPACKET` descriptor the caller made themselves, which is the case the ABI
+fix is for. The refusal is now asserted, so the doc comment stays honest and a
+kernel that started allowing it would be noticed.
+
+### A whole block of socket options was invisible
+
+Optnames 123 to 133 were not merely unwrapped; they were undeclared. The coverage
+sweep recorded earlier in this document compared header `#define`s against
+constants *referenced in the package* — and a declared constant counts as
+referenced, so a declared-but-unwrapped option was structurally invisible to it,
+and an undeclared one doubly so. Re-running that sweep against constants reached
+by a wrapper is the check that finds this class mechanically.
+
+Probed against a live socket with both sysctls at 0:
+
+| option | | |
+|---|---|---|
+| `SCTP_STREAM_SCHEDULER` (123) | get ok | set ok |
+| `SCTP_INTERLEAVING_SUPPORTED` (125) | get ok | `EPERM` until fragment interleave is non-zero |
+| `SCTP_ASCONF_SUPPORTED` (128) | get ok | set ok |
+| `SCTP_AUTH_SUPPORTED` (129) | get ok | set ok |
+| `SCTP_ECN_SUPPORTED` (130) | get ok | set ok |
+| `SCTP_EXPOSE_POTENTIALLY_FAILED_STATE` (131) | get ok | set ok |
+| `SCTP_SENDMSG_CONNECT` (126) | `ENOPROTOOPT` | — genuinely absent here |
+
+Two of those change what this package documents.
+
+**AUTH does not need the sysctl.** The AUTH accessors are documented as requiring
+`net.sctp.auth_enable`, which only root can set system-wide. `SCTP_AUTH_SUPPORTED`
+turns AUTH on for one socket with the sysctl still at 0 — measured.
+
+**`SetAutoAsconf` did nothing.** `net.sctp.addip_enable` defaults to 0, so the
+endpoint never negotiates ASCONF and `SetAutoAsconf` succeeded while adding a
+local address mid-association put zero ASCONF chunks on the wire. With
+`SCTP_ASCONF_SUPPORTED` set before binding: two ASCONF and two ASCONF-ACK.
+
+### The fragment interleave explanation was wrong
+
+This document and the doc comments said the kernel does not police the level, and
+that level 2 fails on one-to-one sockets because RFC 6458 §8.1.20 restricts it to
+one-to-many. Neither is the mechanism.
+
+Linux keeps a flag rather than a level. Setting 2 reads back as 1, and so does
+setting 3 — which is what distinguishes the two explanations, because a
+one-to-many restriction would not clamp 3. What §8.1.20 describes for level 2 is
+reached instead by negotiating the I-DATA chunk of RFC 8260, which is
+`SCTP_INTERLEAVING_SUPPORTED`, and that needs both `net.sctp.intl_enable` and a
+non-zero fragment interleave.
+
+### Two tests had never run
+
+`TestAuthDisabledReportsEACCES` and `TestAuthOptionsWithoutSysctl` assert the
+errno a caller gets on a stock kernel — `EACCES`, not `EOPNOTSUPP`, which is the
+first surprise anyone using AUTH hits. They skip when `net.sctp.auth_enable` is
+on, and `run-tests.sh` turns it on for the other seven AUTH tests. So in the
+documented harness they had never run once, and the suite read green with that
+contract entirely unexercised. Earlier text here said "one skip remains and is
+correct" while reporting three; these were the unaccounted pair.
+
+They get their own pass now, with the sysctl back at its default and restored
+afterwards.
+
+While looking at that script: its `go vet` step could not fail. `go vet ./... |
+grep -v ... || true` takes the pipeline's status from `grep` and then discards
+even that, so `set -e` never saw anything. It ran, and it was decorative.
+
+### CI was decorative too
+
+The workflow triggered only on pull requests to `master`. The work happens on
+`master-gomaja`, so nothing on this branch had ever run it. Its single step was
+`go test -race ./...` with none of the harness setup, no cross-compilation, and no
+lint — which is why the Windows break went unnoticed for several commits.
+
+Two corrections to what was assumed about running without the setup. The
+multi-homing tests do **not** skip without the added loopback aliases:
+`availableLoopbacks` probes by binding, and Linux's `local 127.0.0.0/8` route
+makes 127.0.0.2-4 bindable unaided. And the blackhole-gated dial tests **fail**
+rather than skip without the iptables rule, because `blackholeAvailable` returns
+true on `EINPROGRESS`.
+
+### What the lint sequence can and cannot say
+
+staticcheck and golangci-lint are clean for `linux/amd64`, `arm64`, `arm` and
+`s390x` — every target that carries an implementation.
+
+They are not clean for `GOOS=darwin` or `linux/386`, and cannot be made so without
+splitting shared structs per platform. `sctp_linux.go` is excluded there, so the
+helpers only it calls are reported unused. Ten findings remain, three of them
+struct fields that cannot move without moving the struct. `ipsock_linux.go` was
+worse: constrained only by its filename, it compiled on `linux/386` as entirely
+dead code after its sole consumer was excluded, which is twelve more. It now
+carries the same build tag as the file that uses it.
+
+The lesson from the Windows break stands: a "lint is clean" claim has to name the
+platform, and the detector for portability is compilation, not `U1000`.

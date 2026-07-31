@@ -13,6 +13,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package sctp is a binding for the Linux kernel's SCTP stack.
+//
+// It does not implement SCTP. Chunk handling, association setup,
+// retransmission, congestion control, path management and checksums all belong
+// to the kernel; what is here is the socket API around them — net.Conn and
+// net.Listener implementations, the socket options of RFC 6458 and its
+// extensions, ancillary data, and the notifications the kernel delivers on the
+// data stream.
+//
+// # Platforms
+//
+// SCTP exists on Linux only, and this package's implementation additionally
+// excludes linux/386. Everywhere else the package still compiles and every
+// entry point returns ErrUnsupported, which wraps errors.ErrUnsupported.
+//
+// # Reading
+//
+// SCTP is message-oriented, so a read returns either a whole message or part of
+// one and SCTPRead cannot say which: a message larger than the buffer is split,
+// and the remainder arrives looking like a fresh message. Use ReadMsg, which
+// reassembles, or SCTPReadFlags and test the flags for MSG_EOR.
+//
+// SCTPReadFlags also reports MSG_NOTIFICATION, which distinguishes an event
+// from application data; pass the bytes to ParseNotification. ReadMsg skips
+// notifications, since it returns messages.
+//
+// # Writing
+//
+// Write and SCTPWrite do not block when the send buffer is full — they return
+// EAGAIN, so that a peer which stops reading cannot hang a caller
+// indefinitely. Set a write deadline to wait for space instead; see
+// SetWriteDeadline. SyscallConn gives the readiness handling net.Conn does not.
+//
+// # Options announced in the INIT
+//
+// Several options are only meaningful before the association exists, because
+// they are announced in the INIT chunk: SetInitMsg, SetAdaptationLayer, and the
+// capability negotiations SetPrSupported, SetReconfigSupported,
+// SetAsconfSupported, SetAuthSupported and SetEcnSupported. Setting one on an
+// established association is accepted and does nothing. Several also depend on
+// a net.sctp.* sysctl; each says so.
 package sctp
 
 import (
@@ -21,6 +62,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"strconv"
@@ -184,6 +226,83 @@ const (
 	// SCTP_LOCAL_AUTH_CHUNKS reads the chunk types this endpoint requires to
 	// be authenticated (RFC 4895 §6.7). Read only.
 	SCTP_LOCAL_AUTH_CHUNKS = 27
+
+	// SCTP_STREAM_SCHEDULER selects the order outbound streams are served in
+	// (RFC 8260 §4).
+	SCTP_STREAM_SCHEDULER = 123
+	// SCTP_STREAM_SCHEDULER_VALUE sets a per-stream parameter for the
+	// scheduler in force, which for SCTP_SS_PRIO is the stream's priority.
+	SCTP_STREAM_SCHEDULER_VALUE = 124
+	// SCTP_INTERLEAVING_SUPPORTED negotiates user message interleaving, the
+	// I-DATA chunk of RFC 8260. The kernel refuses it with EPERM unless
+	// net.sctp.intl_enable is on and SetFragmentInterleave has been given a
+	// non-zero level.
+	SCTP_INTERLEAVING_SUPPORTED = 125
+	// SCTP_ASCONF_SUPPORTED negotiates dynamic address reconfiguration
+	// (RFC 5061). See SetAsconfSupported: this is what makes SetAutoAsconf do
+	// anything at all.
+	SCTP_ASCONF_SUPPORTED = 128
+	// SCTP_AUTH_SUPPORTED negotiates AUTH (RFC 4895) for this socket, without
+	// net.sctp.auth_enable.
+	SCTP_AUTH_SUPPORTED = 129
+	// SCTP_ECN_SUPPORTED negotiates explicit congestion notification.
+	SCTP_ECN_SUPPORTED = 130
+	// SCTP_EXPOSE_POTENTIALLY_FAILED_STATE controls whether the PF state of
+	// RFC 7829 is visible; see SetExposePotentiallyFailed.
+	SCTP_EXPOSE_POTENTIALLY_FAILED_STATE = 131
+	// SCTP_EXPOSE_PF_STATE is the kernel's shorter spelling of the same option.
+	SCTP_EXPOSE_PF_STATE = SCTP_EXPOSE_POTENTIALLY_FAILED_STATE
+)
+
+// Stream schedulers for SetStreamScheduler, from the kernel's
+// enum sctp_sched_type (RFC 8260 §4 describes the idea; the set Linux
+// implements is smaller than the one the RFC lists).
+const (
+	// SCTPSchedFCFS sends messages in the order they were handed over,
+	// regardless of stream. It is the default.
+	SCTPSchedFCFS = 0
+	// SCTPSchedPrio serves streams by the priority set with
+	// SetStreamSchedulerValue, lowest number first.
+	SCTPSchedPrio = 1
+	// SCTPSchedRR serves streams round-robin, one message at a time.
+	SCTPSchedRR = 2
+)
+
+// PF state exposure levels for SetExposePotentiallyFailed (RFC 7829).
+//
+// The default is SCTPPFStateHidden, which is why a caller correctly subscribed
+// to SCTP_PEER_ADDR_CHANGE never sees SCTP_ADDR_POTENTIALLY_FAILED and
+// concludes the state is not implemented. It is: it is just not shown.
+const (
+	// SCTPPFStateHidden suppresses the PF state entirely. GetPeerAddrInfo
+	// reports a PF path as SCTP_ACTIVE and no notification is delivered.
+	SCTPPFStateHidden = 0
+	// SCTPPFStateExposed reports the PF state through both the notification
+	// and GetPeerAddrInfo.
+	SCTPPFStateExposed = 1
+	// SCTPPFStateHiddenNoOverride is SCTPPFStateHidden with the socket option
+	// locked, so a later change is refused with EACCES.
+	SCTPPFStateHiddenNoOverride = 2
+)
+
+// Flags for PeerAddrParams.Flags, from the kernel's spp_flags (RFC 6458
+// §8.1.12).
+//
+// The ENABLE/DISABLE pairs are how the option distinguishes "set this" from
+// "leave it alone": with neither bit set the corresponding value field is
+// ignored, which is why SetPeerAddrParams cannot be used to clear a setting by
+// passing zero.
+const (
+	SPP_HB_ENABLE         = 1 << 0
+	SPP_HB_DISABLE        = 1 << 1
+	SPP_HB_DEMAND         = 1 << 2 // send one heartbeat now
+	SPP_PMTUD_ENABLE      = 1 << 3
+	SPP_PMTUD_DISABLE     = 1 << 4
+	SPP_SACKDELAY_ENABLE  = 1 << 5
+	SPP_SACKDELAY_DISABLE = 1 << 6
+	SPP_HB_TIME_IS_ZERO   = 1 << 7 // heartbeat immediately after each RTO
+	SPP_IPV6_FLOWLABEL    = 1 << 8
+	SPP_DSCP              = 1 << 9
 )
 
 // Partial reliability policies for SetDefaultPrInfo (RFC 7496 §4.1). The value
@@ -229,10 +348,11 @@ const (
 
 // Fragmented interleave levels for SetFragmentInterleave (RFC 6458 §8.1.20).
 //
-// The kernel does not police these — a level of 3 is accepted and leaves the
-// receiver in a state the specification does not describe, which was measured.
-// SetFragmentInterleave rejects anything outside this set so that the invalid
-// value fails at the call rather than silently later.
+// Linux does not store a level. It keeps a single flag, so anything non-zero
+// becomes 1: setting 2 and setting 3 both read back as 1, which was measured.
+// That means an out-of-range value is not rejected and not honoured either, and
+// nothing tells the caller. SetFragmentInterleave rejects anything outside this
+// set so the mistake fails at the call.
 const (
 	// SCTPFragmentInterleaveNone blocks every other message while a partial
 	// delivery is in progress. This is the kernel default.
@@ -244,13 +364,13 @@ const (
 	// SCTPFragmentInterleaveStreams additionally allows messages from other
 	// streams of the same association.
 	//
-	// RFC 6458 §8.1.20 describes this level as applying to one-to-many style
-	// sockets, and Linux enforces that: setting it on the one-to-one sockets
-	// this package creates succeeds but reads back as
-	// SCTPFragmentInterleaveOther. That was measured on both connected and
-	// unconnected sockets. It is defined here for completeness and for callers
-	// working with a descriptor from elsewhere; do not expect it to stick on a
-	// socket from this package.
+	// It never reads back. Linux keeps fragment interleave as a flag rather
+	// than a level, so this is accepted and stored as
+	// SCTPFragmentInterleaveOther — as is 3, which is how the flag rather than
+	// the level shows. What RFC 6458 §8.1.20 describes for this level is
+	// reached instead by negotiating the I-DATA chunk of RFC 8260; see
+	// SetInterleavingSupported, which needs this set to a non-zero value first
+	// and refuses with EPERM otherwise.
 	SCTPFragmentInterleaveStreams = 2
 )
 
@@ -622,8 +742,8 @@ type RtoInfo struct {
 // AssocInfo mirrors struct sctp_assocparams (RFC 6458 8.1.2, SCTP_ASSOCINFO).
 //
 // AsocMaxRxt is the field that matters for detecting an unreachable peer: it
-// is Association.Max.Retrans from RFC 9260 section 8.2 (which obsoleted RFC
-// 4960). Once that many
+// is Association.Max.Retrans, RFC 9260 section 8.1 — section 8.2 is the path
+// counter, not the association one. Once that many
 // consecutive retransmissions to a peer go unacknowledged, the association is
 // torn down and the socket becomes readable with an error. Lowering it, and
 // lowering RtoInfo.Max, is what turns a silent black hole into a prompt,
@@ -652,8 +772,7 @@ type PeerState int32
 // match what the kernel reports rather than read in a natural-looking order.
 const (
 	// SCTP_INACTIVE means the path has failed: it has exceeded
-	// Path.Max.Retrans without a response. See RFC 9260 section 8.2, which
-	// obsoleted RFC 4960.
+	// Path.Max.Retrans without a response. See RFC 9260 section 8.2.
 	SCTP_INACTIVE PeerState = iota
 	// SCTP_PF ("potentially failed") is an intermediate state from RFC 7829:
 	// some retransmissions have failed but the path is not yet declared
@@ -827,7 +946,7 @@ func htonl(h uint32) uint32 {
 var ntohl = htonl
 
 // setInitOpts sets options for an SCTP association initialization
-// see https://tools.ietf.org/html/rfc4960#page-25
+// see RFC 9260 section 5.1, which obsoleted RFC 4960
 func setInitOpts(fd int, options InitMsg) error {
 	optlen := unsafe.Sizeof(options)
 	_, _, err := setsockopt(fd, SCTP_INITMSG, uintptr(unsafe.Pointer(&options)), uintptr(optlen))
@@ -936,15 +1055,23 @@ func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
 	if err != nil {
 		return nil, err
 	}
+	// strings.Split never returns an empty slice, so the last element always
+	// exists; the length check that used to be here could not fire.
 	elems := strings.Split(addrs, "/")
-	if len(elems) == 0 {
-		return nil, fmt.Errorf("invalid input: %s", addrs)
-	}
 	ipaddrs := make([]net.IPAddr, 0, len(elems))
 	for _, e := range elems[:len(elems)-1] {
 		tcpa, err := net.ResolveTCPAddr(tcpnet, e+":")
 		if err != nil {
 			return nil, err
+		}
+		if tcpa.IP == nil {
+			// An empty element. "/127.0.0.1:80" used to produce a nil IP
+			// followed by the real one, and binding that list asks for the
+			// wildcard address as well as the one the caller named.
+			return nil, &net.AddrError{
+				Err:  "empty address in a multi-homed address list",
+				Addr: addrs,
+			}
 		}
 		ipaddrs = append(ipaddrs, net.IPAddr{IP: tcpa.IP, Zone: tcpa.Zone})
 	}
@@ -954,7 +1081,18 @@ func ResolveSCTPAddr(network, addrs string) (*SCTPAddr, error) {
 	}
 	if tcpa.IP != nil {
 		ipaddrs = append(ipaddrs, net.IPAddr{IP: tcpa.IP, Zone: tcpa.Zone})
+	} else if len(ipaddrs) > 0 {
+		// The caller listed addresses and then ended with a bare port, as in
+		// "1.2.3.4/5.6.7.8/:80". This used to discard every listed address and
+		// return a wildcard, so a trailing separator in a configuration file
+		// silently turned "listen on these two" into "listen on everything".
+		return nil, &net.AddrError{
+			Err:  "address list ends with a port and no address",
+			Addr: addrs,
+		}
 	} else {
+		// No addresses at all: a bare port means the wildcard, which is the
+		// documented meaning of ":80".
 		ipaddrs = nil
 	}
 	return &SCTPAddr{
@@ -1173,7 +1311,19 @@ func (c *SCTPConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// SetInitMsg sets the association initialisation parameters (SCTP_INITMSG).
+//
+// Every field is a uint16 in the kernel. The arguments are ints, so a value
+// outside that range used to be truncated silently: 65536 streams became 0,
+// which the kernel reads as "leave the default", and a caller asking for more
+// streams than SCTP can carry got the default instead of an error. Read them
+// back with GetInitMsg.
 func (c *SCTPConn) SetInitMsg(numOstreams, maxInstreams, maxAttempts, maxInitTimeout int) error {
+	for _, v := range []int{numOstreams, maxInstreams, maxAttempts, maxInitTimeout} {
+		if v < 0 || v > math.MaxUint16 {
+			return syscall.EINVAL
+		}
+	}
 	return setInitOpts(c.fd(), InitMsg{
 		NumOstreams:    uint16(numOstreams),
 		MaxInstreams:   uint16(maxInstreams),
@@ -1496,18 +1646,17 @@ func (c *SCTPConn) GetMaxSegSize() (int, error) {
 // SetFragmentInterleave controls whether a partial delivery on one stream
 // blocks delivery of messages on the others (RFC 6458 §8.1.20).
 //
-// level must be one of SCTPFragmentInterleaveNone, ...Other or ...Streams. The
-// kernel accepts out-of-range levels without complaint — a level of 3 is taken
-// and leaves the receiver in a state the specification does not define, which
-// was measured against a live kernel — so the check here is what keeps an
-// invalid value from becoming undefined behaviour later.
+// level must be one of SCTPFragmentInterleaveNone, ...Other or ...Streams.
+// Linux keeps a flag rather than a level, so it accepts anything and stores
+// !=0 as 1: setting 2 and setting 3 both read back as 1, measured against a
+// live kernel. An out-of-range value is therefore neither refused nor honoured,
+// and the check here is what turns that into an error the caller can see.
 //
 // The default is SCTPFragmentInterleaveNone, which blocks every other message
 // while a partial delivery is in progress. ...Other is the highest level that
-// takes effect on the one-to-one sockets this package creates: Linux accepts
-// ...Streams but reads it back as ...Other, which was measured. Callers wanting
-// to relax head-of-line blocking on a one-to-one socket should therefore set
-// ...Other and read the value back rather than assume ...Streams applied.
+// reads back. To get what RFC 6458 §8.1.20 describes for ...Streams, negotiate
+// the I-DATA chunk with SetInterleavingSupported, which requires this to be
+// non-zero first.
 func (c *SCTPConn) SetFragmentInterleave(level int) error {
 	switch level {
 	case SCTPFragmentInterleaveNone, SCTPFragmentInterleaveOther,
@@ -2249,6 +2398,374 @@ func setAssocValue(fd int, optname uintptr, val uint32) error {
 	return err
 }
 
+// PeerAddrParams mirrors struct sctp_paddrparams (RFC 6458 §8.1.12), the
+// per-path timers.
+//
+// Flags decides which of the other fields are read: each value has an
+// ENABLE/DISABLE pair in the SPP_ constants, and a value with neither bit set is
+// ignored. So this cannot be used to clear a setting by passing zero, and a
+// caller who wants to change one thing should read the current parameters,
+// modify them, and write them back.
+//
+// HBInterval is the one that usually matters. On an idle association nothing
+// but the heartbeat detects that a path has gone silent, and its default of 30
+// seconds was unreachable from this package before.
+//
+// Address selects the path. Leaving it zeroed addresses the association as a
+// whole, which is what a one-to-one socket normally wants; to name one path,
+// copy a raw sockaddr in — GetPeerAddrs returns them decoded, and
+// SCTPAddr.ToRawSockAddrBuf encodes one back.
+//
+// This is the one struct in the package that cannot simply mirror the kernel's
+// field by field. sctp_paddrparams is declared packed and aligned(4), and the
+// 128-byte address leaves spp_pathmtu at offset 138 — a uint32 on a two-byte
+// boundary, which Go will not lay out at any cost. So the exported form is an
+// ordinary Go struct and the packed form is built on the way in and out.
+// TestPeerAddrParamsLayoutMatchesKernel pins every offset.
+type PeerAddrParams struct {
+	AssocID SCTPAssocID
+	// Address selects the path. Leaving it zeroed addresses the association as
+	// a whole, which is what a one-to-one socket normally wants; to name one
+	// path, copy in the bytes SCTPAddr.ToRawSockAddrBuf produces.
+	Address [128]byte
+	// HBInterval is the heartbeat period in milliseconds. Needs SPP_HB_ENABLE.
+	HBInterval uint32
+	// PathMaxRxt is the retransmission count after which this path is
+	// considered inactive.
+	PathMaxRxt uint16
+	// PathMTU overrides path MTU discovery. Needs SPP_PMTUD_DISABLE.
+	PathMTU uint32
+	// SackDelay is the delayed acknowledgement timer in milliseconds. Needs
+	// SPP_SACKDELAY_ENABLE.
+	SackDelay uint32
+	Flags     uint32
+	// IPv6FlowLabel needs SPP_IPV6_FLOWLABEL.
+	IPv6FlowLabel uint32
+	// DSCP needs SPP_DSCP.
+	DSCP uint8
+}
+
+// paddrparamsSize is sizeof(struct sctp_paddrparams): 155 bytes of fields
+// rounded up to the struct's declared 4-byte alignment.
+const paddrparamsSize = 156
+
+// Field offsets within the packed struct, named so the marshalling below reads
+// as the layout rather than as arithmetic.
+const (
+	pppAssocID    = 0
+	pppAddress    = 4
+	pppHBInterval = 132
+	pppPathMaxRxt = 136
+	pppPathMTU    = 138
+	pppSackDelay  = 142
+	pppFlags      = 146
+	pppFlowLabel  = 150
+	pppDSCP       = 154
+)
+
+func (p *PeerAddrParams) marshal() []byte {
+	b := make([]byte, paddrparamsSize)
+	nativeEndian.PutUint32(b[pppAssocID:], uint32(p.AssocID))
+	copy(b[pppAddress:pppAddress+128], p.Address[:])
+	nativeEndian.PutUint32(b[pppHBInterval:], p.HBInterval)
+	nativeEndian.PutUint16(b[pppPathMaxRxt:], p.PathMaxRxt)
+	nativeEndian.PutUint32(b[pppPathMTU:], p.PathMTU)
+	nativeEndian.PutUint32(b[pppSackDelay:], p.SackDelay)
+	nativeEndian.PutUint32(b[pppFlags:], p.Flags)
+	nativeEndian.PutUint32(b[pppFlowLabel:], p.IPv6FlowLabel)
+	b[pppDSCP] = p.DSCP
+	return b
+}
+
+func (p *PeerAddrParams) unmarshal(b []byte) {
+	p.AssocID = SCTPAssocID(nativeEndian.Uint32(b[pppAssocID:]))
+	copy(p.Address[:], b[pppAddress:pppAddress+128])
+	p.HBInterval = nativeEndian.Uint32(b[pppHBInterval:])
+	p.PathMaxRxt = nativeEndian.Uint16(b[pppPathMaxRxt:])
+	p.PathMTU = nativeEndian.Uint32(b[pppPathMTU:])
+	p.SackDelay = nativeEndian.Uint32(b[pppSackDelay:])
+	p.Flags = nativeEndian.Uint32(b[pppFlags:])
+	p.IPv6FlowLabel = nativeEndian.Uint32(b[pppFlowLabel:])
+	p.DSCP = b[pppDSCP]
+}
+
+// SetPeerAddrParams writes the per-path parameters (SCTP_PEER_ADDR_PARAMS).
+//
+// Set the matching SPP_ flag for each field that should take effect; see
+// PeerAddrParams.
+func (c *SCTPConn) SetPeerAddrParams(p *PeerAddrParams) error {
+	b := p.marshal()
+	_, _, err := setsockopt(c.fd(), SCTP_PEER_ADDR_PARAMS,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
+	return err
+}
+
+// GetPeerAddrParams reads the per-path parameters (SCTP_PEER_ADDR_PARAMS).
+//
+// Zero the Address of the value passed in to ask about the association rather
+// than one path.
+func (c *SCTPConn) GetPeerAddrParams(p *PeerAddrParams) error {
+	b := p.marshal()
+	optlen := uintptr(len(b))
+	_, _, err := getsockopt(c.fd(), SCTP_PEER_ADDR_PARAMS,
+		uintptr(unsafe.Pointer(&b[0])), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return err
+	}
+	p.unmarshal(b)
+	return nil
+}
+
+// GetPeerAddrInfo reads one peer address's state (SCTP_GET_PEER_ADDR_INFO,
+// RFC 6458 §8.2.2).
+//
+// This is the only way to see a secondary path. GetStatus reports the primary
+// only, so on the multi-homed associations this package exists to support,
+// nothing else says whether the other paths are active, what their round-trip
+// time is, or what congestion window they have.
+//
+// Set Address on the value passed in to name the path; the rest is filled in.
+func (c *SCTPConn) GetPeerAddrInfo(info *PeerAddrinfo) error {
+	optlen := unsafe.Sizeof(*info)
+	_, _, err := getsockopt(c.fd(), SCTP_GET_PEER_ADDR_INFO,
+		uintptr(unsafe.Pointer(info)), uintptr(unsafe.Pointer(&optlen)))
+	return err
+}
+
+// SetAdaptationLayer announces an adaptation layer indication to the peer
+// (SCTP_ADAPTATION_LAYER, RFC 6458 §8.1.11).
+//
+// The value is opaque to SCTP and is carried in the INIT, so it must be set
+// before the association is established to reach the peer. The other direction
+// has always been available: the peer's indication arrives as an
+// AdaptationIndication notification.
+func (c *SCTPConn) SetAdaptationLayer(ind uint32) error {
+	v := struct{ AdaptationInd uint32 }{ind}
+	_, _, err := setsockopt(c.fd(), SCTP_ADAPTATION_LAYER,
+		uintptr(unsafe.Pointer(&v)), unsafe.Sizeof(v))
+	return err
+}
+
+// GetAdaptationLayer reports the adaptation layer indication this endpoint
+// announces.
+func (c *SCTPConn) GetAdaptationLayer() (uint32, error) {
+	v := struct{ AdaptationInd uint32 }{}
+	optlen := unsafe.Sizeof(v)
+	_, _, err := getsockopt(c.fd(), SCTP_ADAPTATION_LAYER,
+		uintptr(unsafe.Pointer(&v)), uintptr(unsafe.Pointer(&optlen)))
+	return v.AdaptationInd, err
+}
+
+// SetDisableFragments controls whether a message larger than the path MTU is
+// fragmented (SCTP_DISABLE_FRAGMENTS, RFC 6458 §8.1.5).
+//
+// With fragmentation off, a message that does not fit is refused with
+// EMSGSIZE rather than split. That is what a caller wants when the peer is a
+// device that cannot reassemble, and it turns a silent behaviour change into an
+// error they can see.
+func (c *SCTPConn) SetDisableFragments(on bool) error {
+	return setSockoptBool(c.fd(), SCTP_DISABLE_FRAGMENTS, on)
+}
+
+// DisableFragments reports whether message fragmentation is disabled.
+func (c *SCTPConn) DisableFragments() (bool, error) {
+	return getSockoptBool(c.fd(), SCTP_DISABLE_FRAGMENTS)
+}
+
+// SetMappedV4Addr controls whether IPv4 addresses are reported to the caller in
+// IPv4-mapped IPv6 form on an AF_INET6 socket (SCTP_I_WANT_MAPPED_V4_ADDR,
+// RFC 6458 §8.1.15).
+func (c *SCTPConn) SetMappedV4Addr(on bool) error {
+	return setSockoptBool(c.fd(), SCTP_I_WANT_MAPPED_V4_ADDR, on)
+}
+
+// MappedV4Addr reports whether IPv4-mapped addresses are in use.
+func (c *SCTPConn) MappedV4Addr() (bool, error) {
+	return getSockoptBool(c.fd(), SCTP_I_WANT_MAPPED_V4_ADDR)
+}
+
+// SetAsconfSupported negotiates dynamic address reconfiguration, RFC 5061, for
+// this socket.
+//
+// This is what makes SetAutoAsconf mean anything. net.sctp.addip_enable
+// defaults to 0, and with it off the endpoint never negotiates ASCONF, so
+// SetAutoAsconf succeeds and then adding a local address mid-association puts
+// nothing on the wire — measured as zero ASCONF chunks, against two ASCONF and
+// two ASCONF-ACK once this is on.
+//
+// It must be set before the socket is bound: the capability goes in the INIT.
+// The kernel also requires AUTH for ASCONF, so SetAuthSupported belongs with it.
+func (c *SCTPConn) SetAsconfSupported(on bool) error {
+	return setAssocValueBool(c.fd(), SCTP_ASCONF_SUPPORTED, on)
+}
+
+// AsconfSupported reports the negotiated outcome for ASCONF.
+func (c *SCTPConn) AsconfSupported() (bool, error) {
+	v, err := getAssocValue(c.fd(), SCTP_ASCONF_SUPPORTED)
+	return v != 0, err
+}
+
+// SetAuthSupported negotiates AUTH, RFC 4895, for this socket.
+//
+// The AUTH accessors on this type are documented as needing
+// net.sctp.auth_enable, which is a system-wide sysctl only root can set. That
+// is the older half of the story: this option turns AUTH on for one socket with
+// the sysctl still at its default of 0, which was measured rather than assumed.
+//
+// Set it before binding — the capability is announced in the INIT.
+func (c *SCTPConn) SetAuthSupported(on bool) error {
+	return setAssocValueBool(c.fd(), SCTP_AUTH_SUPPORTED, on)
+}
+
+// AuthSupported reports the negotiated outcome for AUTH.
+func (c *SCTPConn) AuthSupported() (bool, error) {
+	v, err := getAssocValue(c.fd(), SCTP_AUTH_SUPPORTED)
+	return v != 0, err
+}
+
+// SetEcnSupported negotiates explicit congestion notification for this socket.
+func (c *SCTPConn) SetEcnSupported(on bool) error {
+	return setAssocValueBool(c.fd(), SCTP_ECN_SUPPORTED, on)
+}
+
+// EcnSupported reports the negotiated outcome for ECN.
+func (c *SCTPConn) EcnSupported() (bool, error) {
+	v, err := getAssocValue(c.fd(), SCTP_ECN_SUPPORTED)
+	return v != 0, err
+}
+
+// SetInterleavingSupported negotiates user message interleaving, the I-DATA
+// chunk of RFC 8260.
+//
+// The kernel refuses this with EPERM unless net.sctp.intl_enable is on and
+// SetFragmentInterleave has been given a non-zero level, because interleaving
+// without that would deliver fragments of different messages to a caller not
+// expecting them.
+func (c *SCTPConn) SetInterleavingSupported(on bool) error {
+	return setAssocValueBool(c.fd(), SCTP_INTERLEAVING_SUPPORTED, on)
+}
+
+// InterleavingSupported reports the negotiated outcome for message
+// interleaving.
+func (c *SCTPConn) InterleavingSupported() (bool, error) {
+	v, err := getAssocValue(c.fd(), SCTP_INTERLEAVING_SUPPORTED)
+	return v != 0, err
+}
+
+// SetExposePotentiallyFailed controls whether the PF state of RFC 7829 is
+// reported (SCTP_EXPOSE_POTENTIALLY_FAILED_STATE).
+//
+// PF is the early warning that a path has missed retransmissions but has not
+// yet been declared unreachable, and it is the reason RFC 7829 exists: without
+// it a caller learns about a dead path only when the retransmission budget runs
+// out, which on the defaults is minutes. The kernel hides it unless asked,
+// following net.sctp.pf_expose, so a caller who correctly subscribes to
+// SCTP_PEER_ADDR_CHANGE and never sees SCTP_ADDR_POTENTIALLY_FAILED concludes
+// the state does not exist.
+//
+// level is one of the SCTPPFState constants. SCTPPFStateHiddenNoOverride locks
+// the setting, after which this returns EACCES.
+func (c *SCTPConn) SetExposePotentiallyFailed(level uint32) error {
+	return setAssocValue(c.fd(), SCTP_EXPOSE_POTENTIALLY_FAILED_STATE, level)
+}
+
+// ExposePotentiallyFailed reports the current PF exposure level.
+func (c *SCTPConn) ExposePotentiallyFailed() (uint32, error) {
+	return getAssocValue(c.fd(), SCTP_EXPOSE_POTENTIALLY_FAILED_STATE)
+}
+
+// SetStreamScheduler selects the order outbound streams are served in
+// (SCTP_STREAM_SCHEDULER, RFC 8260 §4).
+//
+// sched is one of the SCTPSched constants. The default, SCTPSchedFCFS, ignores
+// streams entirely and sends in the order messages were handed over, so a
+// caller who separates traffic by stream and expects that to affect scheduling
+// gets nothing until this is set.
+func (c *SCTPConn) SetStreamScheduler(sched uint32) error {
+	return setAssocValue(c.fd(), SCTP_STREAM_SCHEDULER, sched)
+}
+
+// StreamScheduler reports the scheduler in force.
+func (c *SCTPConn) StreamScheduler() (uint32, error) {
+	return getAssocValue(c.fd(), SCTP_STREAM_SCHEDULER)
+}
+
+// streamValue mirrors struct sctp_stream_value.
+type streamValue struct {
+	AssocID     SCTPAssocID
+	StreamID    uint16
+	StreamValue uint16
+}
+
+// SetStreamSchedulerValue sets a per-stream parameter for the scheduler in
+// force (SCTP_STREAM_SCHEDULER_VALUE).
+//
+// Under SCTPSchedPrio the value is the stream's priority, lowest served first.
+// Under the other schedulers it is ignored.
+func (c *SCTPConn) SetStreamSchedulerValue(streamID, value uint16) error {
+	sv := streamValue{StreamID: streamID, StreamValue: value}
+	_, _, err := setsockopt(c.fd(), SCTP_STREAM_SCHEDULER_VALUE,
+		uintptr(unsafe.Pointer(&sv)), unsafe.Sizeof(sv))
+	return err
+}
+
+// GetStreamSchedulerValue reads the scheduler parameter for one stream.
+func (c *SCTPConn) GetStreamSchedulerValue(streamID uint16) (uint16, error) {
+	sv := streamValue{StreamID: streamID}
+	optlen := unsafe.Sizeof(sv)
+	_, _, err := getsockopt(c.fd(), SCTP_STREAM_SCHEDULER_VALUE,
+		uintptr(unsafe.Pointer(&sv)), uintptr(unsafe.Pointer(&optlen)))
+	return sv.StreamValue, err
+}
+
+// GetInitMsg reads the association initialisation parameters (SCTP_INITMSG).
+//
+// SetInitMsg has always been available; this is the direction that was missing,
+// which meant a caller could not check what the kernel actually recorded — the
+// zero fields of an InitMsg mean "leave the default", so what was set and what
+// is in force are different things.
+func (c *SCTPConn) GetInitMsg() (*InitMsg, error) {
+	options := &InitMsg{}
+	optlen := unsafe.Sizeof(*options)
+	_, _, err := getsockopt(c.fd(), SCTP_INITMSG,
+		uintptr(unsafe.Pointer(options)), uintptr(unsafe.Pointer(&optlen)))
+	if err != nil {
+		return nil, err
+	}
+	return options, nil
+}
+
+// setSockoptBool writes one of the options carrying a bare int used as a
+// boolean.
+func setSockoptBool(fd int, optname uintptr, on bool) error {
+	var v int32
+	if on {
+		v = 1
+	}
+	_, _, err := setsockopt(fd, optname, uintptr(unsafe.Pointer(&v)),
+		unsafe.Sizeof(v))
+	return err
+}
+
+// getSockoptBool reads one of the options carrying a bare int used as a
+// boolean.
+func getSockoptBool(fd int, optname uintptr) (bool, error) {
+	var v int32
+	optlen := unsafe.Sizeof(v)
+	_, _, err := getsockopt(fd, optname, uintptr(unsafe.Pointer(&v)),
+		uintptr(unsafe.Pointer(&optlen)))
+	return v != 0, err
+}
+
+// setAssocValueBool writes a struct sctp_assoc_value option used as a boolean.
+func setAssocValueBool(fd int, optname uintptr, on bool) error {
+	var v uint32
+	if on {
+		v = 1
+	}
+	return setAssocValue(fd, optname, v)
+}
+
 // getAssocValue reads one of the options carrying struct sctp_assoc_value.
 func getAssocValue(fd int, optname uintptr) (uint32, error) {
 	av := AssocValue{}
@@ -2457,20 +2974,44 @@ func (c *SCTPConn) RemoteAddr() net.Addr {
 	return addr
 }
 
+// peeloffArg mirrors sctp_peeloff_arg_t.
+//
+// Both members are 32 bits in the kernel — sctp_assoc_t is __s32 and sd is an
+// int — so the struct is 8 bytes with sd at offset 4. The Go version used to
+// declare sd as int, which is 64 bits on every target anyone runs this on. That
+// made the struct 16 bytes with sd at offset 8, so the kernel wrote the new
+// descriptor at offset 4 and PeelOff read offset 8, which nothing had written:
+// it returned an SCTPConn wrapping descriptor 0, and leaked the real one.
+//
+// It went unnoticed because it is right on 32-bit, where Go's int is 32 bits,
+// and because nothing tested it.
+type peeloffArg struct {
+	assocID int32
+	sd      int32
+}
+
+// PeelOff detaches association id onto its own socket (RFC 6458 §9.2).
+//
+// This only works on a one-to-many (SOCK_SEQPACKET) socket, which is what
+// peeling off is for: it turns one association out of many into a socket of its
+// own. Every socket this package creates is one-to-one, so calling this on one
+// of them returns EINVAL from the kernel — sctp_do_peeloff rejects any other
+// style. It is usable through NewSCTPConn on a one-to-many descriptor the
+// caller made themselves.
 func (c *SCTPConn) PeelOff(id int) (*SCTPConn, error) {
-	type peeloffArg struct {
-		assocId int32
-		sd      int
-	}
-	param := peeloffArg{
-		assocId: int32(id),
-	}
+	param := peeloffArg{assocID: int32(id)}
 	optlen := unsafe.Sizeof(param)
 	_, _, err := getsockopt(c.fd(), SCTP_SOCKOPT_PEELOFF, uintptr(unsafe.Pointer(&param)), uintptr(unsafe.Pointer(&optlen)))
 	if err != nil {
 		return nil, err
 	}
-	return &SCTPConn{_fd: int32(param.sd)}, nil
+	if param.sd < 0 {
+		// Defensive: the kernel returns the descriptor in the struct rather
+		// than as the syscall result, so a negative value here would otherwise
+		// become an SCTPConn that fails every call with EBADF.
+		return nil, syscall.EINVAL
+	}
+	return &SCTPConn{_fd: param.sd}, nil
 }
 
 // SetDeadline sets both the read and write deadlines.
